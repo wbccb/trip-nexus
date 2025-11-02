@@ -69,12 +69,14 @@ An AI-planned travel product
 ```shell
 pyenv local 3.12.0
 # 创建虚拟环境
-python -m venv trip_venv
+python -m venv venv
 # 激活环境
 source venv/bin/activate
 # 安装核心依赖
 pip install -r requirements.txt
 ```
+
+> 如果使用`PyCharm`，需要设置`Python Interpreter` -> `/xxxx/TripNexus/venv/bin/python`
 
 
 ## 思路借鉴

@@ -1,33 +1,35 @@
-# 前端交互交互（Streamlit最新稳定版，完全支持3.12）
-streamlit==1.38.0
+# 前端交互
+streamlit==1.50.0
+streamlit-folium==0.22.0
 
-# LLM与RAG框架（LangChain生态最新版，适配3.12）
-langchain==0.3.1
-langchain-community==0.3.1
-langchain-core==0.3.6
-langchain-text-splitters==0.3.0
+# LLM与RAG框架 (LangChain 1.x 架构 - 已知冲突全部修复)
+langchain==1.0.3                   # LangChain 主包
+langchain-text-splitters==1.0.0    # 兼容 1.x
+langchain-huggingface==1.0.0       # 兼容 1.x
 
-# 向量数据库（Chroma最新版，修复3.12兼容性问题）
-chromadb==0.5.11
+# 向量数据库 (ChromaDB 1.x 架构)
+chromadb==1.0.20
+langchain-chroma==1.0.0            # **已修复**: 升级到最新的 1.0.0 稳定版
 
-# 网页解析（Playwright 1.45+全面支持3.12）
-playwright==1.46.0
-beautifulsoup4==4.12.3
-soupsieve==2.5  # bs4依赖，确保最新
+# 网页解析
+playwright==1.55.0
+beautifulsoup4==4.14.2
+soupsieve==2.6
 
-# 地图可视化（Folium最新版，geopy适配3.12）
-folium==0.17.0
+# 地图可视化
+folium==0.20.0
 geopy==2.4.1
+geographiclib==2.0
 
-# 嵌入模型（Sentence-Transformers兼容3.12，依赖更新）
-sentence-transformers==3.0.1
-transformers==4.44.2
-accelerate==0.34.2
-torch==2.4.1  # PyTorch最新版，官方支持3.12
+# 嵌入模型与LLM
+torch==2.4.1
+transformers==4.57.1
+sentence-transformers==5.1.2
+accelerate==1.11.0
 
-# 工具类（确保兼容3.12的最新版）
+# 工具类
 python-dotenv==1.0.1
 pydantic==2.8.2
-pydantic-settings==2.3.3
-typing-extensions==4.12.2  # 部分库依赖的类型扩展
-numpy==1.26.4  # 基础数值库，适配3.12
+pydantic-settings==2.4.0
+typing-extensions==4.12.2
+numpy==1.26.4
