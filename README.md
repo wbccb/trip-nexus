@@ -64,6 +64,17 @@ An AI-planned travel product
 - 阶段5: 前端整合
 - 阶段6: 文档编写 + Github上线
 
+## 环境初始化
+
+```shell
+pyenv local 3.12.0
+# 创建虚拟环境
+python -m venv trip_venv
+# 激活环境
+source venv/bin/activate
+# 安装核心依赖
+pip install -r requirements.txt
+```
 
 
 ## 思路借鉴

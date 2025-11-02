@@ -25,3 +25,4 @@ __pycache__/
 
 # 环境文件
 .env
+trip_venv

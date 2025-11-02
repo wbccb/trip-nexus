@@ -1,0 +1,33 @@
+# 前端交互交互（Streamlit最新稳定版，完全支持3.12）
+streamlit==1.38.0
+
+# LLM与RAG框架（LangChain生态最新版，适配3.12）
+langchain==0.3.1
+langchain-community==0.3.1
+langchain-core==0.3.6
+langchain-text-splitters==0.3.0
+
+# 向量数据库（Chroma最新版，修复3.12兼容性问题）
+chromadb==0.5.11
+
+# 网页解析（Playwright 1.45+全面支持3.12）
+playwright==1.46.0
+beautifulsoup4==4.12.3
+soupsieve==2.5  # bs4依赖，确保最新
+
+# 地图可视化（Folium最新版，geopy适配3.12）
+folium==0.17.0
+geopy==2.4.1
+
+# 嵌入模型（Sentence-Transformers兼容3.12，依赖更新）
+sentence-transformers==3.0.1
+transformers==4.44.2
+accelerate==0.34.2
+torch==2.4.1  # PyTorch最新版，官方支持3.12
+
+# 工具类（确保兼容3.12的最新版）
+python-dotenv==1.0.1
+pydantic==2.8.2
+pydantic-settings==2.3.3
+typing-extensions==4.12.2  # 部分库依赖的类型扩展
+numpy==1.26.4  # 基础数值库，适配3.12
