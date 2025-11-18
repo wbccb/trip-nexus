@@ -1,9 +1,9 @@
 import streamlit as st
-from frontend.streamlit_app import TripUI
-from rag.processor import TripRAG
-from llm.trip_generator import TripGenerator
+from frontend.app import TripUI
+from rag.rag import TripRAG
+from llm.generator import TripGenerator
 from map.map_renderer import TripMap
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 def main() -> None:
     ui = TripUI()

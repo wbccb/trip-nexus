@@ -2,7 +2,7 @@ import folium
 from folium import Marker, PolyLine, Icon
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 import time
 
 

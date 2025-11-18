@@ -5,7 +5,7 @@ from langchain_community.document_loaders import PlaywrightURLLoader
 from bs4 import BeautifulSoup
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any
 
 
 class TripRAG:

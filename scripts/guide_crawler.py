@@ -1,5 +1,5 @@
 """批量爬取攻略并存储到Chroma 1.x"""
-from rag.processor import TripRAG
+from rag.rag import TripRAG
 from typing import List
 import time
 import random

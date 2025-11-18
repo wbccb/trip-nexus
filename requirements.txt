@@ -6,6 +6,7 @@ streamlit-folium==0.22.0
 langchain==1.0.3                   # LangChain 主包
 langchain-text-splitters==1.0.0    # 兼容 1.x
 langchain-huggingface==1.0.0       # 兼容 1.x
+langchain-community==0.4.1
 
 # 向量数据库 (ChromaDB 1.x 架构)
 chromadb==1.0.20

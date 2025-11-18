@@ -6,8 +6,6 @@ from typing import Optional, Dict, List, Any
 
 class TripUI:
     def __init__(self):
-        if not st._is_running_with_streamlit:
-            raise RuntimeError("必须通过 'streamlit run' 启动应用")
         st.set_page_config(page_title="TripNexus", layout="wide")
         self._init_session_state()
 
