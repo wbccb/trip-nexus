@@ -1,5 +1,5 @@
 import streamlit as st
-from frontend.app import TripUI
+from frontend.frontend import TripUI
 from rag.rag import TripRAG
 from llm.generator import TripGenerator
 from map.map_renderer import TripMap
