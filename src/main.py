@@ -9,7 +9,7 @@ def main() -> None:
     ui = TripUI()
     rag = TripRAG()
     # map_renderer = TripMap()
-    # generator = TripGenerator()
+    generator = TripGenerator()
 
     # 获取用户输入
     user_input: Optional[Dict[str, Any]] = ui.render_input_form()
@@ -31,18 +31,21 @@ def main() -> None:
         print(f"当前检索出来的文本: {contextItem}")
 
     # 3. 生成/修改行程
-    # edit_cmd = ui.render_edit_controls()
-    # if edit_cmd and edit_cmd["type"] != "无":
-    #     with st.spinner("🔄 正在更新行程..."):
-    #         trip_data = generator.generate_trip(user_input, context, edit_cmd)
-    # else:
-    #     with st.spinner("🧠 AI正在规划行程..."):
-    #         trip_data = generator.generate_trip(user_input, context)
-    #
-    # if not trip_data:
-    #     st.error("❌ 行程生成失败，请检查输入或更换攻略链接")
-    #     return
-    # st.session_state.trip_data = trip_data
+    edit_cmd = ui.render_edit_controls()
+    if edit_cmd and edit_cmd["type"] != "无":
+        with st.spinner("🔄 正在更新行程..."):
+            trip_data = generator.generate_trip(user_input, context, edit_cmd)
+    else:
+        with st.spinner("🧠 AI正在规划行程..."):
+            trip_data = generator.generate_trip(user_input, context)
+
+    if not trip_data:
+        st.error("❌ 行程生成失败，请检查输入或更换攻略链接")
+        return
+    st.session_state.trip_data = trip_data
+    print(f"================================================================================================")
+    print(f"行程生成: {trip_data}")
+    print(f"================================================================================================")
     #
     # # 4. 生成地图
     # with st.spinner("🗺️ 正在绘制行程地图..."):

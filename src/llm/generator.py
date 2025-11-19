@@ -1,17 +1,26 @@
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
-from langchain_community.llms import HuggingFacePipeline
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    pipeline,
-    BitsAndBytesConfig
-)
 from typing import Dict, List, Optional, Any
-import torch
+import torch  # 仍然保留，以防其他部分使用，但在 __init__ 中不再强制需要
 
-# 行程数据模型（Pydantic 2.x兼容）
+# 导入 Ollama 替代 HuggingFacePipeline
+from langchain_community.llms import Ollama
+
+
+# ----------------------------------------------------
+# ⚠️ 注意：以下导入已不再需要，因为我们使用 Ollama API
+# from langchain_community.llms import HuggingFacePipeline
+# from transformers import (
+#     AutoTokenizer,
+#     AutoModelForCausalLM,
+#     pipeline,
+#     BitsAndBytesConfig # 已经不需要
+# )
+# ----------------------------------------------------
+
+
+# 行程数据模型
 class DailyPlanItem(BaseModel):
     time: str = Field(description="格式如'09:00-11:00'")
     attraction: str = Field(description="景点名称，必须准确")
@@ -29,38 +38,22 @@ class TripPlan(BaseModel):
 
 
 class TripGenerator:
-    def __init__(self, model_path: str = "meta-llama/Llama-3-8B-Instruct"):
-        # 4位量化配置
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
+    # 默认使用本地安装的 Ollama deepseek-r1:7b
+    def __init__(self, model_name: str = "deepseek-r1:7b", ollama_base_url: str = "http://localhost:11434"):
 
-        # 加载模型（适配torch 2.4.1）
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            quantization_config=bnb_config,
-            device_map="auto",
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
+        print(f"✅ 初始化 Ollama 模型: {model_name}...")
 
-        # 文本生成管道
-        self.pipeline = pipeline(
-            "text-generation",
-            model=self.model,
-            tokenizer=self.tokenizer,
-            max_new_tokens=1500,
+        # 1. 实例化 Ollama LLM
+        # LangChain 的 Ollama 接口会通过 HTTP API 与 Ollama 服务器通信
+        self.llm = Ollama(
+            base_url=ollama_base_url,
+            model=model_name,
+            # 设置一些生成参数，与你原代码中的 pipeline 保持一致
             temperature=0.7,
-            top_p=0.95,
-            do_sample=True,
-            pad_token_id=self.tokenizer.eos_token_id
+            num_ctx=4096,  # 默认上下文大小，可以根据需要调整
         )
 
-        self.llm = HuggingFacePipeline(pipeline=self.pipeline)
+        # 2. 初始化解析器
         self.parser = JsonOutputParser(pydantic_object=TripPlan)
 
     def build_prompt(self, user_input: Dict[str, Any], context: List[str],
@@ -76,23 +69,28 @@ class TripGenerator:
                 case "reorder":
                     edit_note = "需调整行程顺序，确保路线更合理"
 
+        # 优化提示词模板，更适合指令遵循型模型
         template = """
-        你是专业旅游规划师，严格按以下要求生成行程：
+        你是专业旅游规划师，严格遵循以下所有要求生成行程，并仅返回JSON格式数据。
 
-        1. 仅返回JSON，字段与指定格式完全一致，无额外文字。
-        2. 行程约束：
+        【生成要求】
+        1. 仅输出JSON对象，不包含任何解释性文字或Markdown格式（如```json```）。
+        2. JSON字段必须与指定的格式完全一致。
+        3. 行程约束：
            - 目的地：{destination}
-           - 天数：{days}天
-           - 预算：{budget}元/人（交通、餐饮合理分配）
+           - 总天数：{days}天
+           - 预算：{budget}元/人（请合理分配交通、餐饮开支）
            - 偏好：{preference}
            - 额外要求：{edit_note}
-        3. 必须参考攻略信息（优先采纳）：{context}
-        4. 细节要求：
-           - 每天行程8:00-18:00，无时间冲突
-           - 地址精确到街道（如"成都市青羊区青华路9号"）
-           - 交通方式具体（如"地铁2号线人民公园站B口出"）
+        4. 必须参考攻略信息（请优先采纳）：
+        {context}
 
-        输出格式示例：
+        【细节规范】
+        - 每天行程安排在8:00-18:00，时间必须连续且无冲突。
+        - 地址必须精确到街道和门牌号（如"成都市青羊区青华路9号"）。
+        - 交通方式具体（如"地铁2号线人民公园站B口出"）。
+
+        【输出格式】
         {format_instructions}
         """
         prompt = PromptTemplate(
@@ -113,13 +111,27 @@ class TripGenerator:
                       edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """生成行程（支持修改指令）"""
         prompt = self.build_prompt(user_input, context, edit_cmd)
+
+        # 由于 Ollama 模型的响应速度通常较快，我们进行两次尝试以确保 JSON 格式正确。
         for attempt in range(2):
             try:
+                # 使用 self.llm.invoke() 方法直接调用 Ollama API
                 response = self.llm.invoke(prompt)
-                clean_response = response.split("```json")[1].split("```")[0] if "```json" in response else response
+
+                # 尝试清洗响应，移除可能的 Markdown 格式
+                # deepseek-r1 模型可能仍然会返回 Markdown 块
+                if "```json" in response:
+                    # 尝试精确提取 JSON 块
+                    start = response.find("```json") + 7
+                    end = response.find("```", start)
+                    clean_response = response[start:end].strip()
+                else:
+                    clean_response = response.strip()
+
                 trip_data = self.parser.parse(clean_response)
+                print(f"✅ 第{attempt + 1}次生成成功。")
                 return trip_data.model_dump()
             except Exception as e:
-                print(f"第{attempt + 1}次生成失败：{str(e)}")
+                print(f"❌ 第{attempt + 1}次生成失败，尝试重新生成。错误：{str(e)}")
                 if attempt == 1:
                     return None
