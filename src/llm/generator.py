@@ -6,7 +6,9 @@ import torch  # 仍然保留，以防其他部分使用，但在 __init__ 中不
 
 # 导入 Ollama 替代 HuggingFacePipeline
 from langchain_community.llms import Ollama
-
+# from langchain_ollama import OllamaLLM
+import json
+import re
 
 # ----------------------------------------------------
 # ⚠️ 注意：以下导入已不再需要，因为我们使用 Ollama API
@@ -107,31 +109,52 @@ class TripGenerator:
             edit_note=edit_note
         )
 
+    def extract_json_from_string(self, text):
+        print(f"从大模型拿到的文本: {text}")
+
+        """尝试从文本中提取完整的JSON对象，处理Markdown块"""
+        text = text.strip()
+
+        # 1. 查找并清理 Markdown JSON 块
+        match_md = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
+        if match_md:
+            return match_md.group(1).strip()
+
+        # 2. 如果没有 Markdown 块，尝试返回整个文本
+        return text
+
     def generate_trip(self, user_input: Dict[str, Any], context: List[str],
                       edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """生成行程（支持修改指令）"""
         prompt = self.build_prompt(user_input, context, edit_cmd)
 
-        # 由于 Ollama 模型的响应速度通常较快，我们进行两次尝试以确保 JSON 格式正确。
+        # 进行两次尝试
         for attempt in range(2):
             try:
-                # 使用 self.llm.invoke() 方法直接调用 Ollama API
                 response = self.llm.invoke(prompt)
 
-                # 尝试清洗响应，移除可能的 Markdown 格式
-                # deepseek-r1 模型可能仍然会返回 Markdown 块
-                if "```json" in response:
-                    # 尝试精确提取 JSON 块
-                    start = response.find("```json") + 7
-                    end = response.find("```", start)
-                    clean_response = response[start:end].strip()
-                else:
-                    clean_response = response.strip()
+                # 使用改进的 JSON 提取函数
+                clean_response = self.extract_json_from_string(response)
 
+                # 尝试解析
+                # self.parser.parse() 应该返回一个 TripPlan 实例 或一个 dict
                 trip_data = self.parser.parse(clean_response)
+
                 print(f"✅ 第{attempt + 1}次生成成功。")
-                return trip_data.model_dump()
+
+                # 🌟 Pydantic V2 安全处理：
+                # 如果返回的是 Pydantic 实例，使用 .model_dump() 转换为 dict
+                if hasattr(trip_data, 'model_dump') and callable(getattr(trip_data, 'model_dump')):
+                    return trip_data.model_dump()
+                # 如果返回的就是 dict，则直接返回
+                elif isinstance(trip_data, dict):
+                    return trip_data
+                else:
+                    # 处理未预期的返回类型
+                    raise TypeError(f"解析器返回了意外类型: {type(trip_data)}")
+
             except Exception as e:
+                # 捕获 JSON 解析错误
                 print(f"❌ 第{attempt + 1}次生成失败，尝试重新生成。错误：{str(e)}")
                 if attempt == 1:
                     return None
