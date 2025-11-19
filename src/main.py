@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional, List
 
 def main() -> None:
     ui = TripUI()
-    # rag = TripRAG()
+    rag = TripRAG()
     # map_renderer = TripMap()
     # generator = TripGenerator()
 
@@ -18,15 +18,17 @@ def main() -> None:
         return
 
     # 1. 加载攻略到RAG
-    # with st.spinner("📥 正在解析攻略信息..."):
-    #     rag.load_and_store_guides(user_input["guide_links"])
+    with st.spinner("📥 正在解析攻略信息..."):
+        rag.load_and_store_guides(user_input["guide_links"])
 
     # 2. 检索相关攻略
     query: str = (
         f"{user_input['destination']}{user_input['days']}天旅游，"
         f"预算{user_input['budget']}元，偏好{user_input['preference']}"
     )
-    # context: List[str] = rag.retrieve_relevant_info(query)
+    context: List[str] = rag.retrieve_relevant_info(query)
+    for contextItem in context:
+        print(f"当前检索出来的文本: {contextItem}")
 
     # 3. 生成/修改行程
     # edit_cmd = ui.render_edit_controls()

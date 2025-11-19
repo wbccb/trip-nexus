@@ -6,19 +6,25 @@ from bs4 import BeautifulSoup
 import re
 from pathlib import Path
 from typing import List, Optional, Any
+import os
+from sentence_transformers import SentenceTransformer
 
+
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com' # 以上两行添加的Hugging Face镜像设置，是为了解决没有科学上网环境下载向量模型的问题
 
 class TripRAG:
     def __init__(self, persist_dir: str = "./chroma_db"):
         self.persist_dir = Path(persist_dir)
         self.persist_dir.mkdir(exist_ok=True)
 
-        # 初始化嵌入模型（LangChain 1.x 导入路径）
+        # 初始化嵌入模型
+        # HuggingFaceEmbeddings需要vpn下载模型，最好是本地有个模型文件，直接用绝对地址引用本地文件
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",
+            model_name='all-MiniLM-L6-v2',
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True}
         )
+        # self.embeddings = SentenceTransformer('all-MiniLM-L6-v2')
 
         # 初始化Chroma向量库（使用langchain-chroma 1.0.0）
         self.vector_db = Chroma(
@@ -54,7 +60,6 @@ class TripRAG:
             urls=urls,
             headless=True,
             remove_selectors=["header", "footer", ".ad-container", ".promotion"],
-            wait_time=2000
         )
 
         try:
@@ -66,12 +71,12 @@ class TripRAG:
         # 清洗并分割文本
         for doc in docs:
             doc.page_content = self._clean_html_text(doc.page_content)
+            print(f"清理后的文本为: {doc.page_content}")
         split_docs = self.text_splitter.split_documents(docs)
 
         # 存入向量库（Chroma 1.x 兼容API）
         if split_docs:
             self.vector_db.add_documents(split_docs)
-            self.vector_db.persist()
 
     def retrieve_relevant_info(self, query: str, k: int = 3) -> List[str]:
         """检索相关攻略信息"""
