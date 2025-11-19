@@ -45,30 +45,90 @@ class TripUI:
         return None
 
     def render_trip_result(self, trip_data: Dict[str, Any]) -> None:
-        """展示行程结果和地图，适配Streamlit 1.50.0"""
+        """
+        展示行程结果和地图，适配Streamlit。
+        优化点：1. 适应LLM输出的错误结构；2. 增加数据有效性检查；3. 改进布局。
+        """
         st.subheader("📅 AI生成行程", divider="blue")
-        daily_plan: Dict[str, List[Dict[str, str]]] = trip_data["daily_plan"]
 
-        for day, items in daily_plan.items():
-            with st.expander(f"第{day}天", expanded=True):
+        # ------------------ 1. 数据结构适配与检查 ------------------
+        raw_daily_plan = trip_data.get("daily_plan")
+
+        if not raw_daily_plan:
+            st.error("行程数据缺失或为空，请尝试重新生成。")
+            return
+
+        daily_plans_grouped: Dict[str, List[Dict[str, str]]]
+
+        # 适配结构：如果 LLM 输出的是平铺列表，将其包装为 Day 1
+        if isinstance(raw_daily_plan, list):
+            st.warning("模型输出结构异常（缺少日期分组），已自动将所有行程归为第 1 天。")
+            daily_plans_grouped = {"1": raw_daily_plan}
+        elif isinstance(raw_daily_plan, dict):
+            daily_plans_grouped = raw_daily_plan
+        else:
+            st.error(f"无法解析行程结构，预期为字典或列表，实际为 {type(raw_daily_plan)}。")
+            return
+
+        # ------------------ 2. 行程展示逻辑 ------------------
+
+        # 使用 sorted(daily_plans_grouped.items()) 确保日期按数字顺序显示，
+        # 即使键是字符串 '1', '10' 等也能正确排序（需确保键可转为整数）。
+        try:
+            sorted_plans = sorted(daily_plans_grouped.items(), key=lambda x: int(x[0]))
+        except ValueError:
+            # 如果日期键无法转为整数，则按字符串排序
+            sorted_plans = sorted(daily_plans_grouped.items())
+
+        for day_str, items in sorted_plans:
+            # 使用 Markdown 标题提升日期视觉层级
+            st.markdown(f"#### 第 {day_str} 天")
+
+            # 使用 st.container() 代替 st.expander() 避免点击展开/收起造成不必要的交互
+            with st.container(border=True):
                 for idx, item in enumerate(items):
-                    cols = st.columns([1, 3, 2])
-                    cols[0].write(f"⏰ {item['time']}")
-                    cols[1].write(f"📍 **{item['attraction']}**")
-                    cols[2].write(f"🚗 {item['transport']}")
-                    with cols[1].expander("详情"):
-                        st.write(f"地址：{item['address']}")
-                        st.write(f"停留：{item['duration']}")
-                st.divider()
+                    # 确保关键字段存在，避免 KeyError
+                    time = item.get('time', '未知时间')
+                    attraction = item.get('attraction', '未知景点')
+                    transport = item.get('transport', '未知交通')
+                    address = item.get('address', '地址缺失')
+                    duration = item.get('duration', '时长缺失')
 
+                    # 使用 st.columns 提升布局
+                    cols = st.columns([1, 4, 1.5])  # 调整比例，给景点更多空间
+
+                    # 时间
+                    cols[0].markdown(f"**⏰ {time}**", help=f"停留：{duration}")
+
+                    # 景点和详情
+                    cols[1].markdown(f"**📍 {attraction}**")
+
+                    # 交通
+                    cols[2].markdown(f"🚗 {transport}")
+
+                    # 使用 st.caption 展示地址，避免使用嵌套的 expander
+                    cols[1].caption(f"地址：{address}")
+
+                    st.divider()  # 行程项之间增加分割线
+
+        # ------------------ 3. 地图展示逻辑 ------------------
         st.subheader("🗺️ 行程地图", divider="blue")
+
+        # 检查地图对象是否存在，并在不存在时尝试生成
+        if not st.session_state.get('map_obj'):
+            st.session_state.map_obj = self.render_map(trip_data)
+
         if st.session_state.map_obj:
             st_folium(
                 st.session_state.map_obj,
                 width=1000,
                 height=600,
-                returned_objects=[]
+                # 优化：返回对象可以帮助调试，通常设置为 'all'，这里保持 []
+                returned_objects=[],
+                key="trip_map"  # 明确设置key
             )
+        else:
+            st.error("无法生成地图，请检查地址解析服务是否正常。")
 
     def render_edit_controls(self) -> Optional[Dict[str, Any]]:
         """行程修改控件"""

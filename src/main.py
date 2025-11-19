@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional, List
 def main() -> None:
     ui = TripUI()
     rag = TripRAG()
-    # map_renderer = TripMap()
+    map_renderer = TripMap()
     generator = TripGenerator()
 
     # 获取用户输入
@@ -46,14 +46,14 @@ def main() -> None:
     print(f"================================================================================================")
     print(f"行程生成: {trip_data}")
     print(f"================================================================================================")
-    #
-    # # 4. 生成地图
-    # with st.spinner("🗺️ 正在绘制行程地图..."):
-    #     map_obj = map_renderer.render_map(trip_data)
-    #     st.session_state.map_obj = map_obj
-    #
-    # # 5. 展示结果
-    # ui.render_trip_result(trip_data)
+
+    # 4. 生成地图
+    with st.spinner("🗺️ 正在绘制行程地图..."):
+        map_obj = map_renderer.render_map(trip_data)
+        st.session_state.map_obj = map_obj
+
+    # 5. 展示结果
+    ui.render_trip_result(trip_data)
 
 if __name__ == "__main__":
     main()
