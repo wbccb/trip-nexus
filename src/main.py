@@ -1,15 +1,15 @@
 import streamlit as st
-from src.frontend.frontend import TripUI
-from src.rag.rag import TripRAG
-from src.llm.generator import TripGenerator
-from src.map.map_renderer import TripMap
+from frontend.index import TripUI
+from rag.rag import TripRAG
+from llm.generator import TripGenerator
+from map.map_renderer import TripMap
 from typing import Dict, Any, Optional, List
 
 def main() -> None:
     ui = TripUI()
-    rag = TripRAG()
-    map_renderer = TripMap()
-    generator = TripGenerator()
+    # rag = TripRAG()
+    # map_renderer = TripMap()
+    # generator = TripGenerator()
 
     # 获取用户输入
     user_input: Optional[Dict[str, Any]] = ui.render_input_form()
@@ -18,37 +18,37 @@ def main() -> None:
         return
 
     # 1. 加载攻略到RAG
-    with st.spinner("📥 正在解析攻略信息..."):
-        rag.load_and_store_guides(user_input["guide_links"])
+    # with st.spinner("📥 正在解析攻略信息..."):
+    #     rag.load_and_store_guides(user_input["guide_links"])
 
     # 2. 检索相关攻略
     query: str = (
         f"{user_input['destination']}{user_input['days']}天旅游，"
         f"预算{user_input['budget']}元，偏好{user_input['preference']}"
     )
-    context: List[str] = rag.retrieve_relevant_info(query)
+    # context: List[str] = rag.retrieve_relevant_info(query)
 
     # 3. 生成/修改行程
-    edit_cmd = ui.render_edit_controls()
-    if edit_cmd and edit_cmd["type"] != "无":
-        with st.spinner("🔄 正在更新行程..."):
-            trip_data = generator.generate_trip(user_input, context, edit_cmd)
-    else:
-        with st.spinner("🧠 AI正在规划行程..."):
-            trip_data = generator.generate_trip(user_input, context)
-
-    if not trip_data:
-        st.error("❌ 行程生成失败，请检查输入或更换攻略链接")
-        return
-    st.session_state.trip_data = trip_data
-
-    # 4. 生成地图
-    with st.spinner("🗺️ 正在绘制行程地图..."):
-        map_obj = map_renderer.render_map(trip_data)
-        st.session_state.map_obj = map_obj
-
-    # 5. 展示结果
-    ui.render_trip_result(trip_data)
+    # edit_cmd = ui.render_edit_controls()
+    # if edit_cmd and edit_cmd["type"] != "无":
+    #     with st.spinner("🔄 正在更新行程..."):
+    #         trip_data = generator.generate_trip(user_input, context, edit_cmd)
+    # else:
+    #     with st.spinner("🧠 AI正在规划行程..."):
+    #         trip_data = generator.generate_trip(user_input, context)
+    #
+    # if not trip_data:
+    #     st.error("❌ 行程生成失败，请检查输入或更换攻略链接")
+    #     return
+    # st.session_state.trip_data = trip_data
+    #
+    # # 4. 生成地图
+    # with st.spinner("🗺️ 正在绘制行程地图..."):
+    #     map_obj = map_renderer.render_map(trip_data)
+    #     st.session_state.map_obj = map_obj
+    #
+    # # 5. 展示结果
+    # ui.render_trip_result(trip_data)
 
 if __name__ == "__main__":
     main()
