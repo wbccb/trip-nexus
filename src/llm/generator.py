@@ -9,7 +9,7 @@ from transformers import (
     BitsAndBytesConfig
 )
 from typing import Dict, List, Optional, Any
-
+import torch
 
 # 行程数据模型（Pydantic 2.x兼容）
 class DailyPlanItem(BaseModel):
@@ -35,7 +35,7 @@ class TripGenerator:
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=float
+            bnb_4bit_compute_dtype=torch.bfloat16,
         )
 
         # 加载模型（适配torch 2.4.1）

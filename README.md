@@ -84,6 +84,3 @@ pip install -r requirements.txt
 ```shell
 streamlit run main.py
 ```
-
-## 思路借鉴
-1. `https://chat.qwen.ai/c/4c7b4d88-daa9-43e6-a446-5c689db33aeb` 的旅游规划师agent模块

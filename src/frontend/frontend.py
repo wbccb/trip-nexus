@@ -10,7 +10,7 @@ class TripUI:
         self._init_session_state()
 
     def _init_session_state(self) -> None:
-        """初始化会话状态，兼容Streamlit 1.50.0"""
+        """初始化会话状态"""
         required_keys = {"trip_data", "map_obj", "edit_cmd"}
         for key in required_keys:
             if key not in st.session_state:

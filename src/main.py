@@ -1,8 +1,8 @@
 import streamlit as st
-from frontend.frontend import TripUI
-from rag.rag import TripRAG
-from llm.generator import TripGenerator
-from map.map_renderer import TripMap
+from src.frontend.frontend import TripUI
+from src.rag.rag import TripRAG
+from src.llm.generator import TripGenerator
+from src.map.map_renderer import TripMap
 from typing import Dict, Any, Optional, List
 
 def main() -> None:
