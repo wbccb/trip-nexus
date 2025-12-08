@@ -26,3 +26,6 @@ __pycache__/
 # 环境文件
 .env
 trip_venv
+
+
+不提交.md
