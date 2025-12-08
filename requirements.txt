@@ -176,3 +176,10 @@ xyzservices==2025.10.0
 yarl==1.22.0
 zipp==3.23.0
 zstandard==0.25.0
+
+
+redis==4.6.0
+mysql-connector-python==8.4.0
+tiktoken==0.6.0
+fastapi==0.109.0
+loguru==0.7.2
