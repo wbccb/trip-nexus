@@ -4,12 +4,18 @@ from rag.rag import TripRAG
 from llm.generator import TripGenerator
 from map.map_renderer import TripMap
 from typing import Dict, Any, Optional, List
+from __init__ import __version__, __description__
 
 def main() -> None:
     ui = TripUI()
     rag = TripRAG()
     map_renderer = TripMap()
     generator = TripGenerator()
+
+    # 版本信息
+    st.sidebar.markdown(f"### 📱 版本: v{__version__}")
+    st.sidebar.markdown(f"ℹ️ {__description__}")
+    st.sidebar.markdown("---")
 
     # 获取用户输入
     user_input: Optional[Dict[str, Any]] = ui.render_input_form()

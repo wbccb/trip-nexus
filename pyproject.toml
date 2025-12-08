@@ -1,0 +1,26 @@
+[project]
+name = "ai-travel-planner"
+version = "0.0.1"
+description = "AI旅游行程规划助手 - MVP版本"
+authors = [{name = "wbccb", email = "wbccb18814122@163.com"}]
+readme = "README.md"
+requires-python = ">=3.12.0"
+
+[tool.bumpversion]
+current_version = "0.0.2-dev.1"
+commit = true
+tag = true
+
+[[tool.bumpversion.files]]
+filename = "src/__init__.py"
+search = '__version__ = "{current_version}"'
+replace = '__version__ = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
