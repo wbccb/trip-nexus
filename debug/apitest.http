@@ -1,0 +1,5 @@
+@baseUri=http://127.0.0.1:8069
+@apiKey=xxx
+
+### ping
+GET {{baseUri}}/
