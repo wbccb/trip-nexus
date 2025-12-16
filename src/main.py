@@ -1,6 +1,6 @@
 import streamlit as st
 from frontend.index import TripUI
-from rag.rag import TripRAG
+from rag.rag_main import TripRAG
 from llm.generator import TripGenerator
 from map.map_renderer import TripMap
 from typing import Dict, Any, Optional, List
