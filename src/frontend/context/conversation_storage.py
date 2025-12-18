@@ -6,17 +6,17 @@ import mysql
 import redis
 import datetime
 
-from networkx import cut_size
-from torch.ao.quantization.fx import convert
-
-from entity import StorageConfig
+from src.frontend.context.entity import *
 from src.frontend.context.entity import SessionContext, CoreEntity
+from src.config import Config
 
+"""
+存储相关的方法：提供一系列方法进行数据的存储，包括：redis、mysql等数据存储接口
 
-# 提供一系列方法进行数据的存储，包括：redis、mysql等数据存储接口
-# 提取实体、压缩对话、更新当前存储的对话内容都在ContextManager中处理
-class ContextStorage:
-    def __init__(self, config: StorageConfig):
+注：提取实体、压缩对话、更新当前存储的对话内容都在ContextManager中处理
+"""
+class ConversationStorage:
+    def __init__(self, config: Config):
         # Redis连接用于短期缓存
         self.redis = redis.Redis(
             host=config.REDIS_HOST,

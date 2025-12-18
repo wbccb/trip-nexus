@@ -1,12 +1,13 @@
 from src.config import Config
 from src.rag.module.intent_recognition import IntentRecognizer
 import requests
-from typing import List, Dict, Any
+from typing import List, Dict
+
 
 class MultiSourceSearcher:
-    def __init__(self):
+    def __init__(self, llm):
         self.config = Config()
-        self.intent_recognizer = IntentRecognizer()
+        self.intent_recognizer = IntentRecognizer(llm)
 
     def _get_engines_by_intent(self, intent: str) -> str:
         """

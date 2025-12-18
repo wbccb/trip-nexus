@@ -1,13 +1,21 @@
 import streamlit as st
-import folium
 from streamlit_folium import st_folium
 from typing import Optional, Dict, List, Any
+import datetime
 
+from src.frontend.context.conversation_manager import ConversationManager
+from src.frontend.context.conversation_storage import ConversationStorage
+from src.frontend.context.entity import Message
+from src.llm.llm_manager import LlmManager
+from src.config import Config
 
 class TripUI:
-    def __init__(self):
+    def __init__(self, llm: LlmManager, config: Config):
         st.set_page_config(page_title="TripNexus", layout="wide")
         self._init_session_state()
+        self.llm = llm
+        self.conversation_storage = ConversationStorage(config)
+        self.conversation_manager = ConversationManager(conversation_storage=self.conversation_storage)
 
     def _init_session_state(self) -> None:
         """初始化会话状态"""
@@ -160,3 +168,109 @@ class TripUI:
                     return {"type": "reorder", "msg": "调整顺序需重新生成行程"}
                 case _:
                     return None
+
+    def render_chat_interface(self) -> None:
+        """渲染聊天界面，支持多轮对话"""
+        st.sidebar.subheader("💬 行程对话助手")
+
+        # 使用st.chat_message构建聊天界面
+        chat_container = st.container()
+
+        # with chat_container:
+        #     # 显示对话历史
+        #     for message in st.session_state.chat_history:
+        #         with st.chat_message(message["role"]):
+        #             st.markdown(message["content"])
+        #             if "metadata" in message:
+        #                 st.caption(f"上下文: {message['metadata'].get('context_type', '')}")
+
+        # 用户输入
+        if prompt := st.chat_input("告诉我您想如何调整行程？"):
+            # 添加用户消息到历史
+            st.session_state.chat_history.append({
+                "role": "user",
+                "content": prompt,
+                "timestamp": datetime.now().isoformat()
+            })
+
+            # 显示用户消息
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            # 获取AI响应
+            with st.chat_message("assistant"):
+                message_placeholder = st.empty()
+                full_response = ""
+
+                try:
+                    # TODO 调用LLM获取响应（这里需要实现后端逻辑）
+                    full_response = self.llm.change_trip(prompt)
+                    message_placeholder.markdown(full_response)
+
+                    # 添加AI消息到历史
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": full_response,
+                        "timestamp": datetime.now().isoformat(),
+                        "metadata": {
+                            "context_type": "trip_modification",
+                            "conversation_id": st.session_state.current_conversation_id
+                        }
+                    })
+
+                    # 更新上下文
+                    self._update_conversation_context(prompt, full_response)
+
+                except Exception as e:
+                    error_msg = f"对话处理出错: {str(e)}"
+                    message_placeholder.error(error_msg)
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": error_msg,
+                        "error": True
+                    })
+
+    def _reset_conversation(self, user_id: str, device_id: str) -> None:
+        """清空对话框的内容"""
+        # 重置聊天历史为空列表
+        st.session_state.chat_history = []
+        # 可选：重置会话ID（如果需要全新会话上下文）
+        st.session_state.current_conversation_id = self.conversation_manager.generate_session_id(user_id, device_id)
+        # 可选：清空后给出提示
+        st.sidebar.success("对话已清空！")
+
+    def render_main_interface(self, user_id: str, device_id: str) -> None:
+        """渲染主界面，集成聊天和行程展示"""
+        # 侧边栏：聊天控制
+        with st.sidebar:
+            st.header("🎯 行程助手")
+
+            # 会话管理
+            if st.button("🆕 新对话"):
+                self._reset_conversation(user_id, device_id)
+
+            # 显示最近会话
+            # if hasattr(self, 'conversation_manager'):
+            #     user_id = st.session_state.get('user_id', 'anonymous')
+            #     messages: List[Message] = self.conversation_manager.get_user_conversations(user_id)
+            #     if messages:
+            #         st.subheader("📋 历史会话")
+            #         for message in messages[:5]:  # 显示最近5个
+            #             st.chat_message(message)
+
+            st.divider()
+            self.render_edit_controls()  # 保留原有的编辑控件
+
+        # 主区域：聊天 + 行程
+        # if st.session_state.trip_data:
+        #     tab1, tab2 = st.tabs(["🗺️ 行程详情", "💬 对话调整"])
+        #
+        #     with tab1:
+        #         self.render_trip_result(st.session_state.trip_data)
+
+            # with tab2:
+            #     self.render_chat_interface()
+        # else:
+        #     st.info("请先生成行程，然后可以使用对话功能进行调整")
+        #     self.render_input_form()
+        self.render_chat_interface()

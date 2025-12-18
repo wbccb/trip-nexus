@@ -6,10 +6,10 @@ import time
 from src.config import Config
 
 class AIRetrievalPipeline:
-    def __init__(self):
+    def __init__(self, llm):
         self.config = Config()
-        self.intent_recognizer = IntentRecognizer()
-        self.searcher = MultiSourceSearcher()
+        self.intent_recognizer = IntentRecognizer(llm)
+        self.searcher = MultiSourceSearcher(llm)
         self.quality_filter = QualityFilter()
 
     def run(self, query: str) -> Dict[str, Any]:

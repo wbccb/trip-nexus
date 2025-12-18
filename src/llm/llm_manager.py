@@ -39,7 +39,7 @@ class TripPlan(BaseModel):
     )
 
 
-class TripGenerator:
+class LlmManager:
     # 默认使用本地安装的 Ollama deepseek-r1:7b
     def __init__(self, model_name: str = "deepseek-r1:7b", ollama_base_url: str = "http://localhost:11434"):
 
@@ -57,6 +57,9 @@ class TripGenerator:
 
         # 2. 初始化解析器
         self.parser = JsonOutputParser(pydantic_object=TripPlan)
+
+    def get_llm(self):
+        return self.llm
 
     def build_prompt(self, user_input: Dict[str, Any], context: List[str],
                      edit_cmd: Optional[Dict[str, Any]] = None) -> str:
@@ -158,3 +161,6 @@ class TripGenerator:
                 print(f"❌ 第{attempt + 1}次生成失败，尝试重新生成。错误：{str(e)}")
                 if attempt == 1:
                     return None
+
+    def change_trip(self, query: str):
+        return ["这是", "新生成的行程"]

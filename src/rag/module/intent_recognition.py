@@ -1,15 +1,14 @@
 import json
-from typing import Dict, List, Optional
+from typing import Dict
 from sentence_transformers import SentenceTransformer, util
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from sympy.physics.units import temperature
 
 from src.config import Config
 
 class IntentRecognizer:
-    def __init__(self):
+    def __init__(self, llm):
         self.config = Config()
+        self.llm = llm
         self.intent_classifier = SentenceTransformer(self.config.SENTENCE_BERT_MODEL)
 
         # 预定义的意图类别和示例
@@ -46,12 +45,6 @@ class IntentRecognizer:
         for intent, examples in self.intent_examples.items():
             embeddings = self.intent_classifier.encode(examples, convert_to_tensor=True)
             self.intent_embeddings[intent] = embeddings.mean(dim=0) # 为每个意图生成嵌入向量
-
-        self.llm = ChatOpenAI(
-            model_name=self.config.LLM_MODEL,
-            temperature=0.1,
-            api_key=self.config.OPENAI_API_KEY
-        )
 
     def classify_intent(self, query:str) -> Dict[str, any]:
         """

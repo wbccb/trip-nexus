@@ -1,9 +1,16 @@
-from context_storage import ContextStorage
-from entity import *
+from src.frontend.context.conversation_storage import ConversationStorage
+from src.frontend.context.entity import *
 
-class ContextManager:
-    def __init__(self, storage: ContextStorage, llm_client=None):
-        self.storage = storage
+"""
+会话管理：
+1. 提取实体
+2. 生成对话摘要
+3. 压缩早期对话内容
+4. 动态优化上下文，构建LLM输入:检查会话token，自动调用上面的步骤来构建出会话的prompt
+"""
+class ConversationManager:
+    def __init__(self, conversation_storage: ConversationStorage, llm_client=None):
+        self.conversationStorage = conversation_storage
         self.llm_client = llm_client  # 假设传入一个LLM客户端
 
     def is_redundant_message(self, message: str) -> bool:
@@ -124,7 +131,7 @@ class ContextManager:
         new_summary = self.generate_summary(early_messages, context.long_term_summary)
 
         # 更新长期摘要
-        self.storage.store_long_term_summary(context.session_id, new_summary)
+        self.conversationStorage.store_long_term_summary(context.session_id, new_summary)
 
         # 保留最近10轮对话
         context.short_term_messages = context.short_term_messages[-10:]
@@ -175,8 +182,8 @@ class ContextManager:
         """处理新消息，更新上下文"""
 
         # 1. 获取或创建会话
-        session_id = self.storage.generate_session_id(user_id, device_id)
-        short_term_data = self.storage.get_short_term_context(session_id)
+        session_id = self.conversationStorage.generate_session_id(user_id, device_id)
+        short_term_data = self.conversationStorage.get_short_term_context(session_id)
 
         if short_term_data:
             # 恢复现有会话
@@ -200,13 +207,13 @@ class ContextManager:
         message.is_redundant = self.is_redundant_message(message.content)
 
         # 3. 获取现有核心实体
-        existing_entities = self.storage.get_core_entities(session_id) or CoreEntity()
+        existing_entities = self.conversationStorage.get_core_entities(session_id) or CoreEntity()
 
         # 4. 增量提取核心实体（如果不是冗余信息）
         if not message.is_redundant:
             context.core_entities = self.extract_core_entities(message.content, existing_entities)
             # 更新存储
-            self.storage.store_core_entities(session_id, context.core_entities)
+            self.conversationStorage.store_core_entities(session_id, context.core_entities)
 
         # 5. 添加新消息到短期窗口
         context.short_term_messages.append(message)
@@ -218,14 +225,14 @@ class ContextManager:
             context.long_term_summary = self.compress_early_messages(context)
 
         # 7. 更新短期存储
-        self.storage.store_short_term_context(session_id, context)
+        self.conversationStorage.store_short_term_context(session_id, context)
 
         return context
 
     def get_optimized_context(self, session_id: str, max_tokens: int = 4096) -> Dict[str, Any]:
         """获取优化后的上下文用于LLM输入"""
         # 从存储恢复完整上下文
-        short_term_data = self.storage.get_short_term_context(session_id)
+        short_term_data = self.conversationStorage.get_short_term_context(session_id)
         if not short_term_data:
             return {}
 
@@ -236,11 +243,18 @@ class ContextManager:
             user_id="temp",  # 临时值，实际应从存储获取
             device_id="temp",
             short_term_messages=messages,
-            core_entities=self.storage.get_core_entities(session_id) or CoreEntity(),
-            long_term_summary=self.storage.get_long_term_summary(session_id),
+            core_entities=self.conversationStorage.get_core_entities(session_id) or CoreEntity(),
+            long_term_summary=self.conversationStorage.get_long_term_summary(session_id),
             message_count=short_term_data.get("message_count", len(messages)),
             last_active=datetime.fromisoformat(short_term_data.get("last_active", datetime.now().isoformat()))
         )
 
         # 优化上下文
         return self.optimize_context_for_llm(context, max_tokens)
+
+    def get_user_conversations(self, user_id: str) -> Optional[List[Message]]:
+        """从redis获取短期的会话管理类中的短期会话10条"""
+        return self.conversationStorage.get_short_term_context(user_id)
+
+    def generate_session_id(self, user_id: str, device_id: str) -> str:
+        return self.conversationStorage.generate_session_id(user_id, device_id)
