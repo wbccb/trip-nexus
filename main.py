@@ -1,5 +1,5 @@
 import streamlit as st
-from src.frontend.main_ui import TripUI
+from src.frontend.ui_manager import UIManager
 from src.rag.rag_main import AIRetrievalPipeline
 from src.llm.llm_manager import LlmManager
 from src.map.map_renderer import TripMap
@@ -11,7 +11,7 @@ def main() -> None:
     map_renderer = TripMap()
     llm_manager = LlmManager()
     # rag = AIRetrievalPipeline(llm)
-    ui = TripUI(llm_manager, config)
+    ui_manager = UIManager(llm_manager, config)
 
     # 版本信息
     st.sidebar.markdown(f"### 📱 版本: v{__version__}")
@@ -20,10 +20,10 @@ def main() -> None:
 
     user_id = "temp"
     device_id = "11"
-    ui.render_main_interface(user_id, device_id);
+    ui_manager.render_main_interface(user_id, device_id);
     #
     # # 获取用户输入
-    # user_input: Optional[Dict[str, Any]] = ui.render_input_form()
+    # user_input: Optional[Dict[str, Any]] = ui_manager.render_input_form()
     # if not user_input:
     #     st.info("请填写旅行信息并点击生成按钮")
     #     return
@@ -42,7 +42,7 @@ def main() -> None:
     #     print(f"当前检索出来的文本: {contextItem}")
     #
     # # 3. 生成/修改行程
-    # edit_cmd = ui.render_edit_controls()
+    # edit_cmd = ui_manager.render_edit_controls()
     # if edit_cmd and edit_cmd["type"] != "无":
     #     with st.spinner("🔄 正在更新行程..."):
     #         trip_data = llm_manager.generate_trip(user_input, context, edit_cmd)
@@ -64,7 +64,7 @@ def main() -> None:
     #     st.session_state.map_obj = map_obj
     #
     # # 5. 展示结果
-    # ui.render_trip_result(trip_data)
+    # ui_manager.render_trip_result(trip_data)
 
 if __name__ == "__main__":
     main()

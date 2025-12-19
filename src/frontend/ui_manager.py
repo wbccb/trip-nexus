@@ -9,7 +9,7 @@ from src.frontend.context.entity import Message
 from src.llm.llm_manager import LlmManager
 from src.config import Config
 
-class TripUI:
+class UIManager:
     def __init__(self, llm_manager: LlmManager, config: Config):
         st.set_page_config(page_title="TripNexus", layout="wide")
         self._init_session_state()
@@ -232,7 +232,7 @@ class TripUI:
                     st.session_state.chat_history.append(assistant_msg)
 
                     # 3.5 更新上下文
-                    # self.conversation_manager.process_new_message(user_id, device_id, full_response)
+                    self.conversation_manager.process_new_message(user_id, device_id, full_response)
 
                 except Exception as e:
                     error_msg = f"对话处理出错: {str(e)}"
