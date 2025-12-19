@@ -246,7 +246,8 @@ class TripUI:
     def _reset_conversation(self, user_id: str, device_id: str) -> None:
         """清空对话框的内容"""
         # 重置聊天历史为空列表
-        st.session_state.chat_history = []
+        st.session_state.clear()
+        self._init_session_state()
         # 可选：重置会话ID（如果需要全新会话上下文）
         st.session_state.current_conversation_id = self.conversation_manager.generate_session_id(user_id, device_id)
         # 可选：清空后给出提示
