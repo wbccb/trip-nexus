@@ -1,6 +1,6 @@
-from src.frontend.context.conversation_storage import ConversationStorage
+from src.frontend.context.storage import get_conversation_storage, BaseConversationStorage
 from src.frontend.context.entity import *
-
+import json
 """
 会话管理：
 1. 提取实体
@@ -9,7 +9,7 @@ from src.frontend.context.entity import *
 4. 动态优化上下文，构建LLM输入:检查会话token，自动调用上面的步骤来构建出会话的prompt
 """
 class ConversationManager:
-    def __init__(self, conversation_storage: ConversationStorage, llm_client=None):
+    def __init__(self, conversation_storage: BaseConversationStorage, llm_client=None):
         self.conversationStorage = conversation_storage
         self.llm_client = llm_client  # 假设传入一个LLM客户端
 

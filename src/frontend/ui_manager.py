@@ -4,7 +4,7 @@ from typing import Optional, Dict, List, Any
 from datetime import datetime
 
 from src.frontend.context.conversation_manager import ConversationManager
-from src.frontend.context.conversation_storage import ConversationStorage
+from src.frontend.context.storage import get_conversation_storage
 from src.frontend.context.entity import Message
 from src.llm.llm_manager import LlmManager
 from src.config import Config
@@ -14,7 +14,7 @@ class UIManager:
         st.set_page_config(page_title="TripNexus", layout="wide")
         self._init_session_state()
         self.llm_manager = llm_manager
-        self.conversation_storage = ConversationStorage(config)
+        self.conversation_storage = get_conversation_storage(config)
         self.conversation_manager = ConversationManager(conversation_storage=self.conversation_storage)
 
     def _init_session_state(self) -> None:
@@ -214,34 +214,35 @@ class UIManager:
                 message_placeholder = st.empty()
                 full_response = ""
 
-                try:
-                    # TODO 调用LLM获取响应（这里需要实现后端逻辑）
-                    full_response = self.llm_manager.change_trip(prompt)
-                    message_placeholder.markdown(full_response)
+                # try:
+                # TODO 调用LLM获取响应（这里需要实现后端逻辑）
+                full_response = self.llm_manager.change_trip(prompt)
+                message_placeholder.markdown(full_response)
 
-                    # 3.4 添加AI响应到历史（实现递增的核心：历史列表追加）
-                    assistant_msg = {
-                        "role": "assistant",
-                        "content": full_response,
-                        "timestamp": datetime.now().isoformat(),
-                        "metadata": {
-                            "context_type": "trip_modification",
-                            "conversation_id": st.session_state.current_conversation_id
-                        }
+                # 3.4 添加AI响应到历史（实现递增的核心：历史列表追加）
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": full_response,
+                    "timestamp": datetime.now().isoformat(),
+                    "metadata": {
+                        "context_type": "trip_modification",
+                        "conversation_id": st.session_state.current_conversation_id
                     }
-                    st.session_state.chat_history.append(assistant_msg)
+                }
+                st.session_state.chat_history.append(assistant_msg)
 
-                    # 3.5 更新上下文
-                    self.conversation_manager.process_new_message(user_id, device_id, full_response)
+                # 3.5 更新上下文
+                message_obj = Message.model_validate(assistant_msg)
+                self.conversation_manager.process_new_message(user_id, device_id, message_obj)
 
-                except Exception as e:
-                    error_msg = f"对话处理出错: {str(e)}"
-                    message_placeholder.error(error_msg)
-                    st.session_state.chat_history.append({
-                        "role": "assistant",
-                        "content": error_msg,
-                        "error": True
-                    })
+                # except Exception as e:
+                #     error_msg = f"对话处理出错: {str(e)}"
+                #     message_placeholder.error(error_msg)
+                #     st.session_state.chat_history.append({
+                #         "role": "assistant",
+                #         "content": error_msg,
+                #         "error": True
+                #     })
 
     def _reset_conversation(self, user_id: str, device_id: str) -> None:
         """清空对话框的内容"""

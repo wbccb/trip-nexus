@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Any
 import torch  # 仍然保留，以防其他部分使用，但在 __init__ 中不再强制需要
 
 # 导入 Ollama 替代 HuggingFacePipeline
-from langchain_community.llms import Ollama
+from langchain_ollama import OllamaLLM  # 从独立包导入
 # from langchain_ollama import OllamaLLM
 import json
 import re
@@ -47,7 +47,7 @@ class LlmManager:
 
         # 1. 实例化 Ollama LLM
         # LangChain 的 Ollama 接口会通过 HTTP API 与 Ollama 服务器通信
-        self.llm = Ollama(
+        self.llm = OllamaLLM(
             base_url=ollama_base_url,
             model=model_name,
             # 设置一些生成参数，与你原代码中的 pipeline 保持一致
