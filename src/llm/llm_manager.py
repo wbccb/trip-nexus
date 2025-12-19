@@ -163,4 +163,4 @@ class LlmManager:
                     return None
 
     def change_trip(self, query: str):
-        return ["这是", "新生成的行程"]
+        return "模拟AI回复: " + f"{query}"

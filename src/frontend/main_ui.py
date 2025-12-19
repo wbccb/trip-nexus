@@ -1,7 +1,7 @@
 import streamlit as st
 from streamlit_folium import st_folium
 from typing import Optional, Dict, List, Any
-import datetime
+from datetime import datetime
 
 from src.frontend.context.conversation_manager import ConversationManager
 from src.frontend.context.conversation_storage import ConversationStorage
@@ -10,19 +10,24 @@ from src.llm.llm_manager import LlmManager
 from src.config import Config
 
 class TripUI:
-    def __init__(self, llm: LlmManager, config: Config):
+    def __init__(self, llm_manager: LlmManager, config: Config):
         st.set_page_config(page_title="TripNexus", layout="wide")
         self._init_session_state()
-        self.llm = llm
+        self.llm_manager = llm_manager
         self.conversation_storage = ConversationStorage(config)
         self.conversation_manager = ConversationManager(conversation_storage=self.conversation_storage)
 
     def _init_session_state(self) -> None:
         """初始化会话状态"""
-        required_keys = {"trip_data", "map_obj", "edit_cmd"}
+        required_keys = {"trip_data", "map_obj", "edit_cmd", "current_conversation_id"}
         for key in required_keys:
             if key not in st.session_state:
                 st.session_state[key] = None
+
+        required_array_keys = {"chat_history"}
+        for key in required_array_keys:
+            if key not in st.session_state:
+                st.session_state[key] = []
 
     def render_input_form(self) -> Optional[Dict[str, Any]]:
         """渲染输入表单，返回结构化参数"""
@@ -169,46 +174,53 @@ class TripUI:
                 case _:
                     return None
 
-    def render_chat_interface(self) -> None:
+    def render_chat_interface(self, user_id: str, device_id: str) -> None:
         """渲染聊天界面，支持多轮对话"""
         st.sidebar.subheader("💬 行程对话助手")
 
         # 使用st.chat_message构建聊天界面
         chat_container = st.container()
 
-        # with chat_container:
-        #     # 显示对话历史
-        #     for message in st.session_state.chat_history:
-        #         with st.chat_message(message["role"]):
-        #             st.markdown(message["content"])
-        #             if "metadata" in message:
-        #                 st.caption(f"上下文: {message['metadata'].get('context_type', '')}")
+        with chat_container:
+            # 显示对话历史
+            for message in st.session_state.chat_history:
+                with st.chat_message(message["role"]):
+                    # 显示消息内容
+                    st.markdown(message["content"])
+                    # 显示元数据（如果有）
+                    if "metadata" in message:
+                        st.caption(f"上下文: {message['metadata'].get('context_type', '无')}")
+                    # 显示错误标记（如果有）
+                    if message.get("error", False):
+                        st.caption("⚠️ 消息处理出错")
 
         # 用户输入
         if prompt := st.chat_input("告诉我您想如何调整行程？"):
-            # 添加用户消息到历史
-            st.session_state.chat_history.append({
+            # 3.1 添加用户消息到历史
+            user_msg = {
                 "role": "user",
                 "content": prompt,
                 "timestamp": datetime.now().isoformat()
-            })
+            }
+            st.session_state.chat_history.append(user_msg)
 
-            # 显示用户消息
-            with st.chat_message("user"):
-                st.markdown(prompt)
+            # 3.2 即时显示用户消息（也可以依赖历史渲染，但这里即时显示更流畅）
+            with chat_container:  # 注意：这里用chat_container包裹，确保消息在同一个容器中
+                with st.chat_message(user_msg["role"]):
+                    st.markdown(user_msg["content"])
 
-            # 获取AI响应
+            # 3.3 获取AI响应并显示（核心：追加到历史，而非覆盖）
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
                 full_response = ""
 
                 try:
                     # TODO 调用LLM获取响应（这里需要实现后端逻辑）
-                    full_response = self.llm.change_trip(prompt)
+                    full_response = self.llm_manager.change_trip(prompt)
                     message_placeholder.markdown(full_response)
 
-                    # 添加AI消息到历史
-                    st.session_state.chat_history.append({
+                    # 3.4 添加AI响应到历史（实现递增的核心：历史列表追加）
+                    assistant_msg = {
                         "role": "assistant",
                         "content": full_response,
                         "timestamp": datetime.now().isoformat(),
@@ -216,10 +228,11 @@ class TripUI:
                             "context_type": "trip_modification",
                             "conversation_id": st.session_state.current_conversation_id
                         }
-                    })
+                    }
+                    st.session_state.chat_history.append(assistant_msg)
 
-                    # 更新上下文
-                    self._update_conversation_context(prompt, full_response)
+                    # 3.5 更新上下文
+                    # self.conversation_manager.process_new_message(user_id, device_id, full_response)
 
                 except Exception as e:
                     error_msg = f"对话处理出错: {str(e)}"
@@ -273,4 +286,4 @@ class TripUI:
         # else:
         #     st.info("请先生成行程，然后可以使用对话功能进行调整")
         #     self.render_input_form()
-        self.render_chat_interface()
+        self.render_chat_interface(user_id, device_id)

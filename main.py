@@ -10,9 +10,8 @@ def main() -> None:
     config = Config()
     map_renderer = TripMap()
     llm_manager = LlmManager()
-    llm = llm_manager.get_llm()
     # rag = AIRetrievalPipeline(llm)
-    ui = TripUI(llm, config)
+    ui = TripUI(llm_manager, config)
 
     # 版本信息
     st.sidebar.markdown(f"### 📱 版本: v{__version__}")
