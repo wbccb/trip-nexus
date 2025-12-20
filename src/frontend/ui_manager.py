@@ -5,10 +5,11 @@ from datetime import datetime
 
 from src.frontend.context.conversation_manager import ConversationManager
 from src.frontend.context.storage import get_conversation_storage
-from src.frontend.context.entity import Message
+from src.frontend.context.entity import Message, MessageType
 from src.llm.llm_manager import LlmManager
 from src.config import Config
 from src.utils.console import console_log
+import json
 
 class UIManager:
     def __init__(self, llm_manager: LlmManager, config: Config):
@@ -204,6 +205,10 @@ class UIManager:
                 "timestamp": datetime.now().isoformat()
             }
             st.session_state.chat_history.append(user_msg)
+            # 3.5 更新上下文
+            user_message_obj = Message.model_validate(user_msg)
+            self.conversation_manager.process_new_message(user_id, device_id, user_message_obj, session_id)
+
 
             # 3.2 即时显示用户消息（也可以依赖历史渲染，但这里即时显示更流畅）
             with chat_container:  # 注意：这里用chat_container包裹，确保消息在同一个容器中
@@ -233,8 +238,8 @@ class UIManager:
                 st.session_state.chat_history.append(assistant_msg)
 
                 # 3.5 更新上下文
-                message_obj = Message.model_validate(assistant_msg)
-                self.conversation_manager.process_new_message(user_id, device_id, message_obj, session_id)
+                assistant_message_obj = Message.model_validate(assistant_msg)
+                self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
 
                 # except Exception as e:
                 #     error_msg = f"对话处理出错: {str(e)}"
@@ -294,7 +299,7 @@ class UIManager:
 
     def render_session_list(self, user_id: str, device_id: str) -> None:
         """绘制左侧的会话列表"""
-        with st.sidebar:
+        with (st.sidebar):
             st.subheader("会话列表", divider="gray")
 
             # 1. 新会话按钮
@@ -338,7 +343,7 @@ class UIManager:
                             use_container_width=True,
                             help="删除该会话"
                     ):
-                        # TODO 数据库需要删除会话
+                        self.conversation_storage.delete_session(session_id=session_id)
                         if session_id == st.session_state.current_conversation_id:
                             st.session_state.current_conversation_id = None
                             st.session_state.chat_history = []
@@ -347,9 +352,15 @@ class UIManager:
             # 3. 处理会话切换逻辑
             if selected_session_id:
                 st.session_state.current_conversation_id = selected_session_id
-                st.session_state.chat_history = self.conversation_storage.get_short_term_context(selected_session_id)
+                short_term_list = self.conversation_storage.get_short_term_context(selected_session_id)
+                if not short_term_list:
+                    session_chat_list = self.conversation_storage.get_session_chat_list(selected_session_id)
+                    short_term_list = [
+                        json.loads(msg_str) for msg_str in session_chat_list
+                    ]
+                st.session_state.chat_history = short_term_list
                 # 刷新页面
                 st.rerun()
 
-        return st.session_state.current_conversation_id
+            return st.session_state.current_conversation_id
 

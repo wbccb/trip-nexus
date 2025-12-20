@@ -2,9 +2,10 @@ import hashlib
 import json
 import sqlite3
 import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from src.frontend.context.entity import SessionContext, CoreEntity
 from src.config import Config
+from src.utils.console import console_log
 from .base_storage import BaseConversationStorage
 from .date_time_encoder import DateTimeEncoder
 
@@ -38,6 +39,16 @@ class TestConversationStorage(BaseConversationStorage):
         )
         """)
 
+        # 聊天数据
+        cursor.execute("""
+       CREATE TABLE IF NOT EXISTS session_chat (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           session_id TEXT NOT NULL,
+           message TEXT NOT NULL,
+           update_time TIMESTAMP NOT NULL
+       )
+       """)
+
         # 核心实体表（对应MySQL的core_entities）
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS core_entities (
@@ -65,7 +76,7 @@ class TestConversationStorage(BaseConversationStorage):
 
     def _redis_setex(self, key: str, expire: datetime.timedelta, value: str):
         expire_ts = datetime.datetime.now().timestamp() + expire.total_seconds()
-        self.redis_mock[key] = (key, expire_ts)
+        self.redis_mock[key] = (value, expire_ts)
 
     def _redis_get(self, key: str) -> Optional[str]:
         if self._is_key_expired(key):
@@ -92,11 +103,22 @@ class TestConversationStorage(BaseConversationStorage):
         # 模拟Redis 2小时过期
         self._redis_setex(key, datetime.timedelta(hours=2), json.dumps(data, cls=DateTimeEncoder))
 
-    def get_short_term_context(self, session_id: str) -> Optional[Dict]:
+
+
+    def get_short_term_context(self, session_id: str) -> List[Dict]:
         """获取短期上下文（模拟Redis）"""
         key = f"session:{session_id}:short_term"
         data = self._redis_get(key)
-        return json.loads(data) if data is not None else []
+        if not data:
+            return []
+        console_log("get_short_term_context:"+data)
+        console_log(data)
+
+        parsed_data = json.loads(data)
+        if isinstance(parsed_data, dict):
+            return parsed_data
+        else:
+            return []
 
     def store_core_entities(self, session_id: str, entities: CoreEntity):
         """存储核心实体（模拟Redis + SQLite）"""
@@ -176,3 +198,32 @@ class TestConversationStorage(BaseConversationStorage):
         cursor = self.sqlite_conn.cursor()
         cursor.execute("SELECT * FROM session_list WHERE user_id = ?", (user_id,))
         return cursor.fetchall()
+
+    def delete_session(self, session_id: str):
+        cursor = self.sqlite_conn.cursor()
+        cursor.execute("DELETE FROM session_list WHERE session_id = ?", (session_id,))
+        self.sqlite_conn.commit()
+
+    def store_session_chat(self, session_id: str, message: str):
+        update_time = datetime.datetime.now().isoformat()
+        cursor = self.sqlite_conn.cursor()
+        cursor.execute("""
+            INSERT INTO session_chat (session_id, message, update_time)
+            VALUES (?, ?, ?)
+        """, (session_id, message, update_time))
+        self.sqlite_conn.commit()
+
+    def get_session_chat_list(self, session_id: str):
+        cursor = self.sqlite_conn.cursor()
+        cursor.execute("""
+            SELECT message
+            FROM session_chat
+            WHERE session_id = ?
+            ORDER BY update_time ASC
+        """, (session_id,))
+        return [row[0] for row in cursor.fetchall()]
+
+    def delete_session_chat_by_id(self, chat_id: int):
+        cursor = self.sqlite_conn.cursor()
+        cursor.execute("DELETE FROM session_chat WHERE id = ?", (chat_id,))
+        self.sqlite_conn.commit()

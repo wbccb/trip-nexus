@@ -50,3 +50,21 @@ class BaseConversationStorage(ABC):
         """会话数据列表（数据库）"""
         pass
 
+    @abstractmethod
+    def delete_session(self, session_id: str) -> None:
+        """会话数据列表（数据库）"""
+        pass
+
+    @abstractmethod
+    def store_session_chat(self, session_id: str, message: str):
+        pass
+
+    @abstractmethod
+    def get_session_chat_list(self, session_id: str):
+        pass
+
+    @abstractmethod
+    def delete_session_chat_by_id(self, chat_id: int):
+        pass
+
+

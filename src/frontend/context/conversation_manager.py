@@ -203,17 +203,19 @@ class ConversationManager:
                 device_id=device_id
             )
 
-        # 2. 检查是否为冗余信息
-        message.is_redundant = self.is_redundant_message(message.content)
-
-        # 3. 获取现有核心实体
-        existing_entities = self.conversationStorage.get_core_entities(session_id) or CoreEntity()
-
-        # 4. 增量提取核心实体（如果不是冗余信息）
-        if not message.is_redundant:
-            context.core_entities = self.extract_core_entities(message.content, existing_entities)
-            # 更新存储
-            self.conversationStorage.store_core_entities(session_id, context.core_entities)
+        # 从用户消息中提取核心实体
+        if message.role == MessageType.USER:
+            # 2. 检查是否为冗余信息
+            message.is_redundant = self.is_redundant_message(message.content)
+            # 3. 获取现有核心实体
+            existing_entities = self.conversationStorage.get_core_entities(session_id) or CoreEntity()
+            # 4. 增量提取核心实体（如果不是冗余信息）
+            if not message.is_redundant:
+                context.core_entities = self.extract_core_entities(message.content, existing_entities)
+                # 更新存储
+                self.conversationStorage.store_core_entities(session_id, context.core_entities)
+        else:
+            message.is_redundant = False
 
         # 5. 添加新消息到短期窗口
         context.short_term_messages.append(message)
@@ -226,6 +228,9 @@ class ConversationManager:
 
         # 7. 更新短期存储
         self.conversationStorage.store_short_term_context(session_id, context)
+
+        # 8. 存储数据到数据库中
+        self.conversationStorage.store_session_chat(session_id, message.model_dump_json())
 
         return context
 
