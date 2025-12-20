@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import streamlit as st
 from src.frontend.ui_manager import UIManager
 from src.rag.rag_main import AIRetrievalPipeline
@@ -5,6 +7,8 @@ from src.llm.llm_manager import LlmManager
 from src.map.map_renderer import TripMap
 from __init__ import __version__, __description__
 from src.config import Config
+from src.utils.console import console_log
+
 
 def main() -> None:
     config = Config()
@@ -18,8 +22,16 @@ def main() -> None:
     st.sidebar.markdown(f"ℹ️ {__description__}")
     st.sidebar.markdown("---")
 
-    user_id = "temp"
-    device_id = "11"
+    user_id = "wcb"
+    device_id = "mac"
+    console_log("userId", user_id)
+
+    # 1. 获取会话列表数据，默认取第一个
+
+    # 2. 点击后切换当前sessionId
+
+    # 3. 重新渲染sessionId
+
     ui_manager.render_main_interface(user_id, device_id);
     #
     # # 获取用户输入

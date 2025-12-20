@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from src.frontend.context.entity import SessionContext, CoreEntity
 
 class BaseConversationStorage(ABC):
@@ -39,3 +39,14 @@ class BaseConversationStorage(ABC):
     def get_long_term_summary(self, session_id: str) -> str:
         """获取长期摘要（数据库）"""
         pass
+
+    @abstractmethod
+    def store_session(self, user_id: str, session_id: str):
+        """存储会话（数据库）"""
+        pass
+
+    @abstractmethod
+    def get_session_list(self, session_id: str) -> List[Dict]:
+        """会话数据列表（数据库）"""
+        pass
+

@@ -8,6 +8,7 @@ from src.frontend.context.storage import get_conversation_storage
 from src.frontend.context.entity import Message
 from src.llm.llm_manager import LlmManager
 from src.config import Config
+from src.utils.console import console_log
 
 class UIManager:
     def __init__(self, llm_manager: LlmManager, config: Config):
@@ -174,7 +175,7 @@ class UIManager:
                 case _:
                     return None
 
-    def render_chat_interface(self, user_id: str, device_id: str) -> None:
+    def render_chat_interface(self, user_id: str, device_id: str, session_id: str) -> None:
         """渲染聊天界面，支持多轮对话"""
         st.sidebar.subheader("💬 行程对话助手")
 
@@ -233,7 +234,7 @@ class UIManager:
 
                 # 3.5 更新上下文
                 message_obj = Message.model_validate(assistant_msg)
-                self.conversation_manager.process_new_message(user_id, device_id, message_obj)
+                self.conversation_manager.process_new_message(user_id, device_id, message_obj, session_id)
 
                 # except Exception as e:
                 #     error_msg = f"对话处理出错: {str(e)}"
@@ -259,22 +260,18 @@ class UIManager:
         # 侧边栏：聊天控制
         with st.sidebar:
             st.header("🎯 行程助手")
-
-            # 会话管理
-            if st.button("🆕 新对话"):
-                self._reset_conversation(user_id, device_id)
-
-            # 显示最近会话
-            # if hasattr(self, 'conversation_manager'):
-            #     user_id = st.session_state.get('user_id', 'anonymous')
-            #     messages: List[Message] = self.conversation_manager.get_user_conversations(user_id)
-            #     if messages:
-            #         st.subheader("📋 历史会话")
-            #         for message in messages[:5]:  # 显示最近5个
-            #             st.chat_message(message)
+            # 渲染编辑控件（原有逻辑）
+            self.render_edit_controls()
 
             st.divider()
-            self.render_edit_controls()  # 保留原有的编辑控件
+
+            # 渲染会话列表
+            current_session_id = self.render_session_list(user_id, device_id)
+
+            if not current_session_id:
+                current_session_id = self.conversation_storage.generate_session_id(user_id, device_id)
+                self.conversation_storage.store_session(user_id, current_session_id)
+                st.session_state.current_conversation_id = current_session_id
 
         # 主区域：聊天 + 行程
         # if st.session_state.trip_data:
@@ -288,4 +285,71 @@ class UIManager:
         # else:
         #     st.info("请先生成行程，然后可以使用对话功能进行调整")
         #     self.render_input_form()
-        self.render_chat_interface(user_id, device_id)
+
+        # 生成新的sessionId，然后构建出新的对话框
+        # 有一个界面可以进行sessionList的展示，点击后可以获取对应的sessionId，然后进行render_chat_interface()
+        self.render_chat_interface(user_id, device_id, current_session_id)
+
+
+
+    def render_session_list(self, user_id: str, device_id: str) -> None:
+        """绘制左侧的会话列表"""
+        with st.sidebar:
+            st.subheader("会话列表", divider="gray")
+
+            # 1. 新会话按钮
+            if st.button("新建会话", use_container_width=True):
+                console_log("新建会话:"+user_id , device_id)
+                new_session_id = self.conversation_storage.generate_session_id(user_id, device_id)
+                console_log("新建会话 new_session_id", new_session_id)
+                self.conversation_storage.store_session(user_id, session_id=new_session_id)
+                st.session_state.current_conversation_id = new_session_id
+                st.session_state.chat_history = []
+                st.rerun()
+
+            st.divider()
+            # 2. 获取会话列表
+            sessions = self.conversation_storage.get_session_list(user_id)
+            if not sessions:
+                st.info("暂无会话记录")
+                return None
+
+            selected_session_id = None
+            for idx, session in enumerate(sessions):
+                session_id = session["session_id"]
+                name = session["name"]
+
+                # 一行显示：会话按钮 + 删除按钮
+                col1, col2 = st.columns([8, 2])
+                with col1:
+                    # 会话按钮：点击后切换会话
+                    if st.button(
+                            f"{name})",
+                            key=f"session_{idx}_{session_id}",
+                            use_container_width=True,
+                            # 高亮当前选中的会话
+                            type="primary" if session_id == st.session_state.current_conversation_id else "secondary"
+                    ): selected_session_id = session_id
+                with col2:
+                    # 删除会话
+                    if st.button(
+                            "🗑️",
+                            key=f"delete_{idx}_{session_id}",
+                            use_container_width=True,
+                            help="删除该会话"
+                    ):
+                        # TODO 数据库需要删除会话
+                        if session_id == st.session_state.current_conversation_id:
+                            st.session_state.current_conversation_id = None
+                            st.session_state.chat_history = []
+                        st.rerun()
+
+            # 3. 处理会话切换逻辑
+            if selected_session_id:
+                st.session_state.current_conversation_id = selected_session_id
+                st.session_state.chat_history = self.conversation_storage.get_short_term_context(selected_session_id)
+                # 刷新页面
+                st.rerun()
+
+        return st.session_state.current_conversation_id
+

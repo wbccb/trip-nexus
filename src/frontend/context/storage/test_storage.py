@@ -20,12 +20,24 @@ class TestConversationStorage(BaseConversationStorage):
             "trip_test.db",
             check_same_thread=False,
         )
+        self.sqlite_conn.row_factory = sqlite3.Row
         # 初始化SQLite表结构
         self._init_sqlite_tables()
 
     def _init_sqlite_tables(self):
         """初始化SQLite表（与MySQL表结构一致）"""
         cursor = self.sqlite_conn.cursor()
+
+        # 会话数据
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS session_list (
+            session_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name TEXE NOT NULL,
+            update_time TIMESTAMP NOT NULL
+        )
+        """)
+
         # 核心实体表（对应MySQL的core_entities）
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS core_entities (
@@ -84,7 +96,7 @@ class TestConversationStorage(BaseConversationStorage):
         """获取短期上下文（模拟Redis）"""
         key = f"session:{session_id}:short_term"
         data = self._redis_get(key)
-        return json.loads(data) if data is not None else None
+        return json.loads(data) if data is not None else []
 
     def store_core_entities(self, session_id: str, entities: CoreEntity):
         """存储核心实体（模拟Redis + SQLite）"""
@@ -145,3 +157,22 @@ class TestConversationStorage(BaseConversationStorage):
         cursor.execute("SELECT summary FROM long_term_summaries WHERE session_id = ?", (session_id,))
         result = cursor.fetchone()
         return result[0] if result else ""
+
+    def store_session(self, user_id: str, session_id: str):
+        update_time = datetime.datetime.now().isoformat()
+        name = f"名称{session_id}-{update_time}"
+        cursor = self.sqlite_conn.cursor()
+        cursor.execute("""
+               INSERT INTO session_list (session_id, user_id, name, update_time)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                   name = excluded.name,
+                   update_time = excluded.update_time,
+                   user_id = excluded.user_id
+               """, (session_id, user_id, name, update_time))
+        self.sqlite_conn.commit()
+
+    def get_session_list(self, user_id: str):
+        cursor = self.sqlite_conn.cursor()
+        cursor.execute("SELECT * FROM session_list WHERE user_id = ?", (user_id,))
+        return cursor.fetchall()

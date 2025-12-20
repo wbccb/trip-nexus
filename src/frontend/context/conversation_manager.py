@@ -178,11 +178,11 @@ class ConversationManager:
 
         return base_context
 
-    def process_new_message(self, user_id: str, device_id: str, message: Message) -> SessionContext:
+    def process_new_message(self, user_id: str, device_id: str, message: Message, session_id: str) -> SessionContext:
         """处理新消息，更新上下文"""
 
         # 1. 获取或创建会话
-        session_id = self.conversationStorage.generate_session_id(user_id, device_id)
+        # session_id = self.conversationStorage.generate_session_id(user_id, device_id)
         short_term_data = self.conversationStorage.get_short_term_context(session_id)
 
         if short_term_data:
