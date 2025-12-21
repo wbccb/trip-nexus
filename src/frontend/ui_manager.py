@@ -221,9 +221,13 @@ class UIManager:
                 full_response = ""
 
                 # try:
-                # TODO 调用LLM获取响应（这里需要实现后端逻辑）
+                # 调用LLM获取响应，进行旅游行程的修改
+                print(f"调用LLM获取响应，进行旅游行程的修改，prompt: {prompt}")
+
                 full_response = self.llm_manager.change_trip(prompt)
                 message_placeholder.markdown(full_response)
+
+                print(f"调用LLM获取响应，进行旅游行程的修改，response: {full_response}")
 
                 # 3.4 添加AI响应到历史（实现递增的核心：历史列表追加）
                 assistant_msg = {
