@@ -310,6 +310,29 @@ class UIManager:
                 #         "error": True
                 #     })
 
+    def _display_trip_in_chat(self, trip_data: Dict[str, Any]):
+        """在聊天界面中显示格式化的行程"""
+        if not trip_data:
+            return
+
+        # 生成Markdown格式
+        trip_markdown = self._format_trip_as_markdown(trip_data)
+
+        # 使用expander折叠详细行程，避免聊天界面过长
+        with st.expander("🗺️ 查看详细行程安排", expanded=False):
+            st.markdown(trip_markdown)
+
+        # 添加快速操作按钮
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("🔄 重新生成", key=f"regen_{datetime.now().timestamp()}"):
+                # TODO 待实现
+                st.rerun()
+        with col2:
+            if st.button("✏️ 修改行程", key=f"edit_{datetime.now().timestamp()}"):
+                # TODO 待实现
+                st.rerun()
+
     def _format_trip_as_markdown(self, trip_data: Dict[str, Any]) -> str:
         """将行程数据转换为美观的Markdown格式"""
         if not trip_data:
@@ -391,32 +414,6 @@ class UIManager:
         except Exception as e:
             print(f"❌ 行程格式化失败: {str(e)}")
             return f"❌ 行程数据格式错误，无法显示。错误: {str(e)}"
-
-    def _display_trip_in_chat(self, trip_data: Dict[str, Any]):
-        """在聊天界面中显示格式化的行程"""
-        if not trip_data:
-            return
-
-        # 生成Markdown格式
-        trip_markdown = self._format_trip_as_markdown(trip_data)
-
-        # 使用expander折叠详细行程，避免聊天界面过长
-        with st.expander("🗺️ 查看详细行程安排", expanded=False):
-            st.markdown(trip_markdown)
-
-        # 添加快速操作按钮
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("🔄 重新生成", key=f"regen_{datetime.now().timestamp()}"):
-                st.session_state.edit_cmd = {"type": "regenerate"}
-                st.rerun()
-        with col2:
-            if st.button("✏️ 修改行程", key=f"edit_{datetime.now().timestamp()}"):
-                st.session_state.show_edit_controls = True
-        with col3:
-            if st.button("💾 保存行程", key=f"save_{datetime.now().timestamp()}"):
-                st.success("✅ 行程已保存到您的账户！")
-
 
     def _reset_conversation(self, user_id: str, device_id: str) -> None:
         """清空对话框的内容"""
