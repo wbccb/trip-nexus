@@ -21,6 +21,7 @@ class Message(BaseModel):
     content: str
     timestamp: datetime = Field(default_factory=datetime.now)
     is_redundant: bool = False  # 标记是否为寒暄等冗余信息
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 class CoreEntity(BaseModel):
     destination: Optional[str] = None

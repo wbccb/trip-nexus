@@ -189,9 +189,16 @@ class UIManager:
                 with st.chat_message(message["role"]):
                     # 显示消息内容
                     st.markdown(message["content"])
-                    # 显示元数据（如果有）
-                    if "metadata" in message:
-                        st.caption(f"上下文: {message['metadata'].get('context_type', '无')}")
+                    print(f"显示对话历史，旅游数据为: {message}")
+                    if isinstance(message, dict) and "metadata" in message and "trip_data" in message["metadata"]:
+                        trip_data = message["metadata"]["trip_data"]
+                        if trip_data:
+                            st.divider()
+                            st.markdown("### 🎯 为您生成的行程方案")
+                            # 显示格式化的行程
+                            self._display_trip_in_chat(trip_data)
+                            # 添加视觉提示
+                            st.success("✨ 行程已生成！右侧地图和详细安排已更新。")
                     # 显示错误标记（如果有）
                     if message.get("error", False):
                         st.caption("⚠️ 消息处理出错")
@@ -202,7 +209,8 @@ class UIManager:
             user_msg = {
                 "role": "user",
                 "content": prompt,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "metadata": {}
             }
             st.session_state.chat_history.append(user_msg)
             # 3.5 更新上下文
@@ -292,7 +300,8 @@ class UIManager:
                     "metadata": {
                         "context_type": "trip_modification",
                         "conversation_id": st.session_state.current_conversation_id,
-                        "has_trip_data": bool(trip_data if 'trip_data' in locals() else False)
+                        "has_trip_data": bool(trip_data if 'trip_data' in locals() else False),
+                        "trip_data": trip_data
                     }
                 }
                 st.session_state.chat_history.append(assistant_msg)
