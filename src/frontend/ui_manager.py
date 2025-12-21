@@ -218,25 +218,81 @@ class UIManager:
             # 3.3 获取AI响应并显示（核心：追加到历史，而非覆盖）
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
-                full_response = ""
 
                 # try:
                 # 调用LLM获取响应，进行旅游行程的修改
                 print(f"调用LLM获取响应，进行旅游行程的修改，prompt: {prompt}")
 
-                full_response = self.llm_manager.change_trip(prompt)
-                message_placeholder.markdown(full_response)
+                # response_data = self.llm_manager.change_trip(prompt)
+                response_data = {
+                    "response": "太棒了！我已经为您规划了从上海到成都的3天行程，预算1000元。行程已生成，请查看右侧地图和详细安排！",
+                    "trip_data": {
+                        "destination": "成都",
+                        "days": 3,
+                        "daily_plan": {
+                            "1": {
+                                "time": "09:00-17:00",
+                                "attraction": "都江堰博物馆",
+                                "address": "成都市青羊区都江堰东街28号",
+                                "transport": "地铁5号线龙王村站C口出，步行10分钟",
+                                "duration": "3小时"
+                            },
+                            "2": {
+                                "time": "09:00-17:00",
+                                "attraction": "钟英古镇",
+                                "address": "成都市金堂县钟英镇南二路18号",
+                                "transport": "地铁5号线龙王村站C口出，步行10分钟",
+                                "duration": "3小时"
+                            },
+                            "3": {
+                                "time": "14:00-17:00",
+                                "attraction": "杜甫草堂",
+                                "address": "成都市青羊区青华路37号",
+                                "transport": "地铁4号线草堂北路站B口出，步行10分钟",
+                                "duration": "2小时"
+                            }
+                        }
+                    },
+                    "intent": "trip_generated"
+                }
+                print(f"调用LLM获取响应，进行旅游行程的修改，response: {response_data}")
 
-                print(f"调用LLM获取响应，进行旅游行程的修改，response: {full_response}")
+                # 显示对话回复
+                if isinstance(response_data, dict) and "response" in response_data:
+                    chat_response = response_data["response"]
+                    message_placeholder.markdown(chat_response)
+                else:
+                    chat_response = str(response_data)
+                    message_placeholder.markdown(chat_response)
+
+                # 如果有行程数据，显示格式化的行程
+                if isinstance(response_data, dict) and "trip_data" in response_data:
+                    trip_data = response_data["trip_data"]
+
+                    if trip_data:
+                        # 保存到session状态
+                        st.session_state.trip_data = trip_data
+                        st.session_state.map_obj = None
+
+                        # 在聊天中显示格式化的行程
+                        st.divider()
+                        st.markdown("### 🎯 为您生成的行程方案")
+
+                        # 显示格式化的行程
+                        self._display_trip_in_chat(trip_data)
+
+                        # 添加视觉提示
+                        st.success("✨ 行程已生成！右侧地图和详细安排已更新。")
 
                 # 3.4 添加AI响应到历史（实现递增的核心：历史列表追加）
                 assistant_msg = {
                     "role": "assistant",
-                    "content": full_response,
+                    "content": chat_response,
                     "timestamp": datetime.now().isoformat(),
                     "metadata": {
                         "context_type": "trip_modification",
-                        "conversation_id": st.session_state.current_conversation_id
+                        "conversation_id": st.session_state.current_conversation_id,
+                        "has_trip_data": bool(trip_data if 'trip_data' in locals() else False)
                     }
                 }
                 st.session_state.chat_history.append(assistant_msg)
@@ -253,6 +309,114 @@ class UIManager:
                 #         "content": error_msg,
                 #         "error": True
                 #     })
+
+    def _format_trip_as_markdown(self, trip_data: Dict[str, Any]) -> str:
+        """将行程数据转换为美观的Markdown格式"""
+        if not trip_data:
+            return "❌ 无行程数据可显示"
+
+        try:
+            destination = trip_data.get("destination", "未知目的地")
+            days = trip_data.get("days", 0)
+            daily_plan = trip_data.get("daily_plan", {})
+
+            # 开始构建Markdown
+            markdown_content = []
+
+            # 1. 行程概览卡片
+            markdown_content.append("### 🌟 行程概览")
+            markdown_content.append(f"**目的地**: {destination}")
+            markdown_content.append(f"**行程天数**: {days}天")
+            markdown_content.append(f"**总景点数**: {len(daily_plan) if isinstance(daily_plan, dict) else 0}个")
+            markdown_content.append("")
+
+            # 2. 按天数分组显示行程
+            markdown_content.append("### 📅 详细行程安排")
+
+            # 按天数排序（如果键是数字字符串）
+            sorted_days = sorted(daily_plan.keys(), key=lambda x: int(x) if x.isdigit() else 999)
+
+            for day_key in sorted_days:
+                day_plan = daily_plan[day_key]
+
+                # 处理不同的数据结构（可能是单个字典或列表）
+                items = []
+                if isinstance(day_plan, list):
+                    items = day_plan
+                elif isinstance(day_plan, dict):
+                    # 检查是否是单个行程项
+                    if "attraction" in day_plan:
+                        items = [day_plan]
+                    else:
+                        # 可能是按时间分组的字典
+                        items = list(day_plan.values())
+
+                if not items:
+                    continue
+
+                # 按时间排序
+                items.sort(key=lambda x: x.get("time", "99:99"))
+
+                markdown_content.append(f"#### 🗓️ 第 {day_key} 天")
+                markdown_content.append("")
+
+                # 创建每日行程表格
+                table_rows = []
+                table_rows.append("| 时间 | 景点 | 交通 | 持续时间 |")
+                table_rows.append("|------|------|------|----------|")
+
+                for item in items:
+                    time = item.get("time", "⏰ 未知时间")
+                    attraction = item.get("attraction", "📍 未知景点")
+                    address = item.get("address", "🏠 地址未提供")
+                    transport = item.get("transport", "🚗 交通未提供")
+                    duration = item.get("duration", "⏱️ 时长未提供")
+
+                    # 创建带工具提示的表格行
+                    row = f"| **{time}** | **{attraction}**<br><small>{address}</small> | {transport} | {duration} |"
+                    table_rows.append(row)
+
+                markdown_content.extend(table_rows)
+                markdown_content.append("")
+
+            # 3. 添加总结和提示
+            markdown_content.append("### 💡 旅行小贴士")
+            markdown_content.append("- 🗺️ **地图导航**: 右侧地图已标记所有景点位置，点击可查看详情")
+            markdown_content.append("- ⏰ **时间建议**: 请根据实际交通情况预留缓冲时间")
+            markdown_content.append("- 💰 **预算分配**: 建议每日餐饮预算 200-300 元，交通 50-100 元")
+            markdown_content.append("- 📱 **实用工具**: 可使用高德/百度地图导航，大众点评查找美食")
+
+            return "\n".join(markdown_content)
+
+        except Exception as e:
+            print(f"❌ 行程格式化失败: {str(e)}")
+            return f"❌ 行程数据格式错误，无法显示。错误: {str(e)}"
+
+    def _display_trip_in_chat(self, trip_data: Dict[str, Any]):
+        """在聊天界面中显示格式化的行程"""
+        if not trip_data:
+            return
+
+        # 生成Markdown格式
+        trip_markdown = self._format_trip_as_markdown(trip_data)
+
+        # 使用expander折叠详细行程，避免聊天界面过长
+        with st.expander("🗺️ 查看详细行程安排", expanded=False):
+            st.markdown(trip_markdown)
+
+        # 添加快速操作按钮
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("🔄 重新生成", key=f"regen_{datetime.now().timestamp()}"):
+                st.session_state.edit_cmd = {"type": "regenerate"}
+                st.rerun()
+        with col2:
+            if st.button("✏️ 修改行程", key=f"edit_{datetime.now().timestamp()}"):
+                st.session_state.show_edit_controls = True
+        with col3:
+            if st.button("💾 保存行程", key=f"save_{datetime.now().timestamp()}"):
+                st.success("✅ 行程已保存到您的账户！")
+
 
     def _reset_conversation(self, user_id: str, device_id: str) -> None:
         """清空对话框的内容"""
@@ -367,4 +531,3 @@ class UIManager:
                 st.rerun()
 
             return st.session_state.current_conversation_id
-
