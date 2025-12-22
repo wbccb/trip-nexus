@@ -1,6 +1,12 @@
 from src.frontend.context.storage import get_conversation_storage, BaseConversationStorage
 from src.frontend.context.entity import *
 import json
+from datetime import datetime
+from typing import Optional
+from pydantic import ValidationError
+import re
+from src.llm.llm_manager import LlmManager
+
 """
 会话管理：
 1. 提取实体
@@ -9,9 +15,9 @@ import json
 4. 动态优化上下文，构建LLM输入:检查会话token，自动调用上面的步骤来构建出会话的prompt
 """
 class ConversationManager:
-    def __init__(self, conversation_storage: BaseConversationStorage, llm_client=None):
+    def __init__(self, conversation_storage: BaseConversationStorage, llm_manager: LlmManager):
         self.conversationStorage = conversation_storage
-        self.llm_client = llm_client  # 假设传入一个LLM客户端
+        self.llm_manager = llm_manager  # 假设传入一个LLM客户端
 
     def is_redundant_message(self, message: str) -> bool:
         """判断是否为冗余信息（寒暄等）"""
@@ -22,69 +28,96 @@ class ConversationManager:
         return any(phrase.lower() in message.lower() for phrase in redundant_phrases)
 
     def extract_core_entities(self, new_message: str, existing_entities: CoreEntity) -> CoreEntity:
-        """使用LLM增量提取核心实体"""
-        if not self.llm_client:
+        """
+        使用LLM增量提取核心实体，并安全地合并到现有状态中。
+        """
+        if not self.llm_manager:
             return existing_entities
 
-        # 构建Prompt引导LLM提取增量信息
+        # 1. 序列化现有数据（处理 None 情况）
+        # 使用 model_dump_json (Pydantic v2) 或 json() (Pydantic v1)
+        existing_json = "{}"
+        if existing_entities:
+            existing_json = existing_entities.model_dump_json(exclude_none=True, indent=2)
+
+        # 2. 优化 Prompt：增加约束，防止 LLM 幻觉或格式错误
         prompt = f"""
-        你是一个上下文管理助手，负责从对话中提取关键信息。请分析以下新消息，并与现有信息对比：
+        你是一个专业的数据处理助手。你的任务是从用户的新消息中提取旅游意向实体，并进行增量更新。
 
-        现有信息：
-        {existing_entities.json(indent=2)}
+        【已知实体信息】:
+        {existing_json}
 
-        新消息：
-        {new_message}
+        【用户新消息】:
+        "{new_message}"
 
-        请只提取新出现的或需要更新的关键信息，格式为JSON：
-        {{
-            "destination": "string or null",
-            "budget": "number or null",
-            "travel_dates": ["date1", "date2"] or null,
-            "preferences": {{
-                "key1": "value1",
-                "key2": "value2"
-            }}
-        }}
-
-        注意：
-        1. 如果某字段没有新信息，返回null
-        2. 只提取明确提到的信息
-        3. 保持数据类型正确
+        【输出要求】:
+        1. 请分析新消息是否补充或修正了已知信息。
+        2. 严格按以下 JSON 结构输出（仅输出 JSON，不要 Markdown 标签）：
+           {{
+               "destination": "地点(str)",
+               "budget": 数字(float/int),
+               "travel_dates": ["YYYY-MM-DD", "YYYY-MM-DD"],
+               "preferences": {{ "标签": "具体描述" }}
+           }}
+        3. 如果某项信息在“新消息”中未提及，请在该字段填 null。
+        4. 只有当新消息明确提到新偏好时，才更新 preferences。
         """
 
         try:
-            response = self.llm_client.generate(
-                prompt=prompt,
-                max_tokens=500,
-                temperature=0.1,
-                response_format={"type": "json_object"}
-            )
+            # 3. 调用 LLM，启用 JSON Mode
+            response_text = self.llm_manager.get_llm().invoke(prompt)
 
-            new_entities = CoreEntity.parse_raw(response)
+            # 4. 解析 LLM 返回的 JSON
+            # 考虑到某些 LLM 可能会返回带有 Markdown 标签的字符串，进行简单清洗
+            clean_response = self.llm_manager.extract_json_from_string(response_text)
+            # 处理可能的非JSON响应
+            if not clean_response.startswith('{'):
+                # 尝试从文本中提取JSON
+                json_match = re.search(r'\{.*\}', clean_response, re.DOTALL)
+                if json_match:
+                    clean_response = json_match.group(0)
+                else:
+                    # 如果找不到JSON，返回默认结构
+                    return self._get_default_intent()
 
-            # 合并新旧实体，新实体优先
-            updated_entities = existing_entities.copy()
+            extracted_data = json.loads(clean_response)
 
-            if new_entities.destination:
-                updated_entities.destination = new_entities.destination
-            if new_entities.budget is not None:
-                updated_entities.budget = new_entities.budget
-            if new_entities.travel_dates:
-                updated_entities.travel_dates = new_entities.travel_dates
-            if new_entities.preferences:
-                updated_entities.preferences.update(new_entities.preferences)
+            # 5. 增量更新逻辑
+            # 使用 model_copy 进行浅拷贝，避免修改原始对象
+            updated_entities = existing_entities.model_copy(deep=True)
+
+            # 遍历提取到的字段，仅当不为 None 时更新
+            if extracted_data.get("destination"):
+                updated_entities.destination = extracted_data["destination"]
+
+            if extracted_data.get("budget") is not None:
+                updated_entities.budget = extracted_data["budget"]
+
+            if extracted_data.get("travel_dates"):
+                updated_entities.travel_dates = extracted_data["travel_dates"]
+
+            # 偏好设置采用增量合并（Update）而非直接覆盖
+            if extracted_data.get("preferences"):
+                if updated_entities.preferences is None:
+                    updated_entities.preferences = {}
+                updated_entities.preferences.update(extracted_data["preferences"])
 
             updated_entities.last_updated = datetime.now()
             return updated_entities
 
+        except json.JSONDecodeError as e:
+            print(f"LLM 返回格式非法: {e} | Response: {response_text}")
+            return existing_entities
+        except ValidationError as e:
+            print(f"实体校验失败 (Pydantic): {e}")
+            return existing_entities
         except Exception as e:
-            print(f"实体提取失败: {e}")
+            print(f"提取过程发生未知错误: {e}")
             return existing_entities
 
     def generate_summary(self, messages: List[Message], existing_summary: str = "") -> str:
         """生成对话摘要"""
-        if not self.llm_client:
+        if not self.llm_manager:
             return existing_summary
 
         # 构建摘要Prompt
@@ -107,7 +140,7 @@ class ConversationManager:
         """
 
         try:
-            response = self.llm_client.generate(
+            response = self.llm_manager.generate(
                 prompt=prompt,
                 max_tokens=300,
                 temperature=0.3
