@@ -53,6 +53,7 @@ class LlmManager:
             # 设置一些生成参数，与你原代码中的 pipeline 保持一致
             temperature=0.7,
             num_ctx=4096,  # 默认上下文大小，可以根据需要调整
+            timeout=300,  # 显式设置超时为 300 秒，应对 DeepSeek 的长逻辑推理
         )
 
         # 2. 初始化解析器
@@ -79,7 +80,7 @@ class LlmManager:
         你是专业旅游规划师，严格遵循以下所有要求生成行程，并仅返回JSON格式数据。
 
         【生成要求】
-        1. 仅输出JSON对象，不包含任何解释性文字或Markdown格式（如```json```）。
+        1. 仅输出JSON对象，不包含任何解释性文字或Markdown格式（如```json```），必须严格遵守JSON Schema 结构，确保每一行键值对后都有正确的逗号，且最后一个键值对后不加逗号        
         2. JSON字段必须与指定的格式完全一致。
         3. 行程约束：
            - 目的地：{destination}
@@ -112,19 +113,47 @@ class LlmManager:
             edit_note=edit_note
         )
 
-    def extract_json_from_string(self, text):
-        print(f"从大模型拿到的文本: {text}")
+    def extract_json_from_string(self, response: str) -> str:
+        print(f"DEBUG: 原始响应全文内容 ---> {response}")
 
-        """尝试从文本中提取完整的JSON对象，处理Markdown块"""
-        text = text.strip()
+        # < think >
+        # 好，我来分析一下用户的需求。用户说要从上海出发去广州，5
+        # 天，预算1000元，侧重美食，需要每天的行程，并且按照半小时规划内容。
+        # 首先，用户的意图类型应该是“generate_trip”，因为他是在生成一个行程计划，而不是修改现有的行程、添加或删除景点等。
+        # 接下来提取关键参数：目的地是广州，天数是5天，预算为1000元，偏好美食。用户希望每天的行程按照半小时来规划内容。
+        # 总结一下，用户需要一份5天的行程计划，从上海到广州，预算有限，重点放在美食体验上，并且每天的时间安排要详细到半小时级别。
+        # 最后，是否需要更多信息？看起来用户已经提供了足够的信息，包括出发地、目的地、天数、预算和偏好，所以不需要额外的信息。
+        # < / think >
+        # ```json
+        # {
+        #     "intent": "generate_trip",
+        #     "parameters": {
+        #         "destination": "广州",
+        #         "days": 5,
+        #         "budget": 1000,
+        #         "preference": "美食",
+        #         "day_number": [1, 2, 3, 4, 5]
+        #     },
+        #     "summary": "为用户规划从上海到广州的5天行程，预算1000元，侧重美食体验，并按半小时详细安排每天的内容。",
+        #     "needs_more_info": false
+        # }
+        # ```
 
-        # 1. 查找并清理 Markdown JSON 块
-        match_md = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-        if match_md:
-            return match_md.group(1).strip()
+        # 1. 移除 DeepSeek 的思考过程，就是上面的<think></think>的内容
+        content = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
 
-        # 2. 如果没有 Markdown 块，尝试返回整个文本
-        return text
+        # 2. 优先匹配 Markdown 代码块，就是上面的```json```的内容
+        code_block = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
+        if code_block:
+            return code_block.group(1)
+
+        # 3. 匹配最末尾的一个完整大括号结构（通常 JSON 在最后）
+        # 使用非贪婪匹配以避免把多余文本抓进来
+        json_blocks = re.findall(r'\{.*?\}', content, re.DOTALL)
+        if json_blocks:
+            return json_blocks[-1]  # 取最后一个，通常是真正的返回结果
+
+        return content
 
     def generate_trip(self, user_input: Dict[str, Any], context: List[str],
                       edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -180,9 +209,12 @@ class LlmManager:
         """
         # 1. 构建分析提示词，理解用户意图
         analysis_prompt = self._build_analysis_prompt(query, context, current_trip)
+        print(f"change_trip解析意图的prompt为：{analysis_prompt}")
+
         analysis_response = self.llm.invoke(analysis_prompt)
 
-        print(f"change_trip解析意图的prompt为：{analysis_prompt}")
+        print(f"change_trip从llm拿到的数据是：{analysis_response}")
+
 
         # 2. 从响应中提取用户意图和参数
         intent_data = self._parse_intent(analysis_response)
@@ -241,7 +273,7 @@ class LlmManager:
         3. summary: 用一句话总结用户需求
         4. needs_more_info: 是否需要更多信息才能执行操作 (true/false)
 
-        只返回JSON格式，不要包含其他文本。
+        注意：只返回JSON格式，不要包含其他文本，不包含任何解释性文字或Markdown格式（如```json```），必须严格遵守以下 JSON Schema 结构，确保每一行键值对后都有正确的逗号，且最后一个键值对后不加逗号，禁止在 JSON 中使用 range()、tuple() 等 Python 函数。day_number 必须是一个整数列表，例如 [1, 2, 3, 4, 5]。
         """
 
         return template.format(
