@@ -229,7 +229,7 @@ class UIManager:
 
                 # try:
                 # 调用LLM获取响应，进行旅游行程的修改
-                print(f"调用LLM获取响应，进行旅游行程的修改，prompt: {prompt}")
+                print(f"处理完上下文（实体抽取、压缩第1条数据）后，组装prompt: {prompt}")
 
                 # response_data = self.llm_manager.change_trip(
                 #     query=prompt,

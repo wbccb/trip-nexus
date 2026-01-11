@@ -162,12 +162,12 @@ class ConversationManager:
         """
 
         try:
-            response = self.llm_manager.generate(
-                prompt=prompt,
-                max_tokens=300,
-                temperature=0.3
-            )
-            return response.strip()
+            # 使用 invoke 方法替代不存在的 generate 方法
+            response = self.llm_manager.llm.invoke(prompt)
+            
+            # 清理 <think> 标签及其内容
+            clean_response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+            return clean_response
         except Exception as e:
             print(f"摘要生成失败: {e}")
             return existing_summary
@@ -238,7 +238,7 @@ class ConversationManager:
     def process_new_message(self, user_id: str, device_id: str, message: Message, session_id: str) -> SessionContext:
         """处理新消息，更新上下文"""
 
-        print("\n\n========================================")
+        print("\n\n==============处理新消息，更新上下文 start!==========================")
         print(f"处理新消息，用户ID: {user_id}, 设备ID: {device_id}, 消息内容: {message.content}, 会话ID: {session_id}")
 
         # 1. 获取或创建会话
@@ -247,6 +247,7 @@ class ConversationManager:
 
         if short_term_data:
             # 1.1 命中短期缓存（Redis），直接恢复会话上下文
+            print("命中短期缓存(Redis), 直接恢复会话上下文")
             context = SessionContext(
                 session_id=session_id,
                 user_id=user_id,
@@ -301,8 +302,10 @@ class ConversationManager:
             existing_entities = self.conversationStorage.get_core_entities(session_id) or CoreEntity()
             # 4. 增量提取核心实体（如果不是冗余信息）
             if not message.is_redundant:
+                print("开始提取出实体数据")
                 context.core_entities = self.extract_core_entities(message.content, existing_entities)
                 # 更新存储
+                print("抽离完成，进行存储")
                 self.conversationStorage.store_core_entities(session_id, context.core_entities)
         else:
             message.is_redundant = False
@@ -324,7 +327,7 @@ class ConversationManager:
         # 8. 存储数据到数据库中
         self.conversationStorage.store_session_chat(session_id, message.model_dump_json())
 
-        print("========================================\n\n")
+        print("===============处理新消息，更新上下文 end!=========================\n\n")
 
         return context
 
