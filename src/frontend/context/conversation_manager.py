@@ -185,6 +185,8 @@ class ConversationManager:
         # 生成新摘要
         new_summary = self.generate_summary(early_messages, context.long_term_summary)
 
+        print(f"压缩早期消息后的新摘要: {new_summary}")
+
         # 更新长期摘要
         self.conversationStorage.store_long_term_summary(context.session_id, new_summary)
 
@@ -236,12 +238,15 @@ class ConversationManager:
     def process_new_message(self, user_id: str, device_id: str, message: Message, session_id: str) -> SessionContext:
         """处理新消息，更新上下文"""
 
+        print("\n\n========================================")
+        print(f"处理新消息，用户ID: {user_id}, 设备ID: {device_id}, 消息内容: {message.content}, 会话ID: {session_id}")
+
         # 1. 获取或创建会话
         # session_id = self.conversationStorage.generate_session_id(user_id, device_id)
         short_term_data = self.conversationStorage.get_short_term_context(session_id)
 
         if short_term_data:
-            # 恢复现有会话
+            # 1.1 命中短期缓存（Redis），直接恢复会话上下文
             context = SessionContext(
                 session_id=session_id,
                 user_id=user_id,
@@ -251,12 +256,42 @@ class ConversationManager:
                 last_active=datetime.fromisoformat(short_term_data.get("last_active", datetime.now().isoformat()))
             )
         else:
-            # 创建新会话
-            context = SessionContext(
-                session_id=session_id,
-                user_id=user_id,
-                device_id=device_id
-            )
+            # 1.2 短期缓存未命中（Redis Miss），尝试从持久化存储（DB）恢复
+            # 这通常发生在会话超过2小时不活跃，Redis key过期的情况
+            history_messages_json = self.conversationStorage.get_session_chat_list(session_id)
+            
+            if history_messages_json:
+                print(f"从数据库恢复会话历史，共 {len(history_messages_json)} 条消息")
+                # 反序列化历史消息
+                all_messages = []
+                for msg_json in history_messages_json:
+                    try:
+                        all_messages.append(Message.model_validate_json(msg_json))
+                    except Exception as e:
+                        print(f"解析历史消息失败: {e}")
+                
+                # 重建上下文：仅加载最近10条到短期窗口
+                context = SessionContext(
+                    session_id=session_id,
+                    user_id=user_id,
+                    device_id=device_id,
+                    short_term_messages=all_messages[-10:], # 滑动窗口
+                    message_count=len(all_messages),
+                    last_active=datetime.now() # 恢复活跃状态
+                )
+                
+                # 尝试同步恢复长期摘要（如果有）
+                long_term_summary = self.conversationStorage.get_long_term_summary(session_id)
+                if long_term_summary:
+                    context.long_term_summary = long_term_summary
+
+            else:
+                # 1.3 数据库也无记录，创建全新会话
+                context = SessionContext(
+                    session_id=session_id,
+                    user_id=user_id,
+                    device_id=device_id
+                )
 
         # 从用户消息中提取核心实体
         if message.role == MessageType.USER:
@@ -277,6 +312,8 @@ class ConversationManager:
         context.message_count += 1
         context.last_active = datetime.now()
 
+        print(f"添加新消息到短期窗口后的数量为: {context.message_count}")
+
         # 6. 检查是否需要压缩早期对话
         if context.message_count > 10:
             context.long_term_summary = self.compress_early_messages(context)
@@ -286,6 +323,8 @@ class ConversationManager:
 
         # 8. 存储数据到数据库中
         self.conversationStorage.store_session_chat(session_id, message.model_dump_json())
+
+        print("========================================\n\n")
 
         return context
 

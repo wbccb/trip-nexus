@@ -248,7 +248,8 @@ class TestConversationStorage(BaseConversationStorage):
         """, (session_id, message, update_time))
         self.sqlite_conn.commit()
 
-    def get_session_chat_list(self, session_id: str):
+    def get_session_chat_list(self, session_id: str) -> List[str]:
+        """获取会话的所有聊天记录（按时间正序排列）"""
         cursor = self.sqlite_conn.cursor()
         cursor.execute("""
             SELECT message
