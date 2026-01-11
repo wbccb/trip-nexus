@@ -205,7 +205,7 @@ class UIManager:
 
         # 用户输入
         if prompt := st.chat_input("告诉我您想如何调整行程？"):
-            # 3.1 添加用户消息到历史
+            # 1. 添加用户消息到历史
             user_msg = {
                 "role": MessageType.USER,
                 "content": prompt,
@@ -213,17 +213,17 @@ class UIManager:
                 "metadata": {}
             }
             st.session_state.chat_history.append(user_msg)
-            # 3.5 更新上下文
+            # 2. 处理 用户 发送的消息 => 更新上下文
             user_message_obj = Message.model_validate(user_msg)
             self.conversation_manager.process_new_message(user_id, device_id, user_message_obj, session_id)
 
 
-            # 3.2 即时显示用户消息（也可以依赖历史渲染，但这里即时显示更流畅）
+            # 3. 即时显示用户消息（也可以依赖历史渲染，但这里即时显示更流畅）
             with chat_container:  # 注意：这里用chat_container包裹，确保消息在同一个容器中
                 with st.chat_message(user_msg["role"]):
                     st.markdown(user_msg["content"])
 
-            # 3.3 获取AI响应并显示（核心：追加到历史，而非覆盖）
+            # 获取AI响应并显示（核心：追加到历史，而非覆盖）
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
 
@@ -231,43 +231,43 @@ class UIManager:
                 # 调用LLM获取响应，进行旅游行程的修改
                 print(f"处理完上下文（实体抽取、压缩第1条数据）后，组装prompt: {prompt}")
 
-                # response_data = self.llm_manager.change_trip(
-                #     query=prompt,
-                #     context=st.session_state.chat_history,
-                #     current_trip=st.session_state.trip_data
-                # )
+                response_data = self.llm_manager.change_trip(
+                    query=prompt,
+                    context=st.session_state.chat_history,
+                    current_trip=st.session_state.trip_data
+                )
                 
-                response_data = {
-                    "response": "太棒了！我已经为您规划了从上海到成都的3天行程，预算1000元。行程已生成，请查看右侧地图和详细安排！",
-                    "trip_data": {
-                        "destination": "成都",
-                        "days": 3,
-                        "daily_plan": {
-                            "1": {
-                                "time": "09:00-17:00",
-                                "attraction": "都江堰博物馆",
-                                "address": "成都市青羊区都江堰东街28号",
-                                "transport": "地铁5号线龙王村站C口出，步行10分钟",
-                                "duration": "3小时"
-                            },
-                            "2": {
-                                "time": "09:00-17:00",
-                                "attraction": "钟英古镇",
-                                "address": "成都市金堂县钟英镇南二路18号",
-                                "transport": "地铁5号线龙王村站C口出，步行10分钟",
-                                "duration": "3小时"
-                            },
-                            "3": {
-                                "time": "14:00-17:00",
-                                "attraction": "杜甫草堂",
-                                "address": "成都市青羊区青华路37号",
-                                "transport": "地铁4号线草堂北路站B口出，步行10分钟",
-                                "duration": "2小时"
-                            }
-                        }
-                    },
-                    "intent": "trip_generated"
-                }
+                # response_data = {
+                #     "response": "太棒了！我已经为您规划了从上海到成都的3天行程，预算1000元。行程已生成，请查看右侧地图和详细安排！",
+                #     "trip_data": {
+                #         "destination": "成都",
+                #         "days": 3,
+                #         "daily_plan": {
+                #             "1": {
+                #                 "time": "09:00-17:00",
+                #                 "attraction": "都江堰博物馆",
+                #                 "address": "成都市青羊区都江堰东街28号",
+                #                 "transport": "地铁5号线龙王村站C口出，步行10分钟",
+                #                 "duration": "3小时"
+                #             },
+                #             "2": {
+                #                 "time": "09:00-17:00",
+                #                 "attraction": "钟英古镇",
+                #                 "address": "成都市金堂县钟英镇南二路18号",
+                #                 "transport": "地铁5号线龙王村站C口出，步行10分钟",
+                #                 "duration": "3小时"
+                #             },
+                #             "3": {
+                #                 "time": "14:00-17:00",
+                #                 "attraction": "杜甫草堂",
+                #                 "address": "成都市青羊区青华路37号",
+                #                 "transport": "地铁4号线草堂北路站B口出，步行10分钟",
+                #                 "duration": "2小时"
+                #             }
+                #         }
+                #     },
+                #     "intent": "trip_generated"
+                # }
                 print(f"调用LLM获取响应，进行旅游行程的修改，response: {response_data}")
 
                 # 显示对话回复
@@ -297,7 +297,7 @@ class UIManager:
                         # 添加视觉提示
                         st.success("✨ 行程已生成！右侧地图和详细安排已更新。")
 
-                # 3.4 添加AI响应到历史（实现递增的核心：历史列表追加）
+                # 添加AI响应到历史（实现递增的核心：历史列表追加）
                 assistant_msg = {
                     "role": MessageType.ASSISTANT,
                     "content": chat_response,
@@ -311,7 +311,7 @@ class UIManager:
                 }
                 st.session_state.chat_history.append(assistant_msg)
 
-                # 3.5 更新上下文
+                # AI回复的消息 => 更新上下文
                 assistant_message_obj = Message.model_validate(assistant_msg)
                 self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
 

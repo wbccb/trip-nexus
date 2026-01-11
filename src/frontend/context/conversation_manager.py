@@ -238,10 +238,10 @@ class ConversationManager:
     def process_new_message(self, user_id: str, device_id: str, message: Message, session_id: str) -> SessionContext:
         """处理新消息，更新上下文"""
 
-        print("\n\n==============处理新消息，更新上下文 start!==========================")
+        print(f"\n\n==============处理新消息，更新上下文 start!{'当前是用户消息' if message.role == MessageType.USER else '当前是AI回复消息'}==========================")
         print(f"处理新消息，用户ID: {user_id}, 设备ID: {device_id}, 消息内容: {message.content}, 会话ID: {session_id}")
 
-        # 1. 获取或创建会话
+        # 1. 获取或创建会话上下文
         # session_id = self.conversationStorage.generate_session_id(user_id, device_id)
         short_term_data = self.conversationStorage.get_short_term_context(session_id)
 
@@ -327,7 +327,7 @@ class ConversationManager:
         # 8. 存储数据到数据库中
         self.conversationStorage.store_session_chat(session_id, message.model_dump_json())
 
-        print("===============处理新消息，更新上下文 end!=========================\n\n")
+        print(f"===============处理新消息，更新上下文 end!{'当前是用户消息' if message.role == MessageType.USER else '当前是AI回复消息'}=========================\n\n")
 
         return context
 
