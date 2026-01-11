@@ -31,7 +31,18 @@ class BaseConversationStorage(ABC):
         pass
 
     @abstractmethod
+    def store_trip_data(self, session_id: str, trip_data: Dict):
+        """存储完整的行程数据（Redis + 数据库）"""
+        pass
+
+    @abstractmethod
+    def get_trip_data(self, session_id: str) -> Optional[Dict]:
+        """获取完整的行程数据（Redis + 数据库）"""
+        pass
+
+    @abstractmethod
     def store_long_term_summary(self, session_id: str, summary: str):
+
         """存储长期摘要（数据库）"""
         pass
 

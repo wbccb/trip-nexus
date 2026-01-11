@@ -179,6 +179,13 @@ class UIManager:
     def render_chat_interface(self, user_id: str, device_id: str, session_id: str) -> None:
         """渲染聊天界面，支持多轮对话"""
         st.sidebar.subheader("💬 行程对话助手")
+        
+        # 尝试恢复行程数据（如果当前没有，但数据库有）
+        if not st.session_state.trip_data:
+            trip_data = self.conversation_manager.conversationStorage.get_trip_data(session_id)
+            if trip_data:
+                st.session_state.trip_data = trip_data
+                print("已从数据库恢复行程数据")
 
         # 使用st.chat_message构建聊天界面
         chat_container = st.container()
@@ -286,6 +293,9 @@ class UIManager:
                         # 保存到session状态
                         st.session_state.trip_data = trip_data
                         st.session_state.map_obj = None
+                        
+                        # 持久化存储行程数据
+                        self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
 
                         # 在聊天中显示格式化的行程
                         st.divider()

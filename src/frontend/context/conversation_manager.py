@@ -285,6 +285,11 @@ class ConversationManager:
                 long_term_summary = self.conversationStorage.get_long_term_summary(session_id)
                 if long_term_summary:
                     context.long_term_summary = long_term_summary
+                
+                # 尝试同步恢复行程数据（如果有）
+                trip_data = self.conversationStorage.get_trip_data(session_id)
+                if trip_data:
+                    context.trip_data = trip_data
 
             else:
                 # 1.3 数据库也无记录，创建全新会话

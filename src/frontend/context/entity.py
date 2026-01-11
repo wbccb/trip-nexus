@@ -40,6 +40,7 @@ class SessionContext(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     last_active: datetime = Field(default_factory=datetime.now)
     message_count: int = 0
+    trip_data: Optional[Dict[str, Any]] = None  # 完整的行程数据
 
 # 加载 .env 文件
 load_dotenv()

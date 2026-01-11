@@ -215,6 +215,73 @@ class TestConversationStorage(BaseConversationStorage):
         result = cursor.fetchone()
         return result[0] if result else ""
 
+    def store_trip_data(self, session_id: str, trip_data: Dict):
+        """存储行程数据（Redis + SQLite）"""
+        # 1. Redis 缓存
+        key = f"session:{session_id}:trip_data"
+        self._redis_setex(key, datetime.timedelta(hours=2), json.dumps(trip_data, ensure_ascii=False))
+
+        # 2. SQLite 持久化
+        # 这里为了简化，我们复用 core_entities 表结构，或者新建表。
+        # 考虑到这是一个新功能，我们在 _init_sqlite_tables 中添加 trip_data 表
+        # 但由于 _init_sqlite_tables 只在初始化调用，我们这里动态检查/创建表比较安全，
+        # 或者假设表已存在（需要修改 _init_sqlite_tables）
+        # 为方便起见，我们在 store 时检查并创建表（仅供测试用）
+        cursor = self.sqlite_conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trip_data_store (
+            session_id TEXT PRIMARY KEY,
+            data_json TEXT NOT NULL,
+            last_updated TIMESTAMP NOT NULL
+        )
+        """)
+        
+        now = datetime.datetime.now().isoformat()
+        data_json = json.dumps(trip_data, ensure_ascii=False)
+        cursor.execute("""
+        INSERT INTO trip_data_store (session_id, data_json, last_updated)
+        VALUES (?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            data_json = excluded.data_json,
+            last_updated = excluded.last_updated
+        """, (session_id, data_json, now))
+        self.sqlite_conn.commit()
+
+    def get_trip_data(self, session_id: str) -> Optional[Dict]:
+        """获取行程数据（Redis + SQLite）"""
+        # 1. Redis
+        key = f"session:{session_id}:trip_data"
+        data = self._redis_get(key)
+        if data:
+            try:
+                return json.loads(data)
+            except:
+                pass
+
+        # 2. SQLite
+        cursor = self.sqlite_conn.cursor()
+        # 确保表存在
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trip_data_store (
+            session_id TEXT PRIMARY KEY,
+            data_json TEXT NOT NULL,
+            last_updated TIMESTAMP NOT NULL
+        )
+        """)
+        cursor.execute("SELECT data_json FROM trip_data_store WHERE session_id = ?", (session_id,))
+        result = cursor.fetchone()
+        
+        if result:
+            try:
+                trip_data = json.loads(result[0])
+                # 回填 Redis
+                self._redis_setex(key, datetime.timedelta(hours=2), result[0])
+                return trip_data
+            except Exception as e:
+                print(f"解析行程数据失败: {e}")
+                return None
+        return None
+
     def store_session(self, user_id: str, session_id: str):
         update_time = datetime.datetime.now().isoformat()
         name = f"名称{session_id}-{update_time}"

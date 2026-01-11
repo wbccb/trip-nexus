@@ -74,21 +74,54 @@ class LlmManager:
                     edit_note = f"需删除第{edit_cmd['day']}天的{edit_cmd['attraction']}，并重新规划当天后续行程"
                 case "reorder":
                     edit_note = "需调整行程顺序，确保路线更合理"
+                case "modify":
+                    edit_note = f"需重新调整行程：{edit_cmd.get('msg', '根据新要求调整')}"
 
         # 优化提示词模板，更适合指令遵循型模型
         template = """
         你是专业旅游规划师，严格遵循以下所有要求生成行程，并仅返回JSON格式数据。
 
-        【生成要求】
-        1. 仅输出JSON对象，不包含任何解释性文字或Markdown格式（如```json```），必须严格遵守JSON Schema 结构，确保每一行键值对后都有正确的逗号，且最后一个键值对后不加逗号        
-        2. JSON字段必须与指定的格式完全一致。
-        3. 行程约束：
-           - 目的地：{destination}
-           - 总天数：{days}天
-           - 预算：{budget}元/人（请合理分配交通、餐饮开支）
-           - 偏好：{preference}
-           - 额外要求：{edit_note}
-        4. 必须参考攻略信息（请优先采纳）：
+        【严重警告：JSON格式必须严格合法】
+        1. 严禁输出 Markdown 代码块（如 ```json ... ```），只输出纯文本 JSON。
+        2. **数组元素之间必须用逗号分隔**。例如：[{"a":1}, {"b":2}] 是正确的，[{"a":1} {"b":2}] 是错误的。
+        3. 键值对之间必须用逗号分隔。
+        4. 所有的键和字符串值必须使用双引号。
+        5. 不要包含任何注释或思考过程（<think>...</think>）。
+
+        【数据结构要求】
+        请严格参考以下 JSON 结构示例（注意 daily_plan 是一个字典，key 是第几天，value 是当天的行程列表）：
+        {{
+            "destination": "城市名",
+            "days": 3,
+            "daily_plan": {{
+                "1": [
+                    {{
+                        "time": "09:00-11:00",
+                        "attraction": "景点A",
+                        "address": "地址A",
+                        "transport": "交通A",
+                        "duration": "2小时"
+                    }},
+                    {{
+                        "time": "11:00-13:00",
+                        "attraction": "午餐",
+                        "address": "地址B",
+                        "transport": "步行",
+                        "duration": "2小时"
+                    }}
+                ],
+                "2": [...]
+            }}
+        }}
+
+        【行程约束】
+        - 目的地：{destination}
+        - 总天数：{days}天
+        - 预算：{budget}元/人（请合理分配交通、餐饮开支）
+        - 偏好：{preference}
+        - 额外要求：{edit_note}
+
+        【参考攻略（优先采纳）】
         {context}
 
         【细节规范】
@@ -96,7 +129,7 @@ class LlmManager:
         - 地址必须精确到街道和门牌号（如"成都市青羊区青华路9号"）。
         - 交通方式具体（如"地铁2号线人民公园站B口出"）。
 
-        【输出格式】
+        【Schema 定义】
         {format_instructions}
         """
         prompt = PromptTemplate(
@@ -141,6 +174,13 @@ class LlmManager:
 
         # 1. 移除 DeepSeek 的思考过程，就是上面的<think></think>的内容
         content = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+
+        # 1.1 尝试修复常见的 JSON 错误：数组元素或对象之间缺少逗号
+        # 例如：} {  ->  }, {
+        # 以及 ] [ -> ], [ (虽然较少见)
+        # 排除可能是字符串内部的情况（简单起见假设 LLM 输出的 JSON 格式较标准）
+        content = re.sub(r'\}\s*\{', '}, {', content)
+        content = re.sub(r'\]\s*\[', '], [', content)
 
         # 2. 优先匹配 Markdown 代码块，就是上面的```json```的内容
         code_block = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
@@ -213,13 +253,13 @@ class LlmManager:
 
         analysis_response = self.llm.invoke(analysis_prompt)
 
-        print(f"change_trip从llm拿到的数据是：{analysis_response}")
+        print(f"通过llm分析出用户的意图是： {analysis_response}")
 
 
         # 2. 从响应中提取用户意图和参数
         intent_data = self._parse_intent(analysis_response)
 
-        print(f"change_trip从响应中提取用户意图和参数：{intent_data}")
+        print(f"解析llm返回的意图数据为：{intent_data}")
 
         # 3. 根据意图类型处理
         if intent_data["intent"] == "generate_trip":
@@ -272,6 +312,7 @@ class LlmManager:
         2. parameters: 提取的关键参数（destination, days, budget, preference, attraction_name, day_number, etc.）
         3. summary: 用一句话总结用户需求
         4. needs_more_info: 是否需要更多信息才能执行操作 (true/false)
+        5. missing_info: 如果 needs_more_info 为 true，列出具体缺少的关键信息列表（如 ["目的地", "天数", "预算"]），否则返回空列表 []
 
         注意：只返回JSON格式，不要包含其他文本，不包含任何解释性文字或Markdown格式（如```json```），必须严格遵守以下 JSON Schema 结构，确保每一行键值对后都有正确的逗号，且最后一个键值对后不加逗号，禁止在 JSON 中使用 range()、tuple() 等 Python 函数。day_number 必须是一个整数列表，例如 [1, 2, 3, 4, 5]。
         """
@@ -328,7 +369,13 @@ class LlmManager:
                 # 如果关键参数缺失，设置为需要更多信息
                 key_params = ["destination", "days", "budget"]
                 missing_key_params = [p for p in key_params if not safe_params.get(p)]
-                intent_data["needs_more_info"] = len(missing_key_params) > 1
+                intent_data["needs_more_info"] = len(missing_key_params) > 0
+                if intent_data["needs_more_info"]:
+                     intent_data["missing_info"] = [{"destination": "目的地", "days": "旅行天数", "budget": "预算"}.get(k, k) for k in missing_key_params]
+
+            if "missing_info" not in intent_data:
+                intent_data["missing_info"] = []
+
 
 
             return intent_data
@@ -360,15 +407,17 @@ class LlmManager:
 
         # 1. 首先检查是否需要更多信息
         if needs_more_info:
-            missing_info = []
+            missing_info = intent_data.get("missing_info", [])
 
-            # 检查必需参数
-            if not params.get("destination") or params["destination"] in [None, [], ""]:
-                missing_info.append("目的地")
-            if not params.get("days") or params["days"] is None:
-                missing_info.append("旅行天数")
-            if not params.get("budget") or params["budget"] is None:
-                missing_info.append("预算")
+            # 如果 LLM 没有返回 missing_info，尝试自动检测
+            if not missing_info:
+                # 检查必需参数
+                if not params.get("destination") or params["destination"] in [None, [], ""]:
+                    missing_info.append("目的地")
+                if not params.get("days") or params["days"] is None:
+                    missing_info.append("旅行天数")
+                if not params.get("budget") or params["budget"] is None:
+                    missing_info.append("预算")
 
             if missing_info:
                 return {
@@ -470,6 +519,7 @@ class LlmManager:
     def _handle_trip_modification(self, intent_data: Dict[str, Any], current_trip: Dict,
                                   context: List[Dict[str, str]]) -> Dict[str, Any]:
         """处理行程修改请求"""
+        print("处理行程修改请求")
         params = intent_data.get("parameters", {})
         intent_type = intent_data["intent"]
 
@@ -492,13 +542,30 @@ class LlmManager:
                 "type": "reorder",
                 "msg": "调整行程顺序"
             }
+        elif intent_type == "modify_trip":
+            # 通用修改逻辑
+            summary = intent_data.get("summary", "调整行程")
+            edit_cmd = {
+                "type": "modify",
+                "msg": summary,
+                # 尝试从参数中提取更新值，用于覆盖原有行程参数
+                "updates": {
+                    "destination": params.get("destination"),
+                    "days": params.get("days"),
+                    "budget": params.get("budget"),
+                    "preference": params.get("preference")
+                }
+            }
 
         # 重新生成行程
+        # 优先使用 updates 中的新参数，否则回退到 current_trip，最后回退到默认值
+        updates = edit_cmd.get("updates", {}) if edit_cmd else {}
+        
         user_input = {
-            "destination": current_trip.get("destination", "成都"),
-            "days": current_trip.get("days", 3),
-            "budget": current_trip.get("budget", 5000),
-            "preference": current_trip.get("preference", ["美食", "历史"]),
+            "destination": updates.get("destination") or current_trip.get("destination", "成都"),
+            "days": updates.get("days") or current_trip.get("days", 3),
+            "budget": updates.get("budget") or current_trip.get("budget", 5000),
+            "preference": updates.get("preference") or current_trip.get("preference", ["美食", "历史"]),
             "guide_links": []
         }
 
@@ -506,12 +573,18 @@ class LlmManager:
 
         modified_trip = self.generate_trip(user_input, context_texts, edit_cmd)
 
+        print(f"处理行程修改请求构建的prompt为: {modified_trip}")
+
         if modified_trip:
-            action_desc = {
-                "add": f"已成功在第{edit_cmd['day']}天添加{edit_cmd['attraction']}",
-                "delete": f"已成功从第{edit_cmd['day']}天删除{edit_cmd['attraction']}",
-                "reorder": "已重新优化行程顺序"
-            }.get(edit_cmd["type"], "已调整行程")
+            if edit_cmd and "type" in edit_cmd:
+                 action_desc = {
+                    "add": f"已成功在第{edit_cmd.get('day')}天添加{edit_cmd.get('attraction')}",
+                    "delete": f"已成功从第{edit_cmd.get('day')}天删除{edit_cmd.get('attraction')}",
+                    "reorder": "已重新优化行程顺序",
+                    "modify": edit_cmd.get("msg", "已根据您的要求调整行程")
+                }.get(edit_cmd["type"], "已调整行程")
+            else:
+                 action_desc = "已调整行程"
 
             return {
                 "response": f"{action_desc}。新的行程已生成，请查看更新后的安排！",
