@@ -59,7 +59,7 @@ class ConversationManager:
                "travel_dates": ["YYYY-MM-DD", "YYYY-MM-DD"],
                "preferences": {{ "标签": "具体描述" }}
            }}
-        3. 如果某项信息在“新消息”中未提及，请在该字段填 null。
+        3. 如果某项信息在“新消息”中未提及，请在该字段填 null。对于数组类型（如travel_dates），如果为空请填 [] 或 null，严禁在数组中包含 null 元素。
         4. 只有当新消息明确提到新偏好时，才更新 preferences。
         """
 
@@ -82,6 +82,8 @@ class ConversationManager:
 
             extracted_data = json.loads(clean_response)
 
+            print(f"提取实体，从llm拿到的数据为: {extracted_data}")
+
             # 5. 增量更新逻辑
             # 使用 model_copy 进行浅拷贝，避免修改原始对象
             updated_entities = existing_entities.model_copy(deep=True)
@@ -94,7 +96,27 @@ class ConversationManager:
                 updated_entities.budget = extracted_data["budget"]
 
             if extracted_data.get("travel_dates"):
-                updated_entities.travel_dates = extracted_data["travel_dates"]
+                # 过滤掉 None 值，确保只有有效的时间字符串
+                valid_dates_str = [d for d in extracted_data["travel_dates"] if d]
+                valid_dates_obj = []
+                for d_str in valid_dates_str:
+                    try:
+                        # 尝试解析 YYYY-MM-DD
+                        if isinstance(d_str, str):
+                            dt = datetime.strptime(d_str, "%Y-%m-%d")
+                            valid_dates_obj.append(dt)
+                        elif isinstance(d_str, datetime):
+                            valid_dates_obj.append(d_str)
+                    except ValueError:
+                         try:
+                             # 尝试 ISO 格式作为备选
+                             dt = datetime.fromisoformat(d_str)
+                             valid_dates_obj.append(dt)
+                         except ValueError:
+                            print(f"日期格式无法解析: {d_str}")
+                
+                if valid_dates_obj:
+                    updated_entities.travel_dates = valid_dates_obj
 
             # 偏好设置采用增量合并（Update）而非直接覆盖
             if extracted_data.get("preferences"):

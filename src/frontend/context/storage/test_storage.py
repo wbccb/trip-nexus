@@ -3,6 +3,7 @@ import json
 import sqlite3
 import datetime
 from typing import Optional, Dict, List
+from pydantic import ValidationError
 from src.frontend.context.entity import SessionContext, CoreEntity
 from src.config import Config
 from src.utils.console import console_log
@@ -146,17 +147,51 @@ class TestConversationStorage(BaseConversationStorage):
         redis_key = f"session:{session_id}:core_entities"
         data = self._redis_get(redis_key)
         if data:
-            return CoreEntity.model_validate_json(data)
+            try:
+                return CoreEntity.model_validate_json(data)
+            except ValidationError:
+                pass  # Redis数据坏了，尝试查数据库或修复
 
         # 2. 再查SQLite
         cursor = self.sqlite_conn.cursor()
         cursor.execute("SELECT entities_json FROM core_entities WHERE session_id = ?", (session_id,))
         result = cursor.fetchone()
+        
+        entities_json = None
         if result:
             entities_json = result[0]
-            # 缓存回模拟Redis
-            self._redis_setex(redis_key, datetime.timedelta(hours=2), entities_json)
-            return CoreEntity.model_validate_json(entities_json)
+        elif data:
+            # 如果数据库没查到但Redis有（虽然前面校验失败了），尝试修复Redis数据
+            entities_json = data
+
+        if entities_json:
+            # 尝试解析并修复
+            try:
+                return CoreEntity.model_validate_json(entities_json)
+            except ValidationError:
+                try:
+                    # 尝试修复常见的数据错误
+                    data_obj = json.loads(entities_json)
+                    if isinstance(data_obj.get("travel_dates"), list):
+                        # 过滤掉None值
+                        data_obj["travel_dates"] = [d for d in data_obj["travel_dates"] if d]
+                    
+                    entity = CoreEntity.model_validate(data_obj)
+                    
+                    # 修复成功后，更新回缓存和数据库（为了下次读取）
+                    # 注意：这里可能需要谨慎写入，但为了自愈，写入是好的
+                    # self.store_core_entities(session_id, entity) 
+                    # 暂时不自动回写，只返回修复后的对象，下次更新时会覆盖
+                    
+                    # 仍然缓存回Redis（修复后的数据不好直接存回Redis raw json，除非重序列化）
+                    # 这里保持原逻辑：如果有result才缓存。
+                    if result:
+                         self._redis_setex(redis_key, datetime.timedelta(hours=2), entities_json)
+                    
+                    return entity
+                except Exception as e:
+                    print(f"核心实体数据损坏且修复失败: {e}")
+                    return None
 
         return None
 

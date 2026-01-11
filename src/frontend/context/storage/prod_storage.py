@@ -3,7 +3,9 @@ import json
 import datetime
 import redis
 import mysql.connector
-from typing import Optional, Dict
+from mysql.connector import pooling
+from typing import Optional, Dict, List
+from pydantic import ValidationError
 from src.frontend.context.entity import SessionContext, CoreEntity
 from src.config import Config
 from .base_storage import BaseConversationStorage
@@ -92,9 +94,13 @@ class ProdConversationStorage(BaseConversationStorage):
         redis_key = f"session:{session_id}:core_entities"
         data = self.redis.get(redis_key)
         if data:
-            return CoreEntity.model_validate_json(data)
+            try:
+                return CoreEntity.model_validate_json(data)
+            except ValidationError:
+                pass
 
         # 2. 再查MySQL
+        entities_json = None
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor(dictionary=True)
@@ -105,13 +111,28 @@ class ProdConversationStorage(BaseConversationStorage):
                 entities_json = result['entities_json']
                 # 缓存回Redis
                 self.redis.setex(redis_key, datetime.timedelta(hours=2), entities_json)
-                return CoreEntity.model_validate_json(entities_json)
         except Exception as e:
             print(f"MySQL获取核心实体失败: {e}")
         finally:
             if 'conn' in locals() and conn.is_connected():
                 cursor.close()
                 conn.close()
+
+        if not entities_json and data:
+             entities_json = data
+
+        if entities_json:
+            try:
+                return CoreEntity.model_validate_json(entities_json)
+            except ValidationError:
+                try:
+                    data_obj = json.loads(entities_json)
+                    if isinstance(data_obj.get("travel_dates"), list):
+                        data_obj["travel_dates"] = [d for d in data_obj["travel_dates"] if d]
+                    return CoreEntity.model_validate(data_obj)
+                except Exception as e:
+                    print(f"核心实体数据修复失败: {e}")
+                    return None
 
         return None
 
