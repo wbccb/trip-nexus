@@ -27,8 +27,11 @@ def search_handler(query: str):
     # 3. 执行搜索
     try:
         result = pipeline.run(query)
-        
-        print("\n✅ 搜索完成!")
+
+        print("\n=====================================================================================")
+
+    
+        print("\n✅ 搜索流程执行完毕，下面是总结!")
         print(f"意图: {result['intent_info'].get('primary_intent')}")
         print(f"是否需要搜索: {result['needs_search']}")
         

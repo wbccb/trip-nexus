@@ -48,18 +48,28 @@ class AIRetrievalPipeline:
             }
 
         # 3. 多源搜索 (获取搜索结果摘要)
+        logger.info("准备开始SearchXNR搜索url列表")
         search_results = self.searcher.search(query, intent_info)
-        logger.info(f"Found {len(search_results)} search results")
+        logger.info(f"SearchXNR得到: {search_results}")
+
+        logger.info("-------------准备质量过滤-------------------")
+
+        
 
         # 4. 质量过滤 (基于摘要重排序)
         filtered_results = self.quality_filter.filter_and_rank(search_results, query)
-        logger.info(f"Filtered to {len(filtered_results)} results")
+        logger.info(f"质量过滤 {len(filtered_results)} 结果")
+
+        logger.info("-------------准备内容抓取-------------------")
 
         # 5. 内容抓取 (Deep Fetch)
         # 取 Top K 进行抓取
         urls_to_fetch = [r['url'] for r in filtered_results[:self.config.DETAIL_FETCH_TOP_K]]
         crawled_contents = self.crawler.fetch_urls(urls_to_fetch)
-        logger.info(f"Crawled {len(crawled_contents)} pages")
+        logger.info(f"内容抓取 {len(crawled_contents)} pages")
+        
+        logger.info("-------------准备向量化存储与检索-------------------")
+
 
         # 6. 向量化存储与检索 (RAG)
         context_text = ""
@@ -81,6 +91,9 @@ class AIRetrievalPipeline:
             # 如果抓取失败，回退到使用摘要
             logger.warning("Crawling failed or empty, falling back to snippets")
             context_text = "\n\n".join([f"{r['title']}: {r['content_snippet']}" for r in filtered_results[:5]])
+
+        logger.info("-------------准备LLM生成回答-------------------")
+
 
         # 7. 生成回答
         answer = self._generate_rag_answer(query, context_text)
