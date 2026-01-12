@@ -123,6 +123,10 @@ class AIRetrievalPipeline:
             template=template,
             input_variables=["context", "query"]
         )
-        
+
+
+        print(f"""\n\n\n=========检索完成，组装的prompt:\n{prompt.format(context=context, query=query)}\n\n=========""")
+
+
         chain = prompt | self.llm
         return chain.invoke({"context": context, "query": query})
