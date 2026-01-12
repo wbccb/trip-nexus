@@ -62,7 +62,7 @@ class IntentRecognizer:
         top_intent = max(similarities.items(), key=lambda x: x[1])
 
         # 如果相似度低于阀值
-        if top_intent < 0.6:
+        if top_intent[1] < 0.6:
             return self._llm_intent_recongnition(query)
 
         return {
@@ -102,7 +102,11 @@ class IntentRecognizer:
         response = chain.invoke({"query": query})
 
         try:
-            return json.loads(response.content)
+            # Check if response is string or object (handling both OllamaLLM and ChatOllama)
+            content = response.content if hasattr(response, 'content') else response
+            # Remove potential markdown code blocks
+            content = content.replace("```json", "").replace("```", "").strip()
+            return json.loads(content)
         except json.JSONDecodeError:
             return {
                 "primary_intent": "general_knowledge",
