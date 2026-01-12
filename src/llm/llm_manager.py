@@ -83,7 +83,7 @@ class LlmManager:
 
         【严重警告：JSON格式必须严格合法】
         1. 严禁输出 Markdown 代码块（如 ```json ... ```），只输出纯文本 JSON。
-        2. **数组元素之间必须用逗号分隔**。例如：[{"a":1}, {"b":2}] 是正确的，[{"a":1} {"b":2}] 是错误的。
+        2. **数组元素之间必须用逗号分隔**。例如：{json_example_correct} 是正确的，{json_example_wrong} 是错误的。
         3. 键值对之间必须用逗号分隔。
         4. 所有的键和字符串值必须使用双引号。
         5. 不要包含任何注释或思考过程（<think>...</think>）。
@@ -134,7 +134,11 @@ class LlmManager:
         prompt = PromptTemplate(
             template=template.strip(),
             input_variables=["destination", "days", "budget", "preference", "context", "edit_note"],
-            partial_variables={"format_instructions": self.parser.get_format_instructions()}
+            partial_variables={
+                "format_instructions": self.parser.get_format_instructions(),
+                "json_example_correct": '[{"a":1}, {"b":2}]',
+                "json_example_wrong": '[{"a":1} {"b":2}]'
+            }
         )
 
         print(f"""构建提示词，用户输入为：{user_input}，上下文为：{context}，编辑指令为：{edit_note}""")
