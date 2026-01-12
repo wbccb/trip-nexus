@@ -109,8 +109,7 @@ class LlmManager:
                         "transport": "步行",
                         "duration": "2小时"
                     }}
-                ],
-                "2": [...]
+                ]
             }}
         }}
 
@@ -137,11 +136,23 @@ class LlmManager:
             input_variables=["destination", "days", "budget", "preference", "context", "edit_note"],
             partial_variables={"format_instructions": self.parser.get_format_instructions()}
         )
+
+        print(f"""构建提示词，用户输入为：{user_input}，上下文为：{context}，编辑指令为：{edit_note}""")
+
+        # 安全处理 preference
+        preference = user_input.get("preference", [])
+        if isinstance(preference, str):
+            preference = [preference]
+        elif not isinstance(preference, list):
+            preference = [str(preference)] if preference is not None else []
+            
+        preference_str = ", ".join([str(p) for p in preference if p])
+
         return prompt.format(
             destination=user_input["destination"],
             days=user_input["days"],
             budget=user_input["budget"],
-            preference=", ".join(user_input["preference"]),
+            preference=preference_str,
             context="\n".join(context) if context else "无参考攻略",
             edit_note=edit_note
         )
@@ -178,20 +189,32 @@ class LlmManager:
         # 1.1 尝试修复常见的 JSON 错误：数组元素或对象之间缺少逗号
         # 例如：} {  ->  }, {
         # 以及 ] [ -> ], [ (虽然较少见)
-        # 排除可能是字符串内部的情况（简单起见假设 LLM 输出的 JSON 格式较标准）
         content = re.sub(r'\}\s*\{', '}, {', content)
         content = re.sub(r'\]\s*\[', '], [', content)
+
+        # 1.2 修复常见的 Python 常量到 JSON 的错误
+        # None -> null, True -> true, False -> false
+        # 使用非捕获组 (?:...) 和 lookbehind/lookahead 可能会复杂，这里使用简单的替换
+        # 假设这些关键字出现在冒号之后，且作为值
+        content = re.sub(r':\s*None\b', ': null', content)
+        content = re.sub(r':\s*True\b', ': true', content)
+        content = re.sub(r':\s*False\b', ': false', content)
+        # 修复单引号 (简单处理，可能会误伤，但在 JSON 上下文中通常是键或值被单引号包裹)
+        # 更好的做法是只替换键的单引号，或者依赖解析器的宽容度（但标准 JSON 不支持单引号）
+        # 这里暂不处理单引号，因为风险较大，且 LLM 生成 JSON 通常能遵守双引号规则
 
         # 2. 优先匹配 Markdown 代码块，就是上面的```json```的内容
         code_block = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
         if code_block:
             return code_block.group(1)
 
-        # 3. 匹配最末尾的一个完整大括号结构（通常 JSON 在最后）
-        # 使用非贪婪匹配以避免把多余文本抓进来
-        json_blocks = re.findall(r'\{.*?\}', content, re.DOTALL)
-        if json_blocks:
-            return json_blocks[-1]  # 取最后一个，通常是真正的返回结果
+        # 3. 如果没有 Markdown，尝试提取最外层的 JSON 对象
+        # 找到第一个 '{' 和最后一个 '}'
+        start_idx = content.find('{')
+        end_idx = content.rfind('}')
+
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+             return content[start_idx : end_idx + 1]
 
         return content
 
@@ -354,7 +377,8 @@ class LlmManager:
                 value = intent_data["parameters"].get(key)
                 if value is None or value == "null" or value == "":
                     if key in ["days", "budget", "day_number"]:
-                        safe_params[key] = None
+                        # JSON 中不允许 None，使用空字符串或 0 占位
+                        safe_params[key] = ""
                     elif key in ["destination", "attraction_name"]:
                         safe_params[key] = []
                     elif key == "preference":
@@ -397,7 +421,8 @@ class LlmManager:
                 "day_number": None
             },
             "summary": "用户想要了解或调整行程",
-            "needs_more_info": True
+            "needs_more_info": True,
+            "missing_info": []
         }
 
     def _handle_trip_generation(self, intent_data: Dict[str, Any], context: List[Dict[str, str]]) -> Dict[str, Any]:
@@ -455,7 +480,8 @@ class LlmManager:
         # 处理 preference - 处理各种可能的格式
         preference_raw = params.get("preference")
         if isinstance(preference_raw, list) and preference_raw:
-            preference = preference_raw
+            # 确保列表中的元素都是字符串
+            preference = [str(p) for p in preference_raw if p]
         elif isinstance(preference_raw, str) and preference_raw.strip():
             preference = [pref.strip() for pref in preference_raw.split(",") if pref.strip()]
         else:
@@ -499,6 +525,8 @@ class LlmManager:
         # 6. 生成行程
         trip_data = self.generate_trip(user_input, context_texts)
 
+        print(f"""生成的行程数据为：{trip_data}""")
+
         if trip_data:
             return {
                 "response": f"太棒了！我已经为您规划了去{destination}的{days}天行程，预算{budget}元。行程已生成，请查看右侧地图和详细安排！",
@@ -519,7 +547,7 @@ class LlmManager:
     def _handle_trip_modification(self, intent_data: Dict[str, Any], current_trip: Dict,
                                   context: List[Dict[str, str]]) -> Dict[str, Any]:
         """处理行程修改请求"""
-        print("处理行程修改请求")
+        print(f"处理行程修改请求，目前意图数据是：{intent_data}")
         params = intent_data.get("parameters", {})
         intent_type = intent_data["intent"]
 
@@ -573,7 +601,7 @@ class LlmManager:
 
         modified_trip = self.generate_trip(user_input, context_texts, edit_cmd)
 
-        print(f"处理行程修改请求构建的prompt为: {modified_trip}")
+        print(f"处理行程修改完成，新的行程是: {modified_trip}")
 
         if modified_trip:
             if edit_cmd and "type" in edit_cmd:

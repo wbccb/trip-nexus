@@ -102,6 +102,10 @@ class UIManager:
             # 使用 st.container() 代替 st.expander() 避免点击展开/收起造成不必要的交互
             with st.container(border=True):
                 for idx, item in enumerate(items):
+                    # 数据有效性检查：如果 item 为 None，跳过
+                    if not item:
+                        continue
+                        
                     # 确保关键字段存在，避免 KeyError
                     time = item.get('time', '未知时间')
                     attraction = item.get('attraction', '未知景点')
