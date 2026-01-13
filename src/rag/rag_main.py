@@ -67,6 +67,9 @@ class AIRetrievalPipeline:
         urls_to_fetch = [r['url'] for r in filtered_results[:self.config.DETAIL_FETCH_TOP_K]]
         crawled_contents = self.crawler.fetch_urls(urls_to_fetch)
         logger.info(f"内容抓取 {len(crawled_contents)} pages")
+
+        logger.info(f"\n内容抓取内容: \n {crawled_contents}\n")
+
         
         logger.info("-------------准备向量化存储与检索-------------------")
 

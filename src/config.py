@@ -5,7 +5,7 @@ load_dotenv()
 
 class Config:
     # SearXNG配置
-    SEARXNG_URL = os.getenv("SEARXNG_URL", "https://search.rhscz.eu/")
+    SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080")
 
     # Embedding 模型配置
     SENTENCE_BERT_MODEL = os.getenv("SENTENCE_BERT_MODEL", "all-MiniLM-L6-v2")

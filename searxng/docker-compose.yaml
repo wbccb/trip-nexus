@@ -1,0 +1,16 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: always
+    networks:
+      - searxng_net
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+
+networks:
+  searxng_net:
