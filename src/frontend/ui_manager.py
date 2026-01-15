@@ -1,6 +1,6 @@
 import logging
 import streamlit as st
-from streamlit_folium import st_folium
+from streamlit.components.v1 import html
 from typing import Optional, Dict, List, Any
 from datetime import datetime
 
@@ -144,13 +144,10 @@ class UIManager:
             st.session_state.map_obj = self.map_renderer.render_map(trip_data)
 
         if st.session_state.map_obj:
-            st_folium(
-                st.session_state.map_obj,
-                width=1000,
+            html(
+                st.session_state.map_obj._repr_html_(),
                 height=600,
-                # 优化：返回对象可以帮助调试，通常设置为 'all'，这里保持 []
-                returned_objects=[],
-                key="trip_map"  # 明确设置key
+                width=1000,
             )
         else:
             st.error("无法生成地图，请检查地址解析服务是否正常。")
@@ -385,13 +382,11 @@ class UIManager:
 
         # 6. 显示地图组件
         if st.session_state.get("map_obj"):
-            print("[MapDebug] rendering st_folium")
-            st_folium(
-                st.session_state.map_obj,
-                width=1000,
+            print("[MapDebug] rendering map via html component")
+            html(
+                st.session_state.map_obj._repr_html_(),
                 height=600,
-                returned_objects=[],
-                key="trip_map",
+                width=1000,
             )
 
     def _display_trip_in_chat(self, trip_data: Dict[str, Any]):

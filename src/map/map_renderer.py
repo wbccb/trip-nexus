@@ -14,12 +14,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+
 AMAP_STREET_TILES = "http://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=7&x={x}&y={y}&z={z}"
 AMAP_SATELLITE_TILES = "http://webst02.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}"
 
 
 class TripMap:
     def __init__(self):
+        # Nominatim - OpenStreetMap 提供的免費替代地理編碼服務
         self.geolocator = Nominatim(
             user_agent="trip_nexus_py312_v3",
             timeout=15,
@@ -37,7 +40,8 @@ class TripMap:
                 location = self.geolocator.geocode(city, exactly_one=True)
                 if location:
                     return (location.latitude, location.longitude)
-            except (GeocoderTimedOut, GeocoderServiceError):
+            except (GeocoderTimedOut, GeocoderServiceError, Exception) as e:
+                print(f"[MapRenderer] geocode error for '{address}' attempt {attempt + 1}: {e}")
                 time.sleep(2**attempt)
         return (30.6570, 104.0650)
 
