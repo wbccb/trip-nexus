@@ -22,7 +22,6 @@ AMAP_SATELLITE_TILES = "http://webst02.is.autonavi.com/appmaptile?style=6&x={x}&
 
 class TripMap:
     def __init__(self):
-        # Nominatim - OpenStreetMap 提供的免費替代地理編碼服務
         self.geolocator = Nominatim(
             user_agent="trip_nexus_py312_v3",
             timeout=15,
@@ -30,20 +29,55 @@ class TripMap:
         )
         self.colors = ["blue", "green", "red", "purple", "orange", "darkblue"]
 
-    def _get_coordinates(self, address: str) -> Tuple[float, float]:
+    def _get_coordinates(
+        self,
+        address: str,
+        fallback: Tuple[float, float] | None = None,
+        max_offset_deg: float | None = None,
+    ) -> Tuple[float, float]:
         for attempt in range(3):
             try:
                 location = self.geolocator.geocode(address, exactly_one=True)
                 if location:
-                    return (location.latitude, location.longitude)
+                    lat = location.latitude
+                    lon = location.longitude
+                    if (
+                        fallback
+                        and max_offset_deg is not None
+                        and (
+                            abs(lat - fallback[0]) > max_offset_deg
+                            or abs(lon - fallback[1]) > max_offset_deg
+                        )
+                    ):
+                        print(
+                            f"[MapRenderer] geocode result out of bounds for '{address}', "
+                            f"lat={lat}, lon={lon}, center={fallback}"
+                        )
+                    else:
+                        return (lat, lon)
                 city = address.split(",")[-1].strip()
                 location = self.geolocator.geocode(city, exactly_one=True)
                 if location:
-                    return (location.latitude, location.longitude)
+                    lat = location.latitude
+                    lon = location.longitude
+                    if (
+                        fallback
+                        and max_offset_deg is not None
+                        and (
+                            abs(lat - fallback[0]) > max_offset_deg
+                            or abs(lon - fallback[1]) > max_offset_deg
+                        )
+                    ):
+                        print(
+                            f"[MapRenderer] city-level geocode out of bounds for '{city}', "
+                            f"lat={lat}, lon={lon}, center={fallback}"
+                        )
+                    else:
+                        return (lat, lon)
             except (GeocoderTimedOut, GeocoderServiceError, Exception) as e:
                 print(f"[MapRenderer] geocode error for '{address}' attempt {attempt + 1}: {e}")
                 time.sleep(2**attempt)
-        return (30.6570, 104.0650)
+        return fallback or (30.6570, 104.0650)
 
     def _create_icon(self, day_idx: int, item: Dict[str, Any]) -> DivIcon:
         color = self.colors[day_idx % len(self.colors)]
@@ -85,12 +119,12 @@ class TripMap:
     def render_map(self, trip_data: Dict[str, Any]) -> folium.Map:
         logger.info("\n\n------------------!!开始渲染地图!!------------------\n\n")
         print(f"[MapRenderer] render_map input trip_data keys: {trip_data.keys()}")
-        
-        dest = trip_data.get("destination", "成都") # 增加默认值防止key error
+
+        dest = trip_data.get("destination", "成都")
         print(f"[MapRenderer] resolving destination: {dest}")
         center_coords = self._get_coordinates(dest)
         print(f"[MapRenderer] center_coords: {center_coords}")
-        
+
         m = self._build_base_map(center_coords)
 
         daily_plan_raw = trip_data.get("daily_plan")
@@ -106,7 +140,7 @@ class TripMap:
             print(f"[MapRenderer] 警告：daily_plan 数据类型异常，无法渲染。类型: {type(daily_plan_raw)}")
             return m
 
-        marker_cluster = MarkerCluster(name="行程景点").add_to(m)
+        all_coords: List[Tuple[float, float]] = []
 
         for day_str, items in daily_plans_grouped.items():
             try:
@@ -125,14 +159,18 @@ class TripMap:
                     print(f"[MapRenderer] 第{day_str}天第{idx + 1}项行程({attraction})缺少地址，跳过。")
                     continue
 
-                coords = self._get_coordinates(address)
-                print(f"[MapRenderer] Geocoding '{attraction}' ({address}) -> {coords}")
+                coords = self._get_coordinates(address, fallback=center_coords, max_offset_deg=1.0)
+                print(
+                    f"[MapRenderer] Marker raw -> day={day_str}, idx={idx}, "
+                    f"attraction='{attraction}', address='{address}', coords={coords}"
+                )
 
                 if not coords or all(c == 0 for c in coords):
                     print(f"[MapRenderer] 无法获取地址 '{address}' 的有效坐标，跳过。")
                     continue
 
                 coords_list.append(coords)
+                all_coords.append(coords)
 
                 popup_html = (
                     f"<b>第{day_str}天</b><br>"
@@ -140,12 +178,17 @@ class TripMap:
                     f"交通：{item.get('transport', '')}"
                 )
 
-                folium.Marker(
+                marker = folium.Marker(
                     location=coords,
                     popup=popup_html,
                     icon=self._create_icon(day_idx, item),
                     tooltip=item.get("attraction", ""),
-                ).add_to(marker_cluster)
+                )
+                marker.add_to(m)
+                print(
+                    f"[MapRenderer] Marker added -> day={day_str}, idx={idx}, "
+                    f"lat={coords[0]}, lon={coords[1]}"
+                )
 
             if len(coords_list) >= 2:
                 PolyLine(
@@ -155,5 +198,11 @@ class TripMap:
                     opacity=0.7,
                     tooltip=f"第{day_str}天路线",
                 ).add_to(m)
+
+        if all_coords:
+            try:
+                m.fit_bounds(all_coords, padding=(20, 20))
+            except Exception as e:
+                print(f"[MapRenderer] fit_bounds failed: {e}")
 
         return m
