@@ -139,9 +139,9 @@ class UIManager:
         # ------------------ 3. 地图展示逻辑 ------------------
         st.subheader("🗺️ 行程地图", divider="blue")
 
-        # 检查地图对象是否存在，并在不存在时尝试生成
-        if not st.session_state.get('map_obj') and self.map_renderer:
-            st.session_state.map_obj = self.map_renderer.render_map(trip_data)
+        if not st.session_state.get("map_obj") and self.map_renderer:
+            with st.spinner("地图生成中，请稍候..."):
+                st.session_state.map_obj = self.map_renderer.render_map(trip_data)
 
         if st.session_state.map_obj:
             html(
@@ -373,7 +373,8 @@ class UIManager:
         if not st.session_state.get("map_obj") and self.map_renderer:
             print("[MapDebug] map_obj missing, generating new map...")
             try:
-                st.session_state.map_obj = self.map_renderer.render_map(trip_data)
+                with st.spinner("地图生成中，请稍候..."):
+                    st.session_state.map_obj = self.map_renderer.render_map(trip_data)
                 print("[MapDebug] map generated successfully")
             except Exception as e:
                 print(f"[MapDebug] map generation failed: {e}")
