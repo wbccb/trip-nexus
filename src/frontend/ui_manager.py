@@ -237,6 +237,7 @@ class UIManager:
             user_msg = {"role": MessageType.USER, "content": prompt, "timestamp": datetime.now().isoformat(), "metadata": {}}
             st.session_state.chat_history.append(user_msg)
             user_message_obj = Message.model_validate(user_msg)
+            # 用户输入的文字马上渲染到界面中
             chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
             self.conversation_manager.process_new_message(user_id, device_id, user_message_obj, session_id)
             response_data = self.llm_manager.change_trip(query=prompt, context=st.session_state.chat_history, current_trip=st.session_state.trip_data)
@@ -264,7 +265,9 @@ class UIManager:
             }
             st.session_state.chat_history.append(assistant_msg)
             assistant_message_obj = Message.model_validate(assistant_msg)
+            # AI消息进行处理：主要是压缩多轮对话消息 + 存储会话信息到数据库中
             self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
+            # 显示AI消息到界面中
             chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
             if trip_data:
                 st.divider()
