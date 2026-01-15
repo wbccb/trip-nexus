@@ -6,7 +6,13 @@ from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from typing import Dict, List, Tuple, Any
 import time
+import logging
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 AMAP_STREET_TILES = "http://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=7&x={x}&y={y}&z={z}"
 AMAP_SATELLITE_TILES = "http://webst02.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}"
@@ -73,18 +79,27 @@ class TripMap:
         return m
 
     def render_map(self, trip_data: Dict[str, Any]) -> folium.Map:
-        dest = trip_data["destination"]
+        logger.info("\n\n------------------!!开始渲染地图!!------------------\n\n")
+        print(f"[MapRenderer] render_map input trip_data keys: {trip_data.keys()}")
+        
+        dest = trip_data.get("destination", "成都") # 增加默认值防止key error
+        print(f"[MapRenderer] resolving destination: {dest}")
         center_coords = self._get_coordinates(dest)
+        print(f"[MapRenderer] center_coords: {center_coords}")
+        
         m = self._build_base_map(center_coords)
 
         daily_plan_raw = trip_data.get("daily_plan")
+        if not daily_plan_raw:
+             print("[MapRenderer] Warning: daily_plan is empty or None")
+             return m
 
         if isinstance(daily_plan_raw, dict):
             daily_plans_grouped: Dict[str, List[Dict[str, str]]] = daily_plan_raw
         elif isinstance(daily_plan_raw, list):
             daily_plans_grouped = {"1": daily_plan_raw}
         else:
-            print(f"daily_plan 数据类型异常，无法渲染。类型: {type(daily_plan_raw)}")
+            print(f"[MapRenderer] 警告：daily_plan 数据类型异常，无法渲染。类型: {type(daily_plan_raw)}")
             return m
 
         marker_cluster = MarkerCluster(name="行程景点").add_to(m)
@@ -93,20 +108,24 @@ class TripMap:
             try:
                 day_idx = int(day_str) - 1
             except ValueError:
-                print(f"无法解析日期字符串 '{day_str}' 为数字，跳过。")
+                print(f"[MapRenderer] 无法解析日期字符串 '{day_str}' 为数字，跳过。")
                 continue
 
             coords_list: List[Tuple[float, float]] = []
 
             for idx, item in enumerate(items):
-                if not item.get("address"):
-                    print(f"第{day_str}天第{idx + 1}项行程缺少地址，跳过。")
+                address = item.get("address")
+                attraction = item.get("attraction", "未知景点")
+                
+                if not address:
+                    print(f"[MapRenderer] 第{day_str}天第{idx + 1}项行程({attraction})缺少地址，跳过。")
                     continue
 
-                coords = self._get_coordinates(item["address"])
+                coords = self._get_coordinates(address)
+                print(f"[MapRenderer] Geocoding '{attraction}' ({address}) -> {coords}")
 
                 if not coords or all(c == 0 for c in coords):
-                    print(f"无法获取地址 '{item['address']}' 的有效坐标，跳过。")
+                    print(f"[MapRenderer] 无法获取地址 '{address}' 的有效坐标，跳过。")
                     continue
 
                 coords_list.append(coords)

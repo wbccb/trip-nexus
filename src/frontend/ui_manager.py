@@ -1,3 +1,4 @@
+import logging
 import streamlit as st
 from streamlit_folium import st_folium
 from typing import Optional, Dict, List, Any
@@ -9,19 +10,21 @@ from src.frontend.context.entity import Message, MessageType
 from src.llm.llm_manager import LlmManager
 from src.config import Config
 from src.utils.console import console_log
+from src.map.map_renderer import TripMap
 import json
 
 class UIManager:
-    def __init__(self, llm_manager: LlmManager, config: Config):
+    def __init__(self, llm_manager: LlmManager, config: Config, map_renderer: TripMap | None = None):
         st.set_page_config(page_title="TripNexus", layout="wide")
         self._init_session_state()
         self.llm_manager = llm_manager
         self.conversation_storage = get_conversation_storage(config)
         self.conversation_manager = ConversationManager(conversation_storage=self.conversation_storage, llm_manager=llm_manager)
+        self.map_renderer = map_renderer or TripMap()
 
     def _init_session_state(self) -> None:
         """初始化会话状态"""
-        required_keys = {"trip_data", "map_obj", "edit_cmd", "current_conversation_id"}
+        required_keys = {"trip_data", "map_obj", "edit_cmd", "current_conversation_id", "map_visible"}
         for key in required_keys:
             if key not in st.session_state:
                 st.session_state[key] = None
@@ -30,6 +33,9 @@ class UIManager:
         for key in required_array_keys:
             if key not in st.session_state:
                 st.session_state[key] = []
+
+        if "map_visible" not in st.session_state or st.session_state["map_visible"] is None:
+            st.session_state["map_visible"] = True
 
     def render_input_form(self) -> Optional[Dict[str, Any]]:
         """渲染输入表单，返回结构化参数"""
@@ -134,8 +140,8 @@ class UIManager:
         st.subheader("🗺️ 行程地图", divider="blue")
 
         # 检查地图对象是否存在，并在不存在时尝试生成
-        if not st.session_state.get('map_obj'):
-            st.session_state.map_obj = self.render_map(trip_data)
+        if not st.session_state.get('map_obj') and self.map_renderer:
+            st.session_state.map_obj = self.map_renderer.render_map(trip_data)
 
         if st.session_state.map_obj:
             st_folium(
@@ -338,6 +344,56 @@ class UIManager:
                 #         "error": True
                 #     })
 
+    def render_map_panel(self) -> None:
+        st.subheader("🗺️ 行程地图", divider="blue")
+
+        # 1. 确保 map_visible 有效
+        if st.session_state.get("map_visible") is None:
+            st.session_state.map_visible = True
+
+        # 2. 调试日志
+        print(f"[MapDebug] render_map_panel called. visible={st.session_state.map_visible}, has_trip={bool(st.session_state.get('trip_data'))}, has_map_obj={bool(st.session_state.get('map_obj'))}")
+
+        # 3. 处理隐藏逻辑
+        if not st.session_state.map_visible:
+            if st.button("显示地图", key="show_map_button"):
+                st.session_state.map_visible = True
+                st.rerun()  # 立即刷新
+            return
+        
+        # 4. 处理显示逻辑
+        if st.button("隐藏地图", key="hide_map_button"):
+            st.session_state.map_visible = False
+            st.rerun()  # 立即刷新
+            return
+
+        trip_data = st.session_state.get("trip_data")
+        if not trip_data:
+            st.info("暂无行程数据，生成行程后将显示地图。")
+            return
+        
+        # 5. 渲染地图对象（如果不存在则生成）
+        if not st.session_state.get("map_obj") and self.map_renderer:
+            print("[MapDebug] map_obj missing, generating new map...")
+            try:
+                st.session_state.map_obj = self.map_renderer.render_map(trip_data)
+                print("[MapDebug] map generated successfully")
+            except Exception as e:
+                print(f"[MapDebug] map generation failed: {e}")
+                st.error(f"地图生成失败: {str(e)}")
+                return
+
+        # 6. 显示地图组件
+        if st.session_state.get("map_obj"):
+            print("[MapDebug] rendering st_folium")
+            st_folium(
+                st.session_state.map_obj,
+                width=1000,
+                height=600,
+                returned_objects=[],
+                key="trip_map",
+            )
+
     def _display_trip_in_chat(self, trip_data: Dict[str, Any]):
         """在聊天界面中显示格式化的行程"""
         if not trip_data:
@@ -463,6 +519,7 @@ class UIManager:
 
     def render_main_interface(self, user_id: str, device_id: str) -> None:
         """渲染主界面，集成聊天和行程展示"""
+        print("render_main_interface渲染主界面，集成聊天和行程展示")
         # 侧边栏：聊天控制
         with st.sidebar:
             st.header("🎯 行程助手")
@@ -495,7 +552,13 @@ class UIManager:
                     st.session_state.chat_history = []
                     st.rerun()
 
-        self.render_chat_interface(user_id, device_id, st.session_state.current_conversation_id)
+        col_left, col_right = st.columns([2, 3])
+        with col_left:
+            print("渲染col_left聊天界面")
+            self.render_chat_interface(user_id, device_id, st.session_state.current_conversation_id)
+        with col_right:
+            print(f"渲染col_right地图界面, st.session_state.map_visible = {st.session_state["map_visible"]}")
+            self.render_map_panel()
 
     def render_session_list(self, user_id: str, device_id: str) -> None:
         """绘制左侧的会话列表"""
