@@ -190,18 +190,12 @@ class UIManager:
             trip_data = self.conversation_manager.conversationStorage.get_trip_data(session_id)
             if trip_data:
                 st.session_state.trip_data = trip_data
+        if "ai_processing" not in st.session_state:
+            st.session_state.ai_processing = False
         chat_container = st.container()
         with chat_container:
-            # st.markdown(
-            #     """
-            #     <style>
-            #     .chat-layout{display:flex;flex-direction:column;height:calc(100vh - 140px);}
-            #     </style>
-            #     """,
-            #     unsafe_allow_html=True,
-            # )
-            # st.markdown('<div class="chat-layout222">', unsafe_allow_html=True)
             chat_placeholder = st.empty()
+            input_placeholder = st.empty()
         def build_chat_html(messages: List[Dict[str, Any]]) -> str:
             css = """
             <style>
@@ -214,6 +208,15 @@ class UIManager:
             .user .bubble{background:#E6F4FF;border:1px solid #CDE6FF;}
             .avatar{width:28px;height:28px;border-radius:50%;background:#eef;display:flex;align-items:center;justify-content:center;font-size:14px;margin-right: 10px;}
             .user .avatar{display:none;}
+            .bubble.loading{display:flex;align-items:center;gap:8px;}
+            .loading-dots{display:inline-flex;gap:4px;}
+            .loading-dots span{width:6px;height:6px;border-radius:50%;background:#999;animation:ai-loading 1.2s infinite ease-in-out;}
+            .loading-dots span:nth-child(2){animation-delay:0.2s;}
+            .loading-dots span:nth-child(3){animation-delay:0.4s;}
+            @keyframes ai-loading{
+                0%,80%,100%{transform:scale(0);}
+                40%{transform:scale(1);}
+            }
             </style>
             """
             body = ['<div class="chat-wrapper">']
@@ -221,24 +224,44 @@ class UIManager:
                 role = m.get("role")
                 role_str = "assistant" if role == MessageType.ASSISTANT or role == "assistant" else "user"
                 content = m.get("content", "")
+                metadata = m.get("metadata", {}) if isinstance(m, dict) else {}
+                is_loading = isinstance(metadata, dict) and metadata.get("loading", False)
                 body.append(f'<div class="msg {role_str}">')
                 if role_str == "assistant":
                     body.append('<div class="avatar">AI</div>')
-                body.append(f'<div class="bubble">{content}</div>')
+                if is_loading:
+                    body.append(
+                        '<div class="bubble loading">AI处理中'
+                        '<span class="loading-dots"><span></span><span></span><span></span></span>'
+                        '</div>'
+                    )
+                else:
+                    body.append(f'<div class="bubble">{content}</div>')
                 body.append('</div>')
             body.append('</div>')
             return css + "".join(body)
         with chat_container:
             chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
-            prompt = st.chat_input("告诉我您想如何调整行程？")
-            st.markdown("</div>", unsafe_allow_html=True)
+            if st.session_state.ai_processing:
+                prompt = input_placeholder.chat_input("告诉我您想如何调整行程？", disabled=True)
+            else:
+                prompt = input_placeholder.chat_input("告诉我您想如何调整行程？")
         if prompt:
-            # 当用户输入后，点击Enter触发
             user_msg = {"role": MessageType.USER, "content": prompt, "timestamp": datetime.now().isoformat(), "metadata": {}}
             st.session_state.chat_history.append(user_msg)
             user_message_obj = Message.model_validate(user_msg)
-            # 用户输入的文字马上渲染到界面中
-            chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
+            temp_loading = {
+                "role": MessageType.ASSISTANT,
+                "content": "",
+                "timestamp": datetime.now().isoformat(),
+                "metadata": {"loading": True},
+            }
+            loading_messages = st.session_state.chat_history + [temp_loading]
+            st.session_state.ai_processing = True
+            chat_placeholder.markdown(build_chat_html(loading_messages), unsafe_allow_html=True)
+            with chat_container:
+                with input_placeholder.container():
+                    prompt = input_placeholder.chat_input("AI处理中，暂时无法输入...", disabled=True)
             self.conversation_manager.process_new_message(user_id, device_id, user_message_obj, session_id)
             response_data = self.llm_manager.change_trip(query=prompt, context=st.session_state.chat_history, current_trip=st.session_state.trip_data)
             if isinstance(response_data, dict) and "response" in response_data:
@@ -269,6 +292,8 @@ class UIManager:
             self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
             # 显示AI消息到界面中
             chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
+            st.session_state.ai_processing = False
+            st.rerun()
             if trip_data:
                 st.divider()
                 st.markdown("### 🎯 为您生成的行程方案")
