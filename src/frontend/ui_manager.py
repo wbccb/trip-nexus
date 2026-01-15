@@ -185,161 +185,92 @@ class UIManager:
 
     def render_chat_interface(self, user_id: str, device_id: str, session_id: str) -> None:
         """渲染聊天界面，支持多轮对话"""
-        st.sidebar.subheader("💬 行程对话助手")
-        
-        # 尝试恢复行程数据（如果当前没有，但数据库有）
+        st.subheader("💬 行程对话助手")
         if not st.session_state.trip_data:
             trip_data = self.conversation_manager.conversationStorage.get_trip_data(session_id)
             if trip_data:
                 st.session_state.trip_data = trip_data
-                print("已从数据库恢复行程数据")
-
-        # 使用st.chat_message构建聊天界面
         chat_container = st.container()
-
         with chat_container:
-            # 显示对话历史
-            for message in st.session_state.chat_history:
-                with st.chat_message(message["role"]):
-                    # 显示消息内容
-                    st.markdown(message["content"])
-                    # print(f"显示对话历史，旅游数据为: {message}")
-                    if isinstance(message, dict) and "metadata" in message and "trip_data" in message["metadata"]:
-                        trip_data = message["metadata"]["trip_data"]
-                        if trip_data:
-                            st.divider()
-                            st.markdown("### 🎯 为您生成的行程方案")
-                            # 显示格式化的行程
-                            self._display_trip_in_chat(trip_data)
-                            # 添加视觉提示
-                            st.success("✨ 行程已生成！右侧地图和详细安排已更新。")
-                    # 显示错误标记（如果有）
-                    if message.get("error", False):
-                        st.caption("⚠️ 消息处理出错")
-
-        # 用户输入
-        if prompt := st.chat_input("告诉我您想如何调整行程？"):
-            # 1. 添加用户消息到历史
-            user_msg = {
-                "role": MessageType.USER,
-                "content": prompt,
-                "timestamp": datetime.now().isoformat(),
-                "metadata": {}
-            }
+            # st.markdown(
+            #     """
+            #     <style>
+            #     .chat-layout{display:flex;flex-direction:column;height:calc(100vh - 140px);}
+            #     </style>
+            #     """,
+            #     unsafe_allow_html=True,
+            # )
+            # st.markdown('<div class="chat-layout222">', unsafe_allow_html=True)
+            chat_placeholder = st.empty()
+        def build_chat_html(messages: List[Dict[str, Any]]) -> str:
+            css = """
+            <style>
+            .chat-wrapper{display:flex;flex-direction:column;gap:12px;flex:1;height:0;overflow:auto;padding:8px;}
+            .msg{display:flex;align-items:flex-start;margin:24px 0px;}
+            .msg.assistant{justify-content:flex-start;}
+            .msg.user{justify-content:flex-end;}
+            .bubble{border-radius:8px;padding:10px 12px;max-width:80%;line-height:1.6;font-size:14px;}
+            .assistant .bubble{background:#fff;border:1px solid #eee;}
+            .user .bubble{background:#E6F4FF;border:1px solid #CDE6FF;}
+            .avatar{width:28px;height:28px;border-radius:50%;background:#eef;display:flex;align-items:center;justify-content:center;font-size:14px;margin-right: 10px;}
+            .user .avatar{display:none;}
+            </style>
+            """
+            body = ['<div class="chat-wrapper">']
+            for m in messages:
+                role = m.get("role")
+                role_str = "assistant" if role == MessageType.ASSISTANT or role == "assistant" else "user"
+                content = m.get("content", "")
+                body.append(f'<div class="msg {role_str}">')
+                if role_str == "assistant":
+                    body.append('<div class="avatar">AI</div>')
+                body.append(f'<div class="bubble">{content}</div>')
+                body.append('</div>')
+            body.append('</div>')
+            return css + "".join(body)
+        with chat_container:
+            chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
+            prompt = st.chat_input("告诉我您想如何调整行程？")
+            st.markdown("</div>", unsafe_allow_html=True)
+        if prompt:
+            # 当用户输入后，点击Enter触发
+            user_msg = {"role": MessageType.USER, "content": prompt, "timestamp": datetime.now().isoformat(), "metadata": {}}
             st.session_state.chat_history.append(user_msg)
-            # 2. 处理 用户 发送的消息 => 更新上下文
             user_message_obj = Message.model_validate(user_msg)
+            chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
             self.conversation_manager.process_new_message(user_id, device_id, user_message_obj, session_id)
-
-
-            # 3. 即时显示用户消息（也可以依赖历史渲染，但这里即时显示更流畅）
-            with chat_container:  # 注意：这里用chat_container包裹，确保消息在同一个容器中
-                with st.chat_message(user_msg["role"]):
-                    st.markdown(user_msg["content"])
-
-            # 获取AI响应并显示（核心：追加到历史，而非覆盖）
-            with st.chat_message("assistant"):
-                message_placeholder = st.empty()
-
-                # try:
-                # 调用LLM获取响应，进行旅游行程的修改
-                print(f"处理完上下文（实体抽取、压缩第1条数据）后，组装prompt: {prompt}")
-
-                response_data = self.llm_manager.change_trip(
-                    query=prompt,
-                    context=st.session_state.chat_history,
-                    current_trip=st.session_state.trip_data
-                )
-                
-                # response_data = {
-                #     "response": "太棒了！我已经为您规划了从上海到成都的3天行程，预算1000元。行程已生成，请查看右侧地图和详细安排！",
-                #     "trip_data": {
-                #         "destination": "成都",
-                #         "days": 3,
-                #         "daily_plan": {
-                #             "1": {
-                #                 "time": "09:00-17:00",
-                #                 "attraction": "都江堰博物馆",
-                #                 "address": "成都市青羊区都江堰东街28号",
-                #                 "transport": "地铁5号线龙王村站C口出，步行10分钟",
-                #                 "duration": "3小时"
-                #             },
-                #             "2": {
-                #                 "time": "09:00-17:00",
-                #                 "attraction": "钟英古镇",
-                #                 "address": "成都市金堂县钟英镇南二路18号",
-                #                 "transport": "地铁5号线龙王村站C口出，步行10分钟",
-                #                 "duration": "3小时"
-                #             },
-                #             "3": {
-                #                 "time": "14:00-17:00",
-                #                 "attraction": "杜甫草堂",
-                #                 "address": "成都市青羊区青华路37号",
-                #                 "transport": "地铁4号线草堂北路站B口出，步行10分钟",
-                #                 "duration": "2小时"
-                #             }
-                #         }
-                #     },
-                #     "intent": "trip_generated"
-                # }
-                print(f"调用LLM获取响应，进行旅游行程的修改，response: {response_data}")
-
-                # 显示对话回复
-                if isinstance(response_data, dict) and "response" in response_data:
-                    chat_response = response_data["response"]
-                    message_placeholder.markdown(chat_response)
-                else:
-                    chat_response = str(response_data)
-                    message_placeholder.markdown(chat_response)
-
-                # 如果有行程数据，显示格式化的行程
-                if isinstance(response_data, dict) and "trip_data" in response_data:
-                    trip_data = response_data["trip_data"]
-
-                    if trip_data:
-                        # 保存到session状态
-                        st.session_state.trip_data = trip_data
-                        st.session_state.map_obj = None
-                        
-                        # 持久化存储行程数据
-                        self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
-
-                        # 在聊天中显示格式化的行程
-                        st.divider()
-                        st.markdown("### 🎯 为您生成的行程方案")
-
-                        # 显示格式化的行程
-                        self._display_trip_in_chat(trip_data)
-
-                        # 添加视觉提示
-                        st.success("✨ 行程已生成！右侧地图和详细安排已更新。")
-
-                # 添加AI响应到历史（实现递增的核心：历史列表追加）
-                assistant_msg = {
-                    "role": MessageType.ASSISTANT,
-                    "content": chat_response,
-                    "timestamp": datetime.now().isoformat(),
-                    "metadata": {
-                        "context_type": "trip_modification",
-                        "conversation_id": st.session_state.current_conversation_id,
-                        "has_trip_data": bool(trip_data if 'trip_data' in locals() else False),
-                        "trip_data": trip_data
-                    }
+            response_data = self.llm_manager.change_trip(query=prompt, context=st.session_state.chat_history, current_trip=st.session_state.trip_data)
+            if isinstance(response_data, dict) and "response" in response_data:
+                chat_response = response_data["response"]
+            else:
+                chat_response = str(response_data)
+            trip_data = None
+            if isinstance(response_data, dict) and "trip_data" in response_data:
+                trip_data = response_data["trip_data"]
+                if trip_data:
+                    st.session_state.trip_data = trip_data
+                    st.session_state.map_obj = None
+                    self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
+            assistant_msg = {
+                "role": MessageType.ASSISTANT,
+                "content": chat_response,
+                "timestamp": datetime.now().isoformat(),
+                "metadata": {
+                    "context_type": "trip_modification",
+                    "conversation_id": st.session_state.current_conversation_id,
+                    "has_trip_data": bool(trip_data),
+                    "trip_data": trip_data
                 }
-                st.session_state.chat_history.append(assistant_msg)
-
-                # AI回复的消息 => 更新上下文
-                assistant_message_obj = Message.model_validate(assistant_msg)
-                self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
-
-                # except Exception as e:
-                #     error_msg = f"对话处理出错: {str(e)}"
-                #     message_placeholder.error(error_msg)
-                #     st.session_state.chat_history.append({
-                #         "role": "assistant",
-                #         "content": error_msg,
-                #         "error": True
-                #     })
+            }
+            st.session_state.chat_history.append(assistant_msg)
+            assistant_message_obj = Message.model_validate(assistant_msg)
+            self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
+            chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
+            if trip_data:
+                st.divider()
+                st.markdown("### 🎯 为您生成的行程方案")
+                self._display_trip_in_chat(trip_data)
+                st.success("✨ 行程已生成！右侧地图和详细安排已更新。")
 
     def render_map_panel(self) -> None:
         st.subheader("🗺️ 行程地图", divider="blue")
@@ -515,105 +446,85 @@ class UIManager:
 
     def render_main_interface(self, user_id: str, device_id: str) -> None:
         """渲染主界面，集成聊天和行程展示"""
-        print("render_main_interface渲染主界面，集成聊天和行程展示")
-        # 侧边栏：聊天控制
-        with st.sidebar:
-            st.header("🎯 行程助手")
-
-            # 渲染会话列表
+        st.markdown(
+            """
+            <style>
+            [data-testid="stChatMessage"] { margin-bottom: 12px; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        col_sessions, col_chat, col_map = st.columns([2, 5, 5])
+        with col_sessions:
+            st.header("会话")
             current_session_id = self.render_session_list(user_id, device_id)
-
             if current_session_id is None:
-                # 获取会话列表
                 sessions = self.conversation_storage.get_session_list(user_id)
                 if sessions:
-                    # 自动选择第一个会话
                     first_session_id = sessions[0]["session_id"]
                     st.session_state.current_conversation_id = first_session_id
-
-                    # 加载聊天历史
                     short_term_list = self.conversation_storage.get_short_term_context(first_session_id)
                     if not short_term_list:
                         session_chat_list = self.conversation_storage.get_session_chat_list(first_session_id)
                         short_term_list = [json.loads(msg_str) for msg_str in session_chat_list]
                     st.session_state.chat_history = short_term_list
-
-                    # 刷新以应用状态
                     st.rerun()
                 else:
-                    # 无会话，创建新会话
                     new_session_id = self.conversation_storage.generate_session_id(user_id, device_id)
                     self.conversation_storage.store_session(user_id, session_id=new_session_id)
                     st.session_state.current_conversation_id = new_session_id
                     st.session_state.chat_history = []
                     st.rerun()
-
-        col_left, col_right = st.columns([2, 3])
-        with col_left:
-            print("渲染col_left聊天界面")
+        with col_chat:
+            st.header("对话")
             self.render_chat_interface(user_id, device_id, st.session_state.current_conversation_id)
-        with col_right:
-            print(f"渲染col_right地图界面, st.session_state.map_visible = {st.session_state["map_visible"]}")
+        with col_map:
             self.render_map_panel()
 
     def render_session_list(self, user_id: str, device_id: str) -> None:
         """绘制左侧的会话列表"""
-        with (st.sidebar):
-            st.subheader("会话列表", divider="gray")
-
-            # 1. 新会话按钮
-            if st.button("新建会话", use_container_width=True):
-                console_log("新建会话:"+user_id , device_id)
-                new_session_id = self.conversation_storage.generate_session_id(user_id, device_id)
-                console_log("新建会话 new_session_id", new_session_id)
-                self.conversation_storage.store_session(user_id, session_id=new_session_id)
-                st.session_state.current_conversation_id = new_session_id
-                st.session_state.chat_history = []
-                st.rerun()
-
-            st.divider()
-            # 2. 获取会话列表
-            sessions = self.conversation_storage.get_session_list(user_id)
-            if not sessions:
-                st.info("暂无会话记录")
-                return None
-
-            for idx, session in enumerate(sessions):
-                session_id = session["session_id"]
-                name = session["name"]
-
-
-                # 一行显示：会话按钮 + 删除按钮
-                col1, col2 = st.columns([8, 2])
-                with col1:
-                    # 会话按钮：点击后切换会话
-                    if st.button(
-                            f"{name})",
-                            key=f"session_{idx}_{session_id}",
-                            use_container_width=True,
-                            # 高亮当前选中的会话
-                            type="primary" if session_id == st.session_state.current_conversation_id else "secondary"
-                    ):
-                        # 用户点击：切换会话
-                        st.session_state.current_conversation_id = session_id
-                        short_term_list = self.conversation_storage.get_short_term_context(session_id)
-                        if not short_term_list:
-                            session_chat_list = self.conversation_storage.get_session_chat_list(session_id)
-                            short_term_list = [json.loads(msg_str) for msg_str in session_chat_list]
-                        st.session_state.chat_history = short_term_list
-                        st.rerun()
-                with col2:
-                    # 删除会话
-                    if st.button(
-                            "🗑️",
-                            key=f"delete_{idx}_{session_id}",
-                            use_container_width=True,
-                            help="删除该会话"
-                    ):
-                        self.conversation_storage.delete_session(session_id=session_id)
-                        if session_id == st.session_state.current_conversation_id:
-                            st.session_state.current_conversation_id = None
-                            st.session_state.chat_history = []
-                        st.rerun()
-
-            return st.session_state.current_conversation_id
+        st.subheader("会话列表", divider="gray")
+        if st.button("新建会话", use_container_width=True):
+            console_log("新建会话:"+user_id , device_id)
+            new_session_id = self.conversation_storage.generate_session_id(user_id, device_id)
+            console_log("新建会话 new_session_id", new_session_id)
+            self.conversation_storage.store_session(user_id, session_id=new_session_id)
+            st.session_state.current_conversation_id = new_session_id
+            st.session_state.chat_history = []
+            st.rerun()
+        st.divider()
+        sessions = self.conversation_storage.get_session_list(user_id)
+        if not sessions:
+            st.info("暂无会话记录")
+            return None
+        for idx, session in enumerate(sessions):
+            session_id = session["session_id"]
+            name = session["name"]
+            col1, col2 = st.columns([8, 2])
+            with col1:
+                if st.button(
+                        f"{name})",
+                        key=f"session_{idx}_{session_id}",
+                        use_container_width=True,
+                        type="primary" if session_id == st.session_state.current_conversation_id else "secondary"
+                ):
+                    st.session_state.current_conversation_id = session_id
+                    short_term_list = self.conversation_storage.get_short_term_context(session_id)
+                    if not short_term_list:
+                        session_chat_list = self.conversation_storage.get_session_chat_list(session_id)
+                        short_term_list = [json.loads(msg_str) for msg_str in session_chat_list]
+                    st.session_state.chat_history = short_term_list
+                    st.rerun()
+            with col2:
+                if st.button(
+                        "🗑️",
+                        key=f"delete_{idx}_{session_id}",
+                        use_container_width=True,
+                        help="删除该会话"
+                ):
+                    self.conversation_storage.delete_session(session_id=session_id)
+                    if session_id == st.session_state.current_conversation_id:
+                        st.session_state.current_conversation_id = None
+                        st.session_state.chat_history = []
+                    st.rerun()
+        return st.session_state.current_conversation_id

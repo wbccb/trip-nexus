@@ -17,10 +17,6 @@ def main() -> None:
     # rag = AIRetrievalPipeline(llm)
     ui_manager = UIManager(llm_manager, config, map_renderer)
 
-    # 版本信息
-    st.sidebar.markdown(f"### 📱 版本: v{__version__}")
-    st.sidebar.markdown(f"ℹ️ {__description__}")
-    st.sidebar.markdown("---")
 
     user_id = "wcb"
     device_id = "mac"
