@@ -32,16 +32,63 @@ class TripMap:
     def _get_coordinates(
         self,
         address: str,
+        city_name: str | None = None,
+        attraction_name: str | None = None,
         fallback: Tuple[float, float] | None = None,
         max_offset_deg: float | None = None,
     ) -> Tuple[float, float]:
-        for attempt in range(3):
-            try:
-                location = self.geolocator.geocode(address, exactly_one=True)
-                if location:
+        search_queries = [address]
+        # 尝试组合策略：如果提供了城市名和景点名，尝试组合搜索
+        if city_name and attraction_name:
+            if city_name not in address:
+                search_queries.append(f"{city_name}{attraction_name}")
+            search_queries.append(f"{city_name} {attraction_name}") # 加空格尝试
+        
+        # 如果地址本身就是模糊的（如"附近的餐馆"），直接尝试城市+景点（如果有）
+        # 或者仅仅依赖 fallback
+        
+        for query in search_queries:
+            for attempt in range(2): # 每个 query 重试 2 次
+                try:
+                    location = self.geolocator.geocode(query, exactly_one=True)
+                    if location:
+                        lat = location.latitude
+                        lon = location.longitude
+                        
+                        # 检查是否越界
+                        if (
+                            fallback
+                            and max_offset_deg is not None
+                            and (
+                                abs(lat - fallback[0]) > max_offset_deg
+                                or abs(lon - fallback[1]) > max_offset_deg
+                            )
+                        ):
+                            print(
+                                f"[MapRenderer] geocode result out of bounds for '{query}', "
+                                f"lat={lat}, lon={lon}, center={fallback}"
+                            )
+                            # 如果越界了，继续尝试下一个 query，或者直接视为失败
+                            continue
+                        else:
+                            # 成功且未越界
+                            return (lat, lon)
+                            
+                except (GeocoderTimedOut, GeocoderServiceError, Exception) as e:
+                    print(f"[MapRenderer] geocode error for '{query}' attempt {attempt + 1}: {e}")
+                    time.sleep(1)
+        
+        # 所有尝试都失败或越界，尝试降级到城市中心（如果之前没试过）
+        # 这里逻辑是：如果 address 失败了，我们已经在上面尝试了 city 降级了吗？
+        # 原有代码里有 city = address.split(",")[-1].strip() 的逻辑，保留一下
+        try:
+             short_addr = address.split(",")[-1].strip()
+             if short_addr != address:
+                 location = self.geolocator.geocode(short_addr, exactly_one=True)
+                 if location:
                     lat = location.latitude
                     lon = location.longitude
-                    if (
+                    if not (
                         fallback
                         and max_offset_deg is not None
                         and (
@@ -49,34 +96,10 @@ class TripMap:
                             or abs(lon - fallback[1]) > max_offset_deg
                         )
                     ):
-                        print(
-                            f"[MapRenderer] geocode result out of bounds for '{address}', "
-                            f"lat={lat}, lon={lon}, center={fallback}"
-                        )
-                    else:
                         return (lat, lon)
-                city = address.split(",")[-1].strip()
-                location = self.geolocator.geocode(city, exactly_one=True)
-                if location:
-                    lat = location.latitude
-                    lon = location.longitude
-                    if (
-                        fallback
-                        and max_offset_deg is not None
-                        and (
-                            abs(lat - fallback[0]) > max_offset_deg
-                            or abs(lon - fallback[1]) > max_offset_deg
-                        )
-                    ):
-                        print(
-                            f"[MapRenderer] city-level geocode out of bounds for '{city}', "
-                            f"lat={lat}, lon={lon}, center={fallback}"
-                        )
-                    else:
-                        return (lat, lon)
-            except (GeocoderTimedOut, GeocoderServiceError, Exception) as e:
-                print(f"[MapRenderer] geocode error for '{address}' attempt {attempt + 1}: {e}")
-                time.sleep(2**attempt)
+        except Exception:
+            pass
+
         return fallback or (30.6570, 104.0650)
 
     def _create_icon(self, day_idx: int, item: Dict[str, Any]) -> DivIcon:
@@ -159,7 +182,13 @@ class TripMap:
                     print(f"[MapRenderer] 第{day_str}天第{idx + 1}项行程({attraction})缺少地址，跳过。")
                     continue
 
-                coords = self._get_coordinates(address, fallback=center_coords, max_offset_deg=1.0)
+                coords = self._get_coordinates(
+                    address,
+                    city_name=dest,
+                    attraction_name=attraction,
+                    fallback=center_coords,
+                    max_offset_deg=1.0
+                )
                 print(
                     f"[MapRenderer] Marker raw -> day={day_str}, idx={idx}, "
                     f"attraction='{attraction}', address='{address}', coords={coords}"
