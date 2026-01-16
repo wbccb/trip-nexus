@@ -565,16 +565,31 @@ class UIManager:
             if trip_data:
                 st.session_state.trip_data = trip_data
 
-        # 顶部工具栏，放置地图开关
-        col_header, col_tools = st.columns([8, 1])
-        with col_header:
-            # 只有当有行程数据时才显示地图按钮
-            if st.session_state.get("trip_data"):
-                # 按钮状态可视反馈
-                is_map_visible = st.session_state.get("map_visible", False)
-                if st.button("🗺️", help="切换地图显示/隐藏", use_container_width=True, type="primary" if is_map_visible else "secondary"):
-                    st.session_state.map_visible = not is_map_visible
-                    st.rerun()
+        if st.session_state.get("trip_data"):
+            st.markdown(
+                """
+                <style>
+                div.element-container:has(div#map-toggle-marker) + div.element-container {
+                    position: absolute;
+                    top: 8px;
+                    left: 20px;
+                    z-index: 1000001;
+                    width: auto !important;
+                }
+                </style>
+                <div id="map-toggle-marker"></div>
+                """,
+                unsafe_allow_html=True,
+            )
+            is_map_visible = st.session_state.get("map_visible", False)
+            if st.button(
+                label="隐藏地图" if is_map_visible else "显示地图",
+                key="toggle_map_toolbar_btn",
+                help="切换地图显示/隐藏",
+                type="secondary"
+            ):
+                st.session_state.map_visible = not is_map_visible
+                st.rerun()
 
         # 始终渲染聊天界面（占满全宽，不被挤压）
         self.render_chat_interface(user_id, device_id, st.session_state.current_conversation_id)
