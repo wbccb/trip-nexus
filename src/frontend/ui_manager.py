@@ -38,6 +38,15 @@ class UIManager:
         if "map_visible" not in st.session_state or st.session_state["map_visible"] is None:
             st.session_state["map_visible"] = True
 
+        if "llm_config" not in st.session_state:
+            st.session_state.llm_config = {
+                "provider": "ollama",
+                "base_url": "http://localhost:11434",
+                "model_name": "deepseek-r1:7b",
+                "api_key": "",
+                "temperature": 0.7,
+            }
+
     def render_input_form(self) -> Optional[Dict[str, Any]]:
         """渲染输入表单，返回结构化参数"""
         with st.form("trip_form", clear_on_submit=False):
@@ -183,6 +192,33 @@ class UIManager:
                     return {"type": "reorder", "msg": "调整顺序需重新生成行程"}
                 case _:
                     return None
+
+    def render_llm_settings(self) -> None:
+        config = st.session_state.get("llm_config", {})
+        current_provider = config.get("provider", "ollama")
+        provider_options = ["ollama", "openai_compatible"]
+        provider_index = 0
+        if current_provider in provider_options:
+            provider_index = provider_options.index(current_provider)
+        provider = st.selectbox("模型提供方", provider_options, index=provider_index)
+        base_url_default = config.get("base_url") or ("http://localhost:11434" if provider == "ollama" else "")
+        model_default = config.get("model_name") or ("deepseek-r1:7b" if provider == "ollama" else "")
+        base_url = st.text_input("Base URL", base_url_default)
+        model_name = st.text_input("模型名称", model_default)
+        api_key_value = config.get("api_key") or ""
+        if provider == "openai_compatible":
+            api_key_value = st.text_input("API Key", api_key_value, type="password")
+        temperature_value = float(config.get("temperature", 0.7))
+        temperature = st.slider("温度", 0.0, 1.0, temperature_value, 0.05)
+        if st.button("应用 LLM 配置", use_container_width=True):
+            st.session_state.llm_config = {
+                "provider": provider,
+                "base_url": base_url,
+                "model_name": model_name,
+                "api_key": api_key_value if provider == "openai_compatible" else "",
+                "temperature": temperature,
+            }
+            self.llm_manager.update_llm_config(st.session_state.llm_config)
 
     def render_chat_interface(self, user_id: str, device_id: str, session_id: str) -> None:
         """渲染聊天界面，支持多轮对话"""
@@ -499,7 +535,6 @@ class UIManager:
             """,
             unsafe_allow_html=True,
         )
-        # 左侧侧边栏渲染会话列表
         with st.sidebar:
             current_session_id = self.render_session_list(user_id, device_id)
             if current_session_id is None:
@@ -519,6 +554,10 @@ class UIManager:
                     st.session_state.current_conversation_id = new_session_id
                     st.session_state.chat_history = []
                     st.rerun()
+
+            st.markdown("---")
+            st.subheader("LLM 设置")
+            self.render_llm_settings()
 
         # 预加载 trip_data，确保界面渲染前数据已就绪
         if st.session_state.current_conversation_id and not st.session_state.get("trip_data"):

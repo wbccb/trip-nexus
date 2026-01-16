@@ -4,22 +4,9 @@ from pydantic import BaseModel, Field
 from typing import Dict, List, Optional, Any
 import torch  # 仍然保留，以防其他部分使用，但在 __init__ 中不再强制需要
 
-# 导入 Ollama 替代 HuggingFacePipeline
-from langchain_ollama import OllamaLLM  # 从独立包导入
-# from langchain_ollama import OllamaLLM
+from langchain_ollama import OllamaLLM
 import json
 import re
-
-# ----------------------------------------------------
-# ⚠️ 注意：以下导入已不再需要，因为我们使用 Ollama API
-# from langchain_community.llms import HuggingFacePipeline
-# from transformers import (
-#     AutoTokenizer,
-#     AutoModelForCausalLM,
-#     pipeline,
-#     BitsAndBytesConfig # 已经不需要
-# )
-# ----------------------------------------------------
 
 
 # 行程数据模型
@@ -41,23 +28,67 @@ class TripPlan(BaseModel):
 
 class LlmManager:
     # 默认使用本地安装的 Ollama deepseek-r1:7b
-    def __init__(self, model_name: str = "deepseek-r1:7b", ollama_base_url: str = "http://localhost:11434"):
+    def __init__(
+        self,
+        model_name: str = "deepseek-r1:7b",
+        ollama_base_url: str = "http://localhost:11434",
+        provider: str = "ollama",
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        temperature: float = 0.7,
+    ):
+        if base_url is None:
+            base_url = ollama_base_url
+
+        self._llm_config: Dict[str, Any] = {
+            "provider": provider,
+            "base_url": base_url,
+            "model_name": model_name,
+            "api_key": api_key,
+            "temperature": temperature,
+        }
+
+        self.llm = self._create_llm()
+        self.parser = JsonOutputParser(pydantic_object=TripPlan)
+
+    def _create_llm(self):
+        provider = self._llm_config.get("provider") or "ollama"
+        model_name = self._llm_config.get("model_name") or "deepseek-r1:7b"
+        base_url = self._llm_config.get("base_url") or "http://localhost:11434"
+        temperature = self._llm_config.get("temperature") or 0.7
+
+        if provider == "openai_compatible":
+            try:
+                from langchain_openai import ChatOpenAI  # 延迟导入，避免不兼容版本在启动时崩溃
+            except ImportError as e:
+                raise RuntimeError(
+                    "当前环境的 langchain_openai 与 langchain_core 版本不兼容，暂不支持 OpenAI 兼容模型。"
+                    "请升级相关依赖或切换 provider=ollama。"
+                ) from e
+
+            api_key = self._llm_config.get("api_key") or ""
+            print(f"✅ 初始化 OpenAI 兼容模型: {model_name}...")
+            return ChatOpenAI(
+                model=model_name,
+                api_key=api_key,
+                base_url=base_url,
+                temperature=temperature,
+            )
 
         print(f"✅ 初始化 Ollama 模型: {model_name}...")
-
-        # 1. 实例化 Ollama LLM
-        # LangChain 的 Ollama 接口会通过 HTTP API 与 Ollama 服务器通信
-        self.llm = OllamaLLM(
-            base_url=ollama_base_url,
+        return OllamaLLM(
+            base_url=base_url,
             model=model_name,
-            # 设置一些生成参数，与你原代码中的 pipeline 保持一致
-            temperature=0.7,
-            num_ctx=4096,  # 默认上下文大小，可以根据需要调整
-            timeout=300,  # 显式设置超时为 300 秒，应对 DeepSeek 的长逻辑推理
+            temperature=temperature,
+            num_ctx=4096,
+            timeout=300,
         )
 
-        # 2. 初始化解析器
-        self.parser = JsonOutputParser(pydantic_object=TripPlan)
+    def update_llm_config(self, config: Dict[str, Any]) -> None:
+        if not hasattr(self, "_llm_config"):
+            self._llm_config = {}
+        self._llm_config.update(config)
+        self.llm = self._create_llm()
 
     def get_llm(self):
         return self.llm
@@ -161,6 +192,13 @@ class LlmManager:
             edit_note=edit_note
         )
 
+    def _build_constraints_context(self, user_input: Dict[str, Any]) -> str:
+        destination = user_input.get("destination")
+        days = user_input.get("days")
+        if not destination or not days:
+            return ""
+        return f"行程硬约束信息：目的地 {destination}，天数 {days}。天气、交通时长与费用、POI 开放时间与票价等将通过外部工具和 API 获取，并在规划和修改行程时作为需要严格遵守的约束条件。"
+
     def extract_json_from_string(self, response: str) -> str:
         print(f"DEBUG: 原始响应全文内容 ---> {response}")
 
@@ -225,15 +263,24 @@ class LlmManager:
     def generate_trip(self, user_input: Dict[str, Any], context: List[str],
                       edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """生成行程：通过可视化界面操作输入文字进行行程的生成"""
-        prompt = self.build_prompt(user_input, context, edit_cmd)
+        constraints_text = self._build_constraints_context(user_input)
+        merged_context: List[str] = []
+        if context:
+            merged_context.extend(context)
+        if constraints_text:
+            merged_context.append(constraints_text)
+        prompt = self.build_prompt(user_input, merged_context, edit_cmd)
 
         # 进行两次尝试
         for attempt in range(2):
             try:
-                response = self.llm.invoke(prompt)
+                raw_response = self.llm.invoke(prompt)
+                if hasattr(raw_response, "content"):
+                    response_text = raw_response.content
+                else:
+                    response_text = raw_response
 
-                # 使用改进的 JSON 提取函数
-                clean_response = self.extract_json_from_string(response)
+                clean_response = self.extract_json_from_string(response_text)
 
                 # 尝试解析
                 # self.parser.parse() 应该返回一个 TripPlan 实例 或一个 dict
@@ -278,12 +325,14 @@ class LlmManager:
         analysis_prompt = self._build_analysis_prompt(query, context, current_trip)
         print(f"change_trip解析意图的prompt为：{analysis_prompt}")
 
-        analysis_response = self.llm.invoke(analysis_prompt)
+        raw_analysis_response = self.llm.invoke(analysis_prompt)
+        if hasattr(raw_analysis_response, "content"):
+            analysis_response = raw_analysis_response.content
+        else:
+            analysis_response = raw_analysis_response
 
         print(f"通过llm分析出用户的意图是： {analysis_response}")
 
-
-        # 2. 从响应中提取用户意图和参数
         intent_data = self._parse_intent(analysis_response)
 
         print(f"解析llm返回的意图数据为：{intent_data}")
