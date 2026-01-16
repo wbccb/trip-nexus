@@ -12,6 +12,7 @@ from src.config import Config
 from src.utils.console import console_log
 from src.map.map_renderer import TripMap
 import json
+import base64
 
 class UIManager:
     def __init__(self, llm_manager: LlmManager, config: Config, map_renderer: TripMap | None = None):
@@ -527,46 +528,127 @@ class UIManager:
 
         # 顶部工具栏，放置地图开关
         col_header, col_tools = st.columns([8, 1])
-        with col_tools:
+        with col_header:
             # 只有当有行程数据时才显示地图按钮
             if st.session_state.get("trip_data"):
-                if st.button("🗺️", help="查看行程地图", use_container_width=True):
-                    st.session_state.map_visible = not st.session_state.get("map_visible", False)
+                # 按钮状态可视反馈
+                is_map_visible = st.session_state.get("map_visible", False)
+                if st.button("🗺️", help="切换地图显示/隐藏", use_container_width=True, type="primary" if is_map_visible else "secondary"):
+                    st.session_state.map_visible = not is_map_visible
+                    st.rerun()
 
-        # 动态布局：根据地图是否显示来调整聊天区域宽度
-        if st.session_state.get("map_visible", False) and st.session_state.get("trip_data"):
-            col_chat, col_map = st.columns([1, 1])
-            with col_chat:
-                self.render_chat_interface(user_id, device_id, st.session_state.current_conversation_id)
-            with col_map:
-                # 强制显示关闭按钮
-                col_title, col_close = st.columns([8, 1])
-                with col_title:
-                    st.subheader("🗺️ 行程地图")
-                with col_close:
-                    if st.button("✕", key="close_map_panel", help="关闭地图"):
+        # 始终渲染聊天界面（占满全宽，不被挤压）
+        self.render_chat_interface(user_id, device_id, st.session_state.current_conversation_id)
+
+        # 浮动显示右侧地图（悬浮层）
+        map_visible = st.session_state.get("map_visible", False)
+        has_trip_data = bool(st.session_state.get("trip_data"))
+        print(f"[DEBUG] Map render check: visible={map_visible}, has_data={has_trip_data}")
+        
+        if map_visible and has_trip_data:
+            # 渲染地图内容
+            trip_data = st.session_state.get("trip_data")
+            if not st.session_state.get("map_obj") and self.map_renderer:
+                 print("[DEBUG] Generating map object...")
+                 with st.spinner("地图生成中..."):
+                    try:
+                        st.session_state.map_obj = self.map_renderer.render_map(trip_data)
+                        print("[DEBUG] Map object generated successfully")
+                    except Exception as e:
+                        print(f"[DEBUG] Map generation failed: {e}")
+                        st.error(f"地图生成失败: {str(e)}")
+            
+            if st.session_state.get("map_obj"):
+                try:
+                    # 1. 渲染关闭按钮（悬浮在侧边栏右上角）
+                    # 使用 CSS Hack 将 Streamlit 原生按钮定位到侧边栏标题栏位置
+                    # 利用 div.element-container:has(...) + div.element-container 选择相邻的按钮容器
+                    st.markdown("""
+                        <style>
+                        div.element-container:has(div#close-map-marker) + div.element-container {
+                            position: fixed !important;
+                            top: 64px;
+                            right: 20px;
+                            z-index: 1000001;
+                            width: auto !important;
+                        }
+                        div.element-container:has(div#close-map-marker) + div.element-container button {
+                            background-color: transparent;
+                            border: none;
+                            color: #666;
+                            font-size: 16px;
+                            padding: 4px 12px;
+                            line-height: 1;
+                        }
+                        div.element-container:has(div#close-map-marker) + div.element-container button:hover {
+                            color: #333;
+                            border: none;
+                            background-color: rgba(0,0,0,0.05);
+                        }
+                        div.element-container:has(div#close-map-marker) + div.element-container button:focus {
+                            border: none;
+                            outline: none;
+                            box-shadow: none;
+                        }
+                        </style>
+                        <div id="close-map-marker"></div>
+                    """, unsafe_allow_html=True)
+                    
+                    if st.button("✕", key="close_map_overlay_btn", help="关闭地图"):
                         st.session_state.map_visible = False
                         st.rerun()
-                
-                # 渲染地图内容
-                trip_data = st.session_state.get("trip_data")
-                if not st.session_state.get("map_obj") and self.map_renderer:
-                     with st.spinner("地图生成中..."):
-                        try:
-                            st.session_state.map_obj = self.map_renderer.render_map(trip_data)
-                        except Exception as e:
-                            st.error(f"地图生成失败: {str(e)}")
-                
-                if st.session_state.get("map_obj"):
-                    html(
-                        st.session_state.map_obj._repr_html_(),
-                        height=600,
-                        width=None, # 让宽度自适应
-                        scrolling=True
-                    )
-        else:
-            # 地图隐藏时，聊天区域占满全宽
-            self.render_chat_interface(user_id, device_id, st.session_state.current_conversation_id)
+
+                    # 2. 获取地图的完整 HTML 字符串
+                    map_html_content = st.session_state.map_obj.get_root().render()
+                    print(f"[DEBUG] Map HTML generated, length: {len(map_html_content)}")
+                    
+                    # 3. 转换为 base64 编码
+                    b64_html = base64.b64encode(map_html_content.encode('utf-8')).decode('utf-8')
+                    print(f"[DEBUG] Base64 encoded length: {len(b64_html)}")
+                    
+                    # 4. 使用 CSS 实现右侧固定浮动侧边栏，并嵌入 iframe
+                    sidebar_html = f"""
+                        <div style="
+                            position: fixed;
+                            top: 60px;
+                            right: 0;
+                            width: 40%;
+                            height: calc(100vh - 60px);
+                            background-color: white;
+                            box-shadow: -4px 0 10px rgba(0,0,0,0.1);
+                            z-index: 999999;
+                            border-left: 1px solid #e0e0e0;
+                            display: flex;
+                            flex-direction: column;
+                        ">
+                            <div style="
+                                padding: 12px 16px;
+                                background: #f8f9fa;
+                                border-bottom: 1px solid #eee;
+                                display: flex;
+                                justify-content: space-between;
+                                align-items: center;
+                                flex-shrink: 0;
+                                height: 50px; /* 固定高度以配合按钮定位 */
+                            ">
+                                <span style="font-weight: 600; font-size: 16px; color: #333;">🗺️ 行程地图</span>
+                                <!-- 右侧空间留给悬浮的关闭按钮 -->
+                                <span style="width: 40px;"></span>
+                            </div>
+                            <div style="flex: 1; width: 100%; position: relative;">
+                                <iframe src="data:text/html;charset=utf-8;base64,{b64_html}" 
+                                        style="width: 100%; height: 100%; border: none;">
+                                </iframe>
+                            </div>
+                        </div>
+                    """
+                    print("[DEBUG] Injecting map sidebar HTML")
+                    st.markdown(sidebar_html, unsafe_allow_html=True)
+                except Exception as e:
+                    print(f"[DEBUG] Error rendering map sidebar: {e}")
+                    st.error(f"地图渲染错误: {e}")
+            else:
+                print("[DEBUG] No map object available to render")
 
     def render_session_list(self, user_id: str, device_id: str) -> None:
         """绘制左侧的会话列表（侧边栏内）"""
