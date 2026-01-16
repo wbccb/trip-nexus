@@ -185,7 +185,6 @@ class UIManager:
 
     def render_chat_interface(self, user_id: str, device_id: str, session_id: str) -> None:
         """渲染聊天界面，支持多轮对话"""
-        st.subheader("💬 行程对话助手")
         if not st.session_state.trip_data:
             trip_data = self.conversation_manager.conversationStorage.get_trip_data(session_id)
             if trip_data:
@@ -501,7 +500,6 @@ class UIManager:
         )
         # 左侧侧边栏渲染会话列表
         with st.sidebar:
-            st.header("会话")
             current_session_id = self.render_session_list(user_id, device_id)
             if current_session_id is None:
                 sessions = self.conversation_storage.get_session_list(user_id)
@@ -523,8 +521,6 @@ class UIManager:
 
         # 顶部工具栏，放置地图开关
         col_header, col_tools = st.columns([8, 1])
-        with col_header:
-            st.header("对话")
         with col_tools:
             # 只有当有行程数据时才显示地图按钮
             if st.session_state.get("trip_data"):
@@ -568,7 +564,6 @@ class UIManager:
 
     def render_session_list(self, user_id: str, device_id: str) -> None:
         """绘制左侧的会话列表（侧边栏内）"""
-        st.subheader("会话列表", divider="gray")
         if st.button("新建会话", use_container_width=True):
             console_log("新建会话:"+user_id , device_id)
             new_session_id = self.conversation_storage.generate_session_id(user_id, device_id)
@@ -577,7 +572,6 @@ class UIManager:
             st.session_state.current_conversation_id = new_session_id
             st.session_state.chat_history = []
             st.rerun()
-        st.divider()
         sessions = self.conversation_storage.get_session_list(user_id)
         if not sessions:
             st.info("暂无会话记录")
