@@ -519,6 +519,12 @@ class UIManager:
                     st.session_state.chat_history = []
                     st.rerun()
 
+        # 预加载 trip_data，确保界面渲染前数据已就绪
+        if st.session_state.current_conversation_id and not st.session_state.get("trip_data"):
+            trip_data = self.conversation_storage.get_trip_data(st.session_state.current_conversation_id)
+            if trip_data:
+                st.session_state.trip_data = trip_data
+
         # 顶部工具栏，放置地图开关
         col_header, col_tools = st.columns([8, 1])
         with col_tools:
