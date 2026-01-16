@@ -195,11 +195,28 @@ class UIManager:
         chat_container = st.container()
         with chat_container:
             chat_placeholder = st.empty()
-            input_placeholder = st.empty()
+            # input_placeholder = st.empty()  # Removed as we use st.chat_input directly
+
         def build_chat_html(messages: List[Dict[str, Any]]) -> str:
             css = """
             <style>
-            .chat-wrapper{display:flex;flex-direction:column;gap:12px;flex:1;height:0;overflow:auto;padding:8px;}
+            /* 外层容器：占满视口的一部分高度 */
+            .chat-outer{
+                display:flex;
+                flex-direction:column;
+                /* 视口高度减去上面标题/输入框的大致高度，自行微调 */
+                height:calc(100vh - 260px);
+            }
+            /* 内层真正滚动的区域 */
+            .chat-wrapper{
+                display:flex;
+                flex-direction:column;
+                gap:12px;
+                flex:1;
+                min-height:0;
+                overflow-y:auto;
+                padding:8px;
+            }
             .msg{display:flex;align-items:flex-start;margin:24px 0px;}
             .msg.assistant{justify-content:flex-start;}
             .msg.user{justify-content:flex-end;}
@@ -219,7 +236,7 @@ class UIManager:
             }
             </style>
             """
-            body = ['<div class="chat-wrapper">']
+            body = ['<div class="chat-outer"><div class="chat-wrapper">']
             for m in messages:
                 role = m.get("role")
                 role_str = "assistant" if role == MessageType.ASSISTANT or role == "assistant" else "user"
@@ -238,14 +255,17 @@ class UIManager:
                 else:
                     body.append(f'<div class="bubble">{content}</div>')
                 body.append('</div>')
-            body.append('</div>')
+            body.append('</div></div>')
             return css + "".join(body)
         with chat_container:
             chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
-            if st.session_state.ai_processing:
-                prompt = input_placeholder.chat_input("告诉我您想如何调整行程？", disabled=True)
-            else:
-                prompt = input_placeholder.chat_input("告诉我您想如何调整行程？")
+            
+        # 使用原生 chat_input 固定在底部
+        if st.session_state.ai_processing:
+            prompt = st.chat_input("AI处理中，暂时无法输入...", disabled=True)
+        else:
+            prompt = st.chat_input("告诉我您想如何调整行程？")
+
         if prompt:
             user_msg = {"role": MessageType.USER, "content": prompt, "timestamp": datetime.now().isoformat(), "metadata": {}}
             st.session_state.chat_history.append(user_msg)
@@ -259,9 +279,6 @@ class UIManager:
             loading_messages = st.session_state.chat_history + [temp_loading]
             st.session_state.ai_processing = True
             chat_placeholder.markdown(build_chat_html(loading_messages), unsafe_allow_html=True)
-            with chat_container:
-                with input_placeholder.container():
-                    prompt = input_placeholder.chat_input("AI处理中，暂时无法输入...", disabled=True)
             self.conversation_manager.process_new_message(user_id, device_id, user_message_obj, session_id)
             response_data = self.llm_manager.change_trip(query=prompt, context=st.session_state.chat_history, current_trip=st.session_state.trip_data)
             if isinstance(response_data, dict) and "response" in response_data:
@@ -482,8 +499,8 @@ class UIManager:
             """,
             unsafe_allow_html=True,
         )
-        col_sessions, col_chat, col_map = st.columns([2, 5, 5])
-        with col_sessions:
+        # 左侧侧边栏渲染会话列表
+        with st.sidebar:
             st.header("会话")
             current_session_id = self.render_session_list(user_id, device_id)
             if current_session_id is None:
@@ -503,14 +520,54 @@ class UIManager:
                     st.session_state.current_conversation_id = new_session_id
                     st.session_state.chat_history = []
                     st.rerun()
-        with col_chat:
+
+        # 顶部工具栏，放置地图开关
+        col_header, col_tools = st.columns([8, 1])
+        with col_header:
             st.header("对话")
+        with col_tools:
+            # 只有当有行程数据时才显示地图按钮
+            if st.session_state.get("trip_data"):
+                if st.button("🗺️", help="查看行程地图", use_container_width=True):
+                    st.session_state.map_visible = not st.session_state.get("map_visible", False)
+
+        # 动态布局：根据地图是否显示来调整聊天区域宽度
+        if st.session_state.get("map_visible", False) and st.session_state.get("trip_data"):
+            col_chat, col_map = st.columns([1, 1])
+            with col_chat:
+                self.render_chat_interface(user_id, device_id, st.session_state.current_conversation_id)
+            with col_map:
+                # 强制显示关闭按钮
+                col_title, col_close = st.columns([8, 1])
+                with col_title:
+                    st.subheader("🗺️ 行程地图")
+                with col_close:
+                    if st.button("✕", key="close_map_panel", help="关闭地图"):
+                        st.session_state.map_visible = False
+                        st.rerun()
+                
+                # 渲染地图内容
+                trip_data = st.session_state.get("trip_data")
+                if not st.session_state.get("map_obj") and self.map_renderer:
+                     with st.spinner("地图生成中..."):
+                        try:
+                            st.session_state.map_obj = self.map_renderer.render_map(trip_data)
+                        except Exception as e:
+                            st.error(f"地图生成失败: {str(e)}")
+                
+                if st.session_state.get("map_obj"):
+                    html(
+                        st.session_state.map_obj._repr_html_(),
+                        height=600,
+                        width=None, # 让宽度自适应
+                        scrolling=True
+                    )
+        else:
+            # 地图隐藏时，聊天区域占满全宽
             self.render_chat_interface(user_id, device_id, st.session_state.current_conversation_id)
-        with col_map:
-            self.render_map_panel()
 
     def render_session_list(self, user_id: str, device_id: str) -> None:
-        """绘制左侧的会话列表"""
+        """绘制左侧的会话列表（侧边栏内）"""
         st.subheader("会话列表", divider="gray")
         if st.button("新建会话", use_container_width=True):
             console_log("新建会话:"+user_id , device_id)
@@ -531,7 +588,7 @@ class UIManager:
             col1, col2 = st.columns([8, 2])
             with col1:
                 if st.button(
-                        f"{name})",
+                        f"{name}",
                         key=f"session_{idx}_{session_id}",
                         use_container_width=True,
                         type="primary" if session_id == st.session_state.current_conversation_id else "secondary"
