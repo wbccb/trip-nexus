@@ -45,6 +45,16 @@ class UIManager:
                 "model_name": "deepseek-r1:7b",
                 "api_key": "",
                 "temperature": 0.7,
+                "analysis_provider": "ollama",
+                "analysis_base_url": "http://localhost:11434",
+                "analysis_model_name": "deepseek-r1:7b",
+                "analysis_api_key": "",
+                "analysis_temperature": 0.7,
+                "generation_provider": "ollama",
+                "generation_base_url": "http://localhost:11434",
+                "generation_model_name": "deepseek-r1:7b",
+                "generation_api_key": "",
+                "generation_temperature": 0.7,
             }
 
     def render_input_form(self) -> Optional[Dict[str, Any]]:
@@ -195,28 +205,51 @@ class UIManager:
 
     def render_llm_settings(self) -> None:
         config = st.session_state.get("llm_config", {})
-        current_provider = config.get("provider", "ollama")
         provider_options = ["ollama", "openai_compatible"]
-        provider_index = 0
-        if current_provider in provider_options:
-            provider_index = provider_options.index(current_provider)
-        provider = st.selectbox("模型提供方", provider_options, index=provider_index)
-        base_url_default = config.get("base_url") or ("http://localhost:11434" if provider == "ollama" else "")
-        model_default = config.get("model_name") or ("deepseek-r1:7b" if provider == "ollama" else "")
-        base_url = st.text_input("Base URL", base_url_default)
-        model_name = st.text_input("模型名称", model_default)
-        api_key_value = config.get("api_key") or ""
-        if provider == "openai_compatible":
-            api_key_value = st.text_input("API Key", api_key_value, type="password")
-        temperature_value = float(config.get("temperature", 0.7))
-        temperature = st.slider("温度", 0.0, 1.0, temperature_value, 0.05)
+
+        analysis_provider_current = config.get("analysis_provider", "ollama")
+        analysis_provider_index = provider_options.index(analysis_provider_current) if analysis_provider_current in provider_options else 0
+        analysis_provider = st.selectbox("第 1 次调用-模型提供方（实体抽取+意图识别）", provider_options, index=analysis_provider_index)
+        analysis_base_url_default = config.get("analysis_base_url") or ("http://localhost:11434" if analysis_provider == "ollama" else "")
+        analysis_model_default = config.get("analysis_model_name") or ("deepseek-r1:7b" if analysis_provider == "ollama" else "")
+        analysis_base_url = st.text_input("第 1 次调用-Base URL", analysis_base_url_default)
+        analysis_model_name = st.text_input("第 1 次调用-模型名称", analysis_model_default)
+        analysis_api_key_value = config.get("analysis_api_key") or ""
+        if analysis_provider == "openai_compatible":
+            analysis_api_key_value = st.text_input("第 1 次调用-API Key", analysis_api_key_value, type="password")
+        analysis_temperature_value = float(config.get("analysis_temperature", 0.7))
+        analysis_temperature = st.slider("第 1 次调用-温度", 0.0, 1.0, analysis_temperature_value, 0.05)
+
+        generation_provider_current = config.get("generation_provider", "ollama")
+        generation_provider_index = provider_options.index(generation_provider_current) if generation_provider_current in provider_options else 0
+        generation_provider = st.selectbox("第 2 次调用-模型提供方（行程生成/修改）", provider_options, index=generation_provider_index)
+        generation_base_url_default = config.get("generation_base_url") or ("http://localhost:11434" if generation_provider == "ollama" else "")
+        generation_model_default = config.get("generation_model_name") or ("deepseek-r1:7b" if generation_provider == "ollama" else "")
+        generation_base_url = st.text_input("第 2 次调用-Base URL", generation_base_url_default)
+        generation_model_name = st.text_input("第 2 次调用-模型名称", generation_model_default)
+        generation_api_key_value = config.get("generation_api_key") or ""
+        if generation_provider == "openai_compatible":
+            generation_api_key_value = st.text_input("第 2 次调用-API Key", generation_api_key_value, type="password")
+        generation_temperature_value = float(config.get("generation_temperature", 0.7))
+        generation_temperature = st.slider("第 2 次调用-温度", 0.0, 1.0, generation_temperature_value, 0.05)
+
         if st.button("应用 LLM 配置", use_container_width=True):
             st.session_state.llm_config = {
-                "provider": provider,
-                "base_url": base_url,
-                "model_name": model_name,
-                "api_key": api_key_value if provider == "openai_compatible" else "",
-                "temperature": temperature,
+                "provider": generation_provider,
+                "base_url": generation_base_url,
+                "model_name": generation_model_name,
+                "api_key": generation_api_key_value if generation_provider == "openai_compatible" else "",
+                "temperature": generation_temperature,
+                "analysis_provider": analysis_provider,
+                "analysis_base_url": analysis_base_url,
+                "analysis_model_name": analysis_model_name,
+                "analysis_api_key": analysis_api_key_value if analysis_provider == "openai_compatible" else "",
+                "analysis_temperature": analysis_temperature,
+                "generation_provider": generation_provider,
+                "generation_base_url": generation_base_url,
+                "generation_model_name": generation_model_name,
+                "generation_api_key": generation_api_key_value if generation_provider == "openai_compatible" else "",
+                "generation_temperature": generation_temperature,
             }
             self.llm_manager.update_llm_config(st.session_state.llm_config)
 
@@ -316,7 +349,40 @@ class UIManager:
             st.session_state.ai_processing = True
             chat_placeholder.markdown(build_chat_html(loading_messages), unsafe_allow_html=True)
             self.conversation_manager.process_new_message(user_id, device_id, user_message_obj, session_id)
-            response_data = self.llm_manager.change_trip(query=prompt, context=st.session_state.chat_history, current_trip=st.session_state.trip_data)
+            llm_cfg = st.session_state.get("llm_config", {})
+            analysis_model_name = llm_cfg.get("analysis_model_name") or llm_cfg.get("model_name") or "deepseek-r1:7b"
+            analysis_provider = llm_cfg.get("analysis_provider") or llm_cfg.get("provider", "ollama")
+            analysis_base_url = llm_cfg.get("analysis_base_url") or llm_cfg.get("base_url") or "http://localhost:11434"
+            analysis_api_key = llm_cfg.get("analysis_api_key") or llm_cfg.get("api_key") or ""
+            analysis_temperature = float(llm_cfg.get("analysis_temperature", llm_cfg.get("temperature", 0.7)))
+            analysis_llm_manager = LlmManager(
+                model_name=analysis_model_name,
+                provider=analysis_provider,
+                base_url=analysis_base_url,
+                api_key=analysis_api_key,
+                temperature=analysis_temperature,
+            )
+            intent_data = analysis_llm_manager.analyze_user_message(
+                query=prompt,
+                context=st.session_state.chat_history,
+                current_trip=st.session_state.trip_data,
+            )
+            intent_type = intent_data.get("intent", "general_conversation")
+            if intent_type == "generate_trip":
+                response_data = self.llm_manager._handle_trip_generation(intent_data, st.session_state.chat_history)
+            elif intent_type in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
+                if st.session_state.trip_data:
+                    response_data = self.llm_manager._handle_trip_modification(intent_data, st.session_state.trip_data, st.session_state.chat_history)
+                else:
+                    response_data = {
+                        "response": "我需要先为您生成一个基础行程，然后才能进行调整。请先提供目的地、天数和预算信息。",
+                        "trip_data": None,
+                    }
+            else:
+                response_data = {
+                    "response": f"我理解您想{intent_data.get('summary', '进一步讨论行程')}. 请告诉我更多细节，比如目的地、旅行天数和您的偏好，我可以为您规划具体的行程。",
+                    "trip_data": None,
+                }
             if isinstance(response_data, dict) and "response" in response_data:
                 chat_response = response_data["response"]
             else:
