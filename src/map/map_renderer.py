@@ -177,18 +177,23 @@ class TripMap:
             for idx, item in enumerate(items):
                 address = item.get("address")
                 attraction = item.get("attraction", "未知景点")
-                
-                if not address:
-                    print(f"[MapRenderer] 第{day_str}天第{idx + 1}项行程({attraction})缺少地址，跳过。")
-                    continue
+                lat = item.get("latitude")
+                lon = item.get("longitude")
 
-                coords = self._get_coordinates(
-                    address,
-                    city_name=dest,
-                    attraction_name=attraction,
-                    fallback=center_coords,
-                    max_offset_deg=1.0
-                )
+                if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and not (lat == 0 and lon == 0):
+                    coords = (float(lat), float(lon))
+                else:
+                    if not address:
+                        print(f"[MapRenderer] 第{day_str}天第{idx + 1}项行程({attraction})缺少地址，跳过。")
+                        continue
+
+                    coords = self._get_coordinates(
+                        address,
+                        city_name=dest,
+                        attraction_name=attraction,
+                        fallback=center_coords,
+                        max_offset_deg=1.0
+                    )
                 print(
                     f"[MapRenderer] Marker raw -> day={day_str}, idx={idx}, "
                     f"attraction='{attraction}', address='{address}', coords={coords}"
