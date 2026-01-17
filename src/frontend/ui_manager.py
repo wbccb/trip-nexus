@@ -349,20 +349,7 @@ class UIManager:
             st.session_state.ai_processing = True
             chat_placeholder.markdown(build_chat_html(loading_messages), unsafe_allow_html=True)
             self.conversation_manager.process_new_message(user_id, device_id, user_message_obj, session_id)
-            llm_cfg = st.session_state.get("llm_config", {})
-            analysis_model_name = llm_cfg.get("analysis_model_name") or llm_cfg.get("model_name") or "deepseek-r1:7b"
-            analysis_provider = llm_cfg.get("analysis_provider") or llm_cfg.get("provider", "ollama")
-            analysis_base_url = llm_cfg.get("analysis_base_url") or llm_cfg.get("base_url") or "http://localhost:11434"
-            analysis_api_key = llm_cfg.get("analysis_api_key") or llm_cfg.get("api_key") or ""
-            analysis_temperature = float(llm_cfg.get("analysis_temperature", llm_cfg.get("temperature", 0.7)))
-            analysis_llm_manager = LlmManager(
-                model_name=analysis_model_name,
-                provider=analysis_provider,
-                base_url=analysis_base_url,
-                api_key=analysis_api_key,
-                temperature=analysis_temperature,
-            )
-            intent_data = analysis_llm_manager.analyze_user_message(
+            intent_data = self.llm_manager.analyze_user_message(
                 query=prompt,
                 context=st.session_state.chat_history,
                 current_trip=st.session_state.trip_data,

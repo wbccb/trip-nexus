@@ -43,7 +43,7 @@ class LlmManager:
         if base_url is None:
             base_url = ollama_base_url
 
-        self._llm_config: Dict[str, Any] = {
+        base_config: Dict[str, Any] = {
             "provider": provider,
             "base_url": base_url,
             "model_name": model_name,
@@ -51,14 +51,18 @@ class LlmManager:
             "temperature": temperature,
         }
 
-        self.llm = self._create_llm()
+        self._analysis_config: Dict[str, Any] = dict(base_config)
+        self._generation_config: Dict[str, Any] = dict(base_config)
+
+        self.analysis_llm = self._create_llm(self._analysis_config)
+        self.generation_llm = self._create_llm(self._generation_config)
         self.parser = JsonOutputParser(pydantic_object=TripPlan)
 
-    def _create_llm(self):
-        provider = self._llm_config.get("provider") or "ollama"
-        model_name = self._llm_config.get("model_name") or "deepseek-r1:7b"
-        base_url = self._llm_config.get("base_url") or "http://localhost:11434"
-        temperature = self._llm_config.get("temperature") or 0.7
+    def _create_llm(self, cfg: Dict[str, Any]):
+        provider = cfg.get("provider") or "ollama"
+        model_name = cfg.get("model_name") or "deepseek-r1:7b"
+        base_url = cfg.get("base_url") or "http://localhost:11434"
+        temperature = cfg.get("temperature") or 0.7
 
         if provider == "openai_compatible":
             try:
@@ -69,7 +73,7 @@ class LlmManager:
                     "请升级相关依赖或切换 provider=ollama。"
                 ) from e
 
-            api_key = self._llm_config.get("api_key") or ""
+            api_key = cfg.get("api_key") or ""
             print(f"✅ 初始化 OpenAI 兼容模型: {model_name}...")
             return ChatOpenAI(
                 model=model_name,
@@ -88,13 +92,33 @@ class LlmManager:
         )
 
     def update_llm_config(self, config: Dict[str, Any]) -> None:
-        if not hasattr(self, "_llm_config"):
-            self._llm_config = {}
-        self._llm_config.update(config)
-        self.llm = self._create_llm()
+        analysis_cfg = {
+            "provider": config.get("analysis_provider") or config.get("provider") or "ollama",
+            "base_url": config.get("analysis_base_url") or config.get("base_url") or "http://localhost:11434",
+            "model_name": config.get("analysis_model_name") or config.get("model_name") or "deepseek-r1:7b",
+            "api_key": config.get("analysis_api_key") or config.get("api_key") or "",
+            "temperature": float(config.get("analysis_temperature", config.get("temperature", 0.7))),
+        }
+        generation_cfg = {
+            "provider": config.get("generation_provider") or config.get("provider") or "ollama",
+            "base_url": config.get("generation_base_url") or config.get("base_url") or "http://localhost:11434",
+            "model_name": config.get("generation_model_name") or config.get("model_name") or "deepseek-r1:7b",
+            "api_key": config.get("generation_api_key") or config.get("api_key") or "",
+            "temperature": float(config.get("generation_temperature", config.get("temperature", 0.7))),
+        }
+        self._analysis_config = analysis_cfg
+        self._generation_config = generation_cfg
+        self.analysis_llm = self._create_llm(self._analysis_config)
+        self.generation_llm = self._create_llm(self._generation_config)
 
     def get_llm(self):
-        return self.llm
+        return self.generation_llm
+
+    def get_analysis_llm(self):
+        return self.analysis_llm
+
+    def get_generation_llm(self):
+        return self.generation_llm
 
     def build_prompt(self, user_input: Dict[str, Any], context: List[str],
                      edit_cmd: Optional[Dict[str, Any]] = None) -> str:
@@ -284,10 +308,9 @@ class LlmManager:
             merged_context.append(constraints_text)
         prompt = self.build_prompt(user_input, merged_context, edit_cmd)
 
-        # 进行两次尝试
         for attempt in range(2):
             try:
-                raw_response = self.llm.invoke(prompt)
+                raw_response = self.generation_llm.invoke(prompt)
                 if hasattr(raw_response, "content"):
                     response_text = raw_response.content
                 else:
@@ -318,39 +341,38 @@ class LlmManager:
                 if attempt == 1:
                     return None
 
+    def analyze_user_message(
+        self,
+        query: str,
+        context: Optional[List[Dict[str, str]]] = None,
+        current_trip: Optional[Dict] = None,
+    ) -> Dict[str, Any]:
+        """仅做第 1 次调用：实体抽取 + 意图识别"""
+        analysis_prompt = self._build_analysis_prompt(query, context, current_trip)
+        print(f"analyze_user_message 解析意图的 prompt 为：{analysis_prompt}")
+
+        try:
+            raw_analysis_response = self.analysis_llm.invoke(analysis_prompt)
+            if hasattr(raw_analysis_response, "content"):
+                analysis_response = raw_analysis_response.content
+            else:
+                analysis_response = raw_analysis_response
+
+            print(f"analyze_user_message LLM 原始响应为：{analysis_response}")
+
+            intent_data = self._parse_intent(analysis_response)
+            print(f"analyze_user_message 解析出的意图数据为：{intent_data}")
+            return intent_data
+        except Exception as e:
+            print(f"analyze_user_message 调用或解析失败: {str(e)}")
+            return self._get_default_intent()
+
     def change_trip(self, query: str, context: List[Dict[str, str]] = None, current_trip: Dict = None) -> Dict[str, Any]:
         """
         根据用户查询调整行程，支持多轮对话上下文（不仅仅是调整行程，还支持初始化生成行程）
-        1.理解用户意图：通过LLM分析用户输入，识别是生成新行程还是修改现有行程
-        2.上下文感知：结合对话历史和当前行程状态做出智能决策
-        3.实体提取：自动提取目的地、天数、预算、偏好等关键参数
-        4.多种操作支持：支持添加景点、删除景点、调整顺序等操作
-        5.结构化响应：返回包含对话回复和行程数据的结构化结果
-        Args:
-            query: 用户输入的调整指令
-            context: 对话上下文列表，包含历史消息
-            current_trip: 当前行程数据（如果存在）
-
-        Returns:
-            包含响应文本和可选行程数据的字典
         """
-        # 1. 构建分析提示词，理解用户意图
-        analysis_prompt = self._build_analysis_prompt(query, context, current_trip)
-        print(f"change_trip解析意图的prompt为：{analysis_prompt}")
+        intent_data = self.analyze_user_message(query, context, current_trip)
 
-        raw_analysis_response = self.llm.invoke(analysis_prompt)
-        if hasattr(raw_analysis_response, "content"):
-            analysis_response = raw_analysis_response.content
-        else:
-            analysis_response = raw_analysis_response
-
-        print(f"通过llm分析出用户的意图是： {analysis_response}")
-
-        intent_data = self._parse_intent(analysis_response)
-
-        print(f"解析llm返回的意图数据为：{intent_data}")
-
-        # 3. 根据意图类型处理
         if intent_data["intent"] == "generate_trip":
             return self._handle_trip_generation(intent_data, context)
         elif intent_data["intent"] in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
@@ -361,12 +383,11 @@ class LlmManager:
                     "response": "我需要先为您生成一个基础行程，然后才能进行调整。请先提供目的地、天数和预算信息。",
                     "trip_data": None
                 }
-        else:  # general_conversation
+        else:
             return {
                 "response": f"我理解您想{intent_data.get('summary', '进一步讨论行程')}. 请告诉我更多细节，比如目的地、旅行天数和您的偏好，我可以为您规划具体的行程。",
                 "trip_data": None
             }
-
 
     def _build_analysis_prompt(self, query: str, context: List[Dict[str, str]], current_trip: Dict) -> str:
         """构建意图分析提示词"""
