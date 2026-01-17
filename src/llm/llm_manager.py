@@ -7,6 +7,7 @@ import torch  # 仍然保留，以防其他部分使用，但在 __init__ 中不
 from langchain_ollama import OllamaLLM
 import json
 import re
+from datetime import datetime
 
 
 class DailyPlanItem(BaseModel):
@@ -27,6 +28,10 @@ class TripPlan(BaseModel):
     daily_plan: Dict[str, List[DailyPlanItem]] = Field(
         description="键为'1','2'等字符串，值为当天行程列表"
     )
+
+
+def _ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 class LlmManager:
@@ -74,7 +79,7 @@ class LlmManager:
                 ) from e
 
             api_key = cfg.get("api_key") or ""
-            print(f"✅ 初始化 OpenAI 兼容模型: {model_name}...")
+            print(f"[{_ts()}][LlmManager] 初始化 OpenAI 兼容模型: {model_name} @ {base_url}")
             return ChatOpenAI(
                 model=model_name,
                 api_key=api_key,
@@ -82,7 +87,7 @@ class LlmManager:
                 temperature=temperature,
             )
 
-        print(f"✅ 初始化 Ollama 模型: {model_name}...")
+        print(f"[{_ts()}][LlmManager] 初始化 Ollama 模型: {model_name} @ {base_url}")
         return OllamaLLM(
             base_url=base_url,
             model=model_name,
@@ -92,6 +97,7 @@ class LlmManager:
         )
 
     def update_llm_config(self, config: Dict[str, Any]) -> None:
+        print(f"[{_ts()}][LlmManager] update_llm_config called with keys: {list(config.keys())}")
         analysis_cfg = {
             "provider": config.get("analysis_provider") or config.get("provider") or "ollama",
             "base_url": config.get("analysis_base_url") or config.get("base_url") or "http://localhost:11434",
@@ -106,6 +112,8 @@ class LlmManager:
             "api_key": config.get("generation_api_key") or config.get("api_key") or "",
             "temperature": float(config.get("generation_temperature", config.get("temperature", 0.7))),
         }
+        print(f"[{_ts()}][LlmManager] analysis_cfg: {analysis_cfg}")
+        print(f"[{_ts()}][LlmManager] generation_cfg: {generation_cfg}")
         self._analysis_config = analysis_cfg
         self._generation_config = generation_cfg
         self.analysis_llm = self._create_llm(self._analysis_config)
@@ -209,7 +217,7 @@ class LlmManager:
             }
         )
 
-        print(f"""构建提示词，用户输入为：{user_input}，上下文为：{context}，编辑指令为：{edit_note}""")
+        print(f"[{_ts()}][LlmManager] 构建行程生成提示词，用户输入={user_input}，上下文条数={len(context)}, 编辑指令={edit_note}")
 
         # 安全处理 preference
         preference = user_input.get("preference", [])
@@ -237,7 +245,7 @@ class LlmManager:
         return f"行程硬约束信息：目的地 {destination}，天数 {days}。天气、交通时长与费用、POI 开放时间与票价等将通过外部工具和 API 获取，并在规划和修改行程时作为需要严格遵守的约束条件。"
 
     def extract_json_from_string(self, response: str) -> str:
-        print(f"DEBUG: 原始响应全文内容 ---> {response}")
+        print(f"[{_ts()}][LlmManager] extract_json_from_string 原始响应长度={len(str(response))}")
 
         # < think >
         # 好，我来分析一下用户的需求。用户说要从上海出发去广州，5
@@ -308,8 +316,12 @@ class LlmManager:
             merged_context.append(constraints_text)
         prompt = self.build_prompt(user_input, merged_context, edit_cmd)
 
+        print(f"[{_ts()}][LlmManager] generate_trip start, destination={user_input.get('destination')}, days={user_input.get('days')}, attempt_count=2")
+
         for attempt in range(2):
             try:
+                start_ts = datetime.now()
+                print(f"[{_ts()}][LlmManager] 第{attempt + 1}次行程生成调用开始")
                 raw_response = self.generation_llm.invoke(prompt)
                 if hasattr(raw_response, "content"):
                     response_text = raw_response.content
@@ -322,7 +334,8 @@ class LlmManager:
                 # self.parser.parse() 应该返回一个 TripPlan 实例 或一个 dict
                 trip_data = self.parser.parse(clean_response)
 
-                print(f"✅ 第{attempt + 1}次生成成功。")
+                cost = (datetime.now() - start_ts).total_seconds()
+                print(f"[{_ts()}][LlmManager] 第{attempt + 1}次生成成功，耗时 {cost:.2f}s")
 
                 # 🌟 Pydantic V2 安全处理：
                 # 如果返回的是 Pydantic 实例，使用 .model_dump() 转换为 dict
@@ -336,8 +349,8 @@ class LlmManager:
                     raise TypeError(f"解析器返回了意外类型: {type(trip_data)}")
 
             except Exception as e:
-                # 捕获 JSON 解析错误
-                print(f"❌ 第{attempt + 1}次生成失败，尝试重新生成。错误：{str(e)}")
+                cost = (datetime.now() - start_ts).total_seconds()
+                print(f"[{_ts()}][LlmManager] 第{attempt + 1}次生成失败，耗时 {cost:.2f}s，错误={str(e)}")
                 if attempt == 1:
                     return None
 
@@ -349,22 +362,25 @@ class LlmManager:
     ) -> Dict[str, Any]:
         """仅做第 1 次调用：实体抽取 + 意图识别"""
         analysis_prompt = self._build_analysis_prompt(query, context, current_trip)
-        print(f"analyze_user_message 解析意图的 prompt 为：{analysis_prompt}")
+        print(f"[{_ts()}][LlmManager] analyze_user_message 构建完成，query={query}")
 
         try:
+            start_ts = datetime.now()
+            print(f"[{_ts()}][LlmManager] analyze_user_message LLM 调用开始")
             raw_analysis_response = self.analysis_llm.invoke(analysis_prompt)
             if hasattr(raw_analysis_response, "content"):
                 analysis_response = raw_analysis_response.content
             else:
                 analysis_response = raw_analysis_response
 
-            print(f"analyze_user_message LLM 原始响应为：{analysis_response}")
+            cost = (datetime.now() - start_ts).total_seconds()
+            print(f"[{_ts()}][LlmManager] analyze_user_message LLM 调用结束，耗时 {cost:.2f}s，原始响应长度={len(str(analysis_response))}")
 
             intent_data = self._parse_intent(analysis_response)
-            print(f"analyze_user_message 解析出的意图数据为：{intent_data}")
+            print(f"[{_ts()}][LlmManager] analyze_user_message 解析出的意图数据={intent_data}")
             return intent_data
         except Exception as e:
-            print(f"analyze_user_message 调用或解析失败: {str(e)}")
+            print(f"[{_ts()}][LlmManager] analyze_user_message 调用或解析失败: {str(e)}")
             return self._get_default_intent()
 
     def change_trip(self, query: str, context: List[Dict[str, str]] = None, current_trip: Dict = None) -> Dict[str, Any]:

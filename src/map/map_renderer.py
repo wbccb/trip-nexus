@@ -7,6 +7,7 @@ from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 from typing import Dict, List, Tuple, Any
 import time
 import logging
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,8 +65,9 @@ class TripMap:
                                 or abs(lon - fallback[1]) > max_offset_deg
                             )
                         ):
+                            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             print(
-                                f"[MapRenderer] geocode result out of bounds for '{query}', "
+                                f"[{ts}][MapRenderer] geocode result out of bounds for '{query}', "
                                 f"lat={lat}, lon={lon}, center={fallback}"
                             )
                             # 如果越界了，继续尝试下一个 query，或者直接视为失败
@@ -75,7 +77,8 @@ class TripMap:
                             return (lat, lon)
                             
                 except (GeocoderTimedOut, GeocoderServiceError, Exception) as e:
-                    print(f"[MapRenderer] geocode error for '{query}' attempt {attempt + 1}: {e}")
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[{ts}][MapRenderer] geocode error for '{query}' attempt {attempt + 1}: {e}")
                     time.sleep(1)
         
         # 所有尝试都失败或越界，尝试降级到城市中心（如果之前没试过）
@@ -141,18 +144,19 @@ class TripMap:
 
     def render_map(self, trip_data: Dict[str, Any]) -> folium.Map:
         logger.info("\n\n------------------!!开始渲染地图!!------------------\n\n")
-        print(f"[MapRenderer] render_map input trip_data keys: {trip_data.keys()}")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}][MapRenderer] render_map input trip_data keys: {trip_data.keys()}")
 
         dest = trip_data.get("destination", "成都")
-        print(f"[MapRenderer] resolving destination: {dest}")
+        print(f"[{ts}][MapRenderer] resolving destination: {dest}")
         center_coords = self._get_coordinates(dest)
-        print(f"[MapRenderer] center_coords: {center_coords}")
+        print(f"[{ts}][MapRenderer] center_coords: {center_coords}")
 
         m = self._build_base_map(center_coords)
 
         daily_plan_raw = trip_data.get("daily_plan")
         if not daily_plan_raw:
-             print("[MapRenderer] Warning: daily_plan is empty or None")
+             print(f"[{ts}][MapRenderer] Warning: daily_plan is empty or None")
              return m
 
         if isinstance(daily_plan_raw, dict):
@@ -160,7 +164,7 @@ class TripMap:
         elif isinstance(daily_plan_raw, list):
             daily_plans_grouped = {"1": daily_plan_raw}
         else:
-            print(f"[MapRenderer] 警告：daily_plan 数据类型异常，无法渲染。类型: {type(daily_plan_raw)}")
+            print(f"[{ts}][MapRenderer] 警告：daily_plan 数据类型异常，无法渲染。类型: {type(daily_plan_raw)}")
             return m
 
         all_coords: List[Tuple[float, float]] = []
@@ -169,7 +173,7 @@ class TripMap:
             try:
                 day_idx = int(day_str) - 1
             except ValueError:
-                print(f"[MapRenderer] 无法解析日期字符串 '{day_str}' 为数字，跳过。")
+                print(f"[{ts}][MapRenderer] 无法解析日期字符串 '{day_str}' 为数字，跳过。")
                 continue
 
             coords_list: List[Tuple[float, float]] = []
@@ -184,7 +188,7 @@ class TripMap:
                     coords = (float(lat), float(lon))
                 else:
                     if not address:
-                        print(f"[MapRenderer] 第{day_str}天第{idx + 1}项行程({attraction})缺少地址，跳过。")
+                        print(f"[{ts}][MapRenderer] 第{day_str}天第{idx + 1}项行程({attraction})缺少地址，跳过。")
                         continue
 
                     coords = self._get_coordinates(
@@ -195,12 +199,12 @@ class TripMap:
                         max_offset_deg=1.0
                     )
                 print(
-                    f"[MapRenderer] Marker raw -> day={day_str}, idx={idx}, "
+                    f"[{ts}][MapRenderer] Marker raw -> day={day_str}, idx={idx}, "
                     f"attraction='{attraction}', address='{address}', coords={coords}"
                 )
 
                 if not coords or all(c == 0 for c in coords):
-                    print(f"[MapRenderer] 无法获取地址 '{address}' 的有效坐标，跳过。")
+                    print(f"[{ts}][MapRenderer] 无法获取地址 '{address}' 的有效坐标，跳过。")
                     continue
 
                 coords_list.append(coords)
@@ -220,7 +224,7 @@ class TripMap:
                 )
                 marker.add_to(m)
                 print(
-                    f"[MapRenderer] Marker added -> day={day_str}, idx={idx}, "
+                    f"[{ts}][MapRenderer] Marker added -> day={day_str}, idx={idx}, "
                     f"lat={coords[0]}, lon={coords[1]}"
                 )
 
@@ -237,6 +241,6 @@ class TripMap:
             try:
                 m.fit_bounds(all_coords, padding=(20, 20))
             except Exception as e:
-                print(f"[MapRenderer] fit_bounds failed: {e}")
+                print(f"[{ts}][MapRenderer] fit_bounds failed: {e}")
 
         return m

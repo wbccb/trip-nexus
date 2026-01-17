@@ -409,12 +409,11 @@ class UIManager:
     def render_map_panel(self) -> None:
         st.subheader("🗺️ 行程地图", divider="blue")
 
-        # 1. 确保 map_visible 有效
         if st.session_state.get("map_visible") is None:
             st.session_state.map_visible = True
 
-        # 2. 调试日志
-        print(f"[MapDebug] render_map_panel called. visible={st.session_state.map_visible}, has_trip={bool(st.session_state.get('trip_data'))}, has_map_obj={bool(st.session_state.get('map_obj'))}")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}][UIManager] render_map_panel called. visible={st.session_state.map_visible}, has_trip={bool(st.session_state.get('trip_data'))}, has_map_obj={bool(st.session_state.get('map_obj'))}")
 
         # 3. 处理隐藏逻辑
         if not st.session_state.map_visible:
@@ -436,13 +435,16 @@ class UIManager:
         
         # 5. 渲染地图对象（如果不存在则生成）
         if not st.session_state.get("map_obj") and self.map_renderer:
-            print("[MapDebug] map_obj missing, generating new map...")
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{ts}][UIManager] map_obj missing, generating new map...")
             try:
                 with st.spinner("地图生成中，请稍候..."):
                     st.session_state.map_obj = self.map_renderer.render_map(trip_data)
-                print("[MapDebug] map generated successfully")
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{ts}][UIManager] map generated successfully")
             except Exception as e:
-                print(f"[MapDebug] map generation failed: {e}")
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{ts}][UIManager] map generation failed: {e}")
                 st.error(f"地图生成失败: {str(e)}")
                 return
 

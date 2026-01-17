@@ -6,6 +6,7 @@ from typing import Optional
 from pydantic import ValidationError
 import re
 from src.llm.llm_manager import LlmManager
+from datetime import datetime as _dt
 
 """
 会话管理：
@@ -238,8 +239,8 @@ class ConversationManager:
     def process_new_message(self, user_id: str, device_id: str, message: Message, session_id: str) -> SessionContext:
         """处理新消息，更新上下文"""
 
-        print(f"\n\n==============处理新消息，更新上下文 start!{'当前是用户消息' if message.role == MessageType.USER else '当前是AI回复消息'}==========================")
-        print(f"处理新消息，用户ID: {user_id}, 设备ID: {device_id}, 消息内容: {message.content}, 会话ID: {session_id}")
+        ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}][ConversationManager] process_new_message start, role={message.role}, user_id={user_id}, device_id={device_id}, session_id={session_id}")
 
         # 1. 获取或创建会话上下文
         # session_id = self.conversationStorage.generate_session_id(user_id, device_id)
@@ -247,7 +248,7 @@ class ConversationManager:
 
         if short_term_data:
             # 1.1 命中短期缓存（Redis），直接恢复会话上下文
-            print("命中短期缓存(Redis), 直接恢复会话上下文")
+            print(f"[{ts}][ConversationManager] 命中短期缓存(Redis), 直接恢复会话上下文")
             context = SessionContext(
                 session_id=session_id,
                 user_id=user_id,
@@ -262,14 +263,14 @@ class ConversationManager:
             history_messages_json = self.conversationStorage.get_session_chat_list(session_id)
             
             if history_messages_json:
-                print(f"从数据库恢复会话历史，共 {len(history_messages_json)} 条消息")
+                print(f"[{ts}][ConversationManager] 从数据库恢复会话历史，共 {len(history_messages_json)} 条消息")
                 # 反序列化历史消息
                 all_messages = []
                 for msg_json in history_messages_json:
                     try:
                         all_messages.append(Message.model_validate_json(msg_json))
                     except Exception as e:
-                        print(f"解析历史消息失败: {e}")
+                        print(f"[{ts}][ConversationManager] 解析历史消息失败: {e}")
                 
                 # 重建上下文：仅加载最近10条到短期窗口
                 context = SessionContext(
@@ -307,10 +308,10 @@ class ConversationManager:
             existing_entities = self.conversationStorage.get_core_entities(session_id) or CoreEntity()
             # 4. 增量提取核心实体（如果不是冗余信息）
             if not message.is_redundant:
-                print("开始提取出实体数据")
+                print(f"[{ts}][ConversationManager] 开始提取出实体数据")
                 context.core_entities = self.extract_core_entities(message.content, existing_entities)
                 # 更新存储
-                print("抽离完成，进行存储")
+                print(f"[{ts}][ConversationManager] 抽离完成，进行存储")
                 self.conversationStorage.store_core_entities(session_id, context.core_entities)
         else:
             message.is_redundant = False
@@ -320,7 +321,7 @@ class ConversationManager:
         context.message_count += 1
         context.last_active = datetime.now()
 
-        print(f"添加新消息到短期窗口后的数量为: {context.message_count}")
+        print(f"[{ts}][ConversationManager] 添加新消息到短期窗口后的数量为: {context.message_count}")
 
         # 6. 检查是否需要压缩早期对话
         if context.message_count > 10:
@@ -332,7 +333,7 @@ class ConversationManager:
         # 8. 存储数据到数据库中
         self.conversationStorage.store_session_chat(session_id, message.model_dump_json())
 
-        print(f"===============处理新消息，更新上下文 end!{'当前是用户消息' if message.role == MessageType.USER else '当前是AI回复消息'}=========================\n\n")
+        print(f"[{ts}][ConversationManager] process_new_message end, role={message.role}, total_count={context.message_count}")
 
         return context
 
