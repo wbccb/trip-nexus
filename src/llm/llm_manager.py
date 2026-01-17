@@ -9,11 +9,14 @@ import json
 import re
 
 
-# 行程数据模型
 class DailyPlanItem(BaseModel):
-    time: str = Field(description="格式如'09:00-11:00'")
+    time: str = Field(description="格式如'09:00-09:30'，必须为半小时粒度时间段")
     attraction: str = Field(description="景点名称，必须准确")
     address: str = Field(description="详细地址，包含街道门牌号")
+    city: str = Field(default="", description="城市名称，例如'成都市'")
+    street: str = Field(default="", description="街道信息，例如'青羊区青华路'")
+    latitude: float = Field(default=0.0, description="景点纬度，精确到小数点后至少4位")
+    longitude: float = Field(default=0.0, description="景点经度，精确到小数点后至少4位")
     transport: str = Field(description="具体交通方式，如'地铁2号线→步行5分钟'")
     duration: str = Field(description="停留时间，如'2小时'")
 
@@ -127,18 +130,26 @@ class LlmManager:
             "daily_plan": {{
                 "1": [
                     {{
-                        "time": "09:00-11:00",
+                        "time": "09:00-09:30",
                         "attraction": "景点A",
-                        "address": "地址A",
+                        "address": "地址A，包含城市名和街道门牌号",
+                        "city": "城市名A",
+                        "street": "街道信息A",
+                        "latitude": 30.6570,
+                        "longitude": 104.0650,
                         "transport": "交通A",
-                        "duration": "2小时"
+                        "duration": "30分钟"
                     }},
                     {{
-                        "time": "11:00-13:00",
+                        "time": "09:30-10:00",
                         "attraction": "午餐",
-                        "address": "地址B",
+                        "address": "地址B，包含城市名和街道门牌号",
+                        "city": "城市名A",
+                        "street": "街道信息B",
+                        "latitude": 30.6580,
+                        "longitude": 104.0660,
                         "transport": "步行",
-                        "duration": "2小时"
+                        "duration": "30分钟"
                     }}
                 ]
             }}
@@ -156,7 +167,9 @@ class LlmManager:
 
         【细节规范】
         - 每天行程安排在8:00-18:00，时间必须连续且无冲突。
-        - 地址必须精确到街道和门牌号（如"成都市青羊区青华路9号"）。
+        - 每个时间段必须为半小时粒度，例如"08:00-08:30"、"08:30-09:00"、"09:00-09:30"。
+        - 地址必须精确到街道和门牌号（如"成都市青羊区青华路9号"），并同时提供匹配的 city、street 字段。
+        - 每个行程项必须包含精确的 latitude 和 longitude 坐标，且与地址一致。
         - 交通方式具体（如"地铁2号线人民公园站B口出"）。
 
         【Schema 定义】
