@@ -1,4 +1,4 @@
-__version__ = "0.0.2-20251220"
+__version__ = "0.0.2-RELEASE"
 __author__ = "wbccb"
 __email__ = "wbccb18814122@163.com"
 __description__ = "AI旅游行程规划助手 - MVP版本"
