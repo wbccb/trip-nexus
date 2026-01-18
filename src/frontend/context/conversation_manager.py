@@ -8,6 +8,9 @@ import re
 from src.llm.llm_manager import LlmManager
 from datetime import datetime as _dt
 
+def _ts() -> str:
+    return _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+
 """
 会话管理：
 1. 提取实体
@@ -27,6 +30,30 @@ class ConversationManager:
             "hello", "hi", "thank you", "bye", "ok", "got it"
         ]
         return any(phrase.lower() in message.lower() for phrase in redundant_phrases)
+
+    def merge_core_entities_from_intent_data(self, intent_data: Dict[str, Any], existing_entities: CoreEntity) -> CoreEntity:
+        params = intent_data.get("parameters") or {}
+        updated_entities = existing_entities.model_copy(deep=True)
+
+        destination = params.get("destination")
+        if isinstance(destination, list) and destination:
+            destination = destination[0]
+        if isinstance(destination, str) and destination.strip():
+            updated_entities.destination = destination.strip()
+
+        budget = params.get("budget")
+        if budget not in [None, "", [], {}]:
+            try:
+                updated_entities.budget = float(budget)
+            except (TypeError, ValueError):
+                pass
+
+        preference = params.get("preference")
+        if preference not in [None, "", [], {}]:
+            updated_entities.preferences["preference"] = preference
+
+        updated_entities.last_updated = datetime.now()
+        return updated_entities
 
     def extract_core_entities(self, new_message: str, existing_entities: CoreEntity) -> CoreEntity:
         """
@@ -66,7 +93,18 @@ class ConversationManager:
 
         try:
             # 3. 调用 LLM，启用 JSON Mode
-            response_text = self.llm_manager.get_llm().invoke(prompt)
+            start_ts = _dt.now()
+            print(
+                f"[{_ts()}][ConversationManager] extract_core_entities LLM 调用开始, "
+                f"message_len={len(new_message)}, existing_entities_present={bool(existing_entities)}"
+            )
+            raw_response = self.llm_manager.get_analysis_llm().invoke(prompt)
+            if hasattr(raw_response, "content"):
+                response_text = raw_response.content
+            else:
+                response_text = raw_response
+            cost = (_dt.now() - start_ts).total_seconds()
+            print(f"[{_ts()}][ConversationManager] extract_core_entities LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response_text))}")
 
             # 4. 解析 LLM 返回的 JSON
             # 考虑到某些 LLM 可能会返回带有 Markdown 标签的字符串，进行简单清洗
@@ -78,12 +116,12 @@ class ConversationManager:
                 if json_match:
                     clean_response = json_match.group(0)
                 else:
-                    # 如果找不到JSON，返回默认结构
-                    return self._get_default_intent()
+                    print(f"[{_ts()}][ConversationManager] extract_core_entities 未找到可解析 JSON，跳过更新")
+                    return existing_entities
 
             extracted_data = json.loads(clean_response)
 
-            print(f"提取实体，从llm拿到的数据为: {extracted_data}")
+            print(f"[{_ts()}][ConversationManager] extract_core_entities 解析完成，keys={list(extracted_data.keys())}")
 
             # 5. 增量更新逻辑
             # 使用 model_copy 进行浅拷贝，避免修改原始对象
@@ -114,7 +152,7 @@ class ConversationManager:
                              dt = datetime.fromisoformat(d_str)
                              valid_dates_obj.append(dt)
                          except ValueError:
-                            print(f"日期格式无法解析: {d_str}")
+                            print(f"[{_ts()}][ConversationManager] 日期格式无法解析: {d_str}")
                 
                 if valid_dates_obj:
                     updated_entities.travel_dates = valid_dates_obj
@@ -129,13 +167,13 @@ class ConversationManager:
             return updated_entities
 
         except json.JSONDecodeError as e:
-            print(f"LLM 返回格式非法: {e} | Response: {response_text}")
+            print(f"[{_ts()}][ConversationManager] LLM 返回格式非法: {e} | ResponseLen: {len(str(response_text))}")
             return existing_entities
         except ValidationError as e:
-            print(f"实体校验失败 (Pydantic): {e}")
+            print(f"[{_ts()}][ConversationManager] 实体校验失败 (Pydantic): {e}")
             return existing_entities
         except Exception as e:
-            print(f"提取过程发生未知错误: {e}")
+            print(f"[{_ts()}][ConversationManager] 提取过程发生未知错误: {e}")
             return existing_entities
 
     def generate_summary(self, messages: List[Message], existing_summary: str = "") -> str:
@@ -164,13 +202,21 @@ class ConversationManager:
 
         try:
             # 使用 invoke 方法替代不存在的 generate 方法
-            response = self.llm_manager.llm.invoke(prompt)
+            start_ts = _dt.now()
+            print(f"[{_ts()}][ConversationManager] generate_summary LLM 调用开始, message_count={len(messages)}")
+            raw_response = self.llm_manager.get_analysis_llm().invoke(prompt)
+            if hasattr(raw_response, "content"):
+                response = raw_response.content
+            else:
+                response = raw_response
+            cost = (_dt.now() - start_ts).total_seconds()
+            print(f"[{_ts()}][ConversationManager] generate_summary LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response))}")
             
             # 清理 <think> 标签及其内容
             clean_response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
             return clean_response
         except Exception as e:
-            print(f"摘要生成失败: {e}")
+            print(f"[{_ts()}][ConversationManager] 摘要生成失败: {e}")
             return existing_summary
 
     def compress_early_messages(self, context: SessionContext) -> str:
@@ -186,7 +232,7 @@ class ConversationManager:
         # 生成新摘要
         new_summary = self.generate_summary(early_messages, context.long_term_summary)
 
-        print(f"压缩早期消息后的新摘要: {new_summary}")
+        print(f"[{_ts()}][ConversationManager] 压缩早期消息后的新摘要长度: {len(new_summary)}")
 
         # 更新长期摘要
         self.conversationStorage.store_long_term_summary(context.session_id, new_summary)
@@ -236,11 +282,17 @@ class ConversationManager:
 
         return base_context
 
-    def process_new_message(self, user_id: str, device_id: str, message: Message, session_id: str) -> SessionContext:
+    def process_new_message(
+        self,
+        user_id: str,
+        device_id: str,
+        message: Message,
+        session_id: str,
+        intent_data: Optional[Dict[str, Any]] = None,
+    ) -> SessionContext:
         """处理新消息，更新上下文"""
 
-        ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{ts}][ConversationManager] process_new_message start, role={message.role}, user_id={user_id}, device_id={device_id}, session_id={session_id}")
+        print(f"[{_ts()}][ConversationManager] process_new_message start, role={message.role}, user_id={user_id}, device_id={device_id}, session_id={session_id}")
 
         # 1. 获取或创建会话上下文
         # session_id = self.conversationStorage.generate_session_id(user_id, device_id)
@@ -248,7 +300,7 @@ class ConversationManager:
 
         if short_term_data:
             # 1.1 命中短期缓存（Redis），直接恢复会话上下文
-            print(f"[{ts}][ConversationManager] 命中短期缓存(Redis), 直接恢复会话上下文")
+            print(f"[{_ts()}][ConversationManager] 命中短期缓存(Redis), 直接恢复会话上下文")
             context = SessionContext(
                 session_id=session_id,
                 user_id=user_id,
@@ -263,14 +315,14 @@ class ConversationManager:
             history_messages_json = self.conversationStorage.get_session_chat_list(session_id)
             
             if history_messages_json:
-                print(f"[{ts}][ConversationManager] 从数据库恢复会话历史，共 {len(history_messages_json)} 条消息")
+                print(f"[{_ts()}][ConversationManager] 从数据库恢复会话历史，共 {len(history_messages_json)} 条消息")
                 # 反序列化历史消息
                 all_messages = []
                 for msg_json in history_messages_json:
                     try:
                         all_messages.append(Message.model_validate_json(msg_json))
                     except Exception as e:
-                        print(f"[{ts}][ConversationManager] 解析历史消息失败: {e}")
+                        print(f"[{_ts()}][ConversationManager] 解析历史消息失败: {e}")
                 
                 # 重建上下文：仅加载最近10条到短期窗口
                 context = SessionContext(
@@ -308,10 +360,15 @@ class ConversationManager:
             existing_entities = self.conversationStorage.get_core_entities(session_id) or CoreEntity()
             # 4. 增量提取核心实体（如果不是冗余信息）
             if not message.is_redundant:
-                print(f"[{ts}][ConversationManager] 开始提取出实体数据")
-                context.core_entities = self.extract_core_entities(message.content, existing_entities)
+                start_ts = _dt.now()
+                print(f"[{_ts()}][ConversationManager] 开始提取出实体数据, has_intent_data={bool(intent_data)}")
+                if intent_data:
+                    context.core_entities = self.merge_core_entities_from_intent_data(intent_data, existing_entities)
+                else:
+                    context.core_entities = self.extract_core_entities(message.content, existing_entities)
+                cost = (_dt.now() - start_ts).total_seconds()
                 # 更新存储
-                print(f"[{ts}][ConversationManager] 抽离完成，进行存储")
+                print(f"[{_ts()}][ConversationManager] 抽离完成，进行存储，耗时 {cost:.2f}s")
                 self.conversationStorage.store_core_entities(session_id, context.core_entities)
         else:
             message.is_redundant = False
@@ -321,7 +378,7 @@ class ConversationManager:
         context.message_count += 1
         context.last_active = datetime.now()
 
-        print(f"[{ts}][ConversationManager] 添加新消息到短期窗口后的数量为: {context.message_count}")
+        print(f"[{_ts()}][ConversationManager] 添加新消息到短期窗口后的数量为: {context.message_count}")
 
         # 6. 检查是否需要压缩早期对话
         if context.message_count > 10:
@@ -333,7 +390,7 @@ class ConversationManager:
         # 8. 存储数据到数据库中
         self.conversationStorage.store_session_chat(session_id, message.model_dump_json())
 
-        print(f"[{ts}][ConversationManager] process_new_message end, role={message.role}, total_count={context.message_count}")
+        print(f"[{_ts()}][ConversationManager] process_new_message end, role={message.role}, total_count={context.message_count}")
 
         return context
 

@@ -37,3 +37,11 @@
 
 1. 小模型：实体抽取、意图识别、会话摘要
 2. 大模型：行程生成/修改
+
+
+## 尝试优化1
+### 耗时过长的根因（按同步链路）
+- 主要时间都消耗在 LLM 推理上：一次会话里你日志里已经看到 analyze_user_message ≈ 23s + generate_trip ≈ 76s ，这两段基本就是“卡住点”。
+- 额外的隐形耗时来自「重复的实体抽取」：原流程在 UI 里会先 process_new_message() 做一次实体抽取（会触发 LLM），再调用 analyze_user_message() （又一次 LLM），最后生成/修改行程（第三次 LLM）。而且之前实体抽取用的是 get_llm() 默认返回的 generation 模型（更慢）( llm_manager.py:L122-L129 )。
+### 修复与增强（用于定位 + 降低无谓延迟）
+- 消除“重复实体抽取”的同步 LLM 调用：把 analyze_user_message() 的 intent_data.parameters 直接合并进 CoreEntity ，从而在 UI 主链路上不再额外调用一次 LLM 做实体抽取 ( conversation_manager.py:L34-L56 )，并在 UI 中把调用顺序调整为“先分析，再入库/合并实体” ( ui_manager.py:L340-L368 )。

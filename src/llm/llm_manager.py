@@ -508,7 +508,7 @@ class LlmManager:
             return intent_data
 
         except Exception as e:
-            print(f"❌ 意图解析失败: {str(e)}, 使用默认意图")
+            print(f"[{_ts()}][LlmManager] 意图解析失败: {str(e)}, 使用默认意图")
             return self._get_default_intent()
 
     def _get_default_intent(self) -> Dict[str, Any]:
@@ -628,7 +628,16 @@ class LlmManager:
         # 6. 生成行程
         trip_data = self.generate_trip(user_input, context_texts)
 
-        print(f"""生成的行程数据为：{trip_data}""")
+        if isinstance(trip_data, dict):
+            daily_plan = trip_data.get("daily_plan") or {}
+            total_items = 0
+            if isinstance(daily_plan, dict):
+                for _, v in daily_plan.items():
+                    if isinstance(v, list):
+                        total_items += len(v)
+            print(f"[{_ts()}][LlmManager] 生成的行程数据概览: days={trip_data.get('days')}, daily_plan_days={len(daily_plan)}, items={total_items}")
+        else:
+            print(f"[{_ts()}][LlmManager] 生成的行程数据类型: {type(trip_data)}, str_len={len(str(trip_data))}")
 
         if trip_data:
             return {
@@ -650,7 +659,7 @@ class LlmManager:
     def _handle_trip_modification(self, intent_data: Dict[str, Any], current_trip: Dict,
                                   context: List[Dict[str, str]]) -> Dict[str, Any]:
         """处理行程修改请求"""
-        print(f"处理行程修改请求，目前意图数据是：{intent_data}")
+        print(f"[{_ts()}][LlmManager] 处理行程修改请求，intent={intent_data.get('intent')}, params_keys={list((intent_data.get('parameters') or {}).keys())}")
         params = intent_data.get("parameters", {})
         intent_type = intent_data["intent"]
 
@@ -704,7 +713,16 @@ class LlmManager:
 
         modified_trip = self.generate_trip(user_input, context_texts, edit_cmd)
 
-        print(f"处理行程修改完成，新的行程是: {modified_trip}")
+        if isinstance(modified_trip, dict):
+            daily_plan = modified_trip.get("daily_plan") or {}
+            total_items = 0
+            if isinstance(daily_plan, dict):
+                for _, v in daily_plan.items():
+                    if isinstance(v, list):
+                        total_items += len(v)
+            print(f"[{_ts()}][LlmManager] 处理行程修改完成: daily_plan_days={len(daily_plan)}, items={total_items}")
+        else:
+            print(f"[{_ts()}][LlmManager] 处理行程修改完成: type={type(modified_trip)}, str_len={len(str(modified_trip))}")
 
         if modified_trip:
             if edit_cmd and "type" in edit_cmd:

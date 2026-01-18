@@ -348,11 +348,17 @@ class UIManager:
             loading_messages = st.session_state.chat_history + [temp_loading]
             st.session_state.ai_processing = True
             chat_placeholder.markdown(build_chat_html(loading_messages), unsafe_allow_html=True)
-            self.conversation_manager.process_new_message(user_id, device_id, user_message_obj, session_id)
             intent_data = self.llm_manager.analyze_user_message(
                 query=prompt,
                 context=st.session_state.chat_history,
                 current_trip=st.session_state.trip_data,
+            )
+            self.conversation_manager.process_new_message(
+                user_id,
+                device_id,
+                user_message_obj,
+                session_id,
+                intent_data=intent_data,
             )
             intent_type = intent_data.get("intent", "general_conversation")
             if intent_type == "generate_trip":
