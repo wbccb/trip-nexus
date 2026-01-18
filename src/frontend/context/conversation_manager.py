@@ -365,7 +365,7 @@ class ConversationManager:
                 if intent_data:
                     context.core_entities = self.merge_core_entities_from_intent_data(intent_data, existing_entities)
                 else:
-                    context.core_entities = self.extract_core_entities(message.content, existing_entities)
+                    print(f"[{_ts()}][ConversationManager] 未提供 intent_data，跳过实体抽取以避免额外 LLM 调用")
                 cost = (_dt.now() - start_ts).total_seconds()
                 # 更新存储
                 print(f"[{_ts()}][ConversationManager] 抽离完成，进行存储，耗时 {cost:.2f}s")

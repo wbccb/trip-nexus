@@ -336,6 +336,9 @@ class UIManager:
             prompt = st.chat_input("告诉我您想如何调整行程？")
 
         if prompt:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            start_ts = datetime.now()
+            print(f"[{ts}][UIManager] chat_submit start, session_id={session_id}, prompt_len={len(prompt)}")
             user_msg = {"role": MessageType.USER, "content": prompt, "timestamp": datetime.now().isoformat(), "metadata": {}}
             st.session_state.chat_history.append(user_msg)
             user_message_obj = Message.model_validate(user_msg)
@@ -348,11 +351,13 @@ class UIManager:
             loading_messages = st.session_state.chat_history + [temp_loading]
             st.session_state.ai_processing = True
             chat_placeholder.markdown(build_chat_html(loading_messages), unsafe_allow_html=True)
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] analyze_user_message start")
             intent_data = self.llm_manager.analyze_user_message(
                 query=prompt,
                 context=st.session_state.chat_history,
                 current_trip=st.session_state.trip_data,
             )
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] analyze_user_message end, intent={intent_data.get('intent')}")
             self.conversation_manager.process_new_message(
                 user_id,
                 device_id,
@@ -402,6 +407,8 @@ class UIManager:
             assistant_message_obj = Message.model_validate(assistant_msg)
             # AI消息进行处理：主要是压缩多轮对话消息 + 存储会话信息到数据库中
             self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
+            total_cost = (datetime.now() - start_ts).total_seconds()
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] chat_submit end, total_cost={total_cost:.2f}s")
             # 显示AI消息到界面中
             chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
             st.session_state.ai_processing = False
