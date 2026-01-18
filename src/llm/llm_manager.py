@@ -488,7 +488,46 @@ class LlmManager:
                         safe_params[key] = []
                 else:
                     safe_params[key] = value
+
+            days_raw = safe_params.get("days")
+            if isinstance(days_raw, list):
+                numeric_days: List[int] = []
+                for v in days_raw:
+                    try:
+                        numeric_days.append(int(v))
+                    except (TypeError, ValueError):
+                        continue
+                safe_params["days"] = max(numeric_days) if numeric_days else ""
+            elif isinstance(days_raw, (int, float)):
+                safe_params["days"] = int(days_raw)
+            elif isinstance(days_raw, str) and days_raw.strip():
+                try:
+                    safe_params["days"] = int(float(days_raw.strip()))
+                except ValueError:
+                    safe_params["days"] = ""
+
+            budget_raw = safe_params.get("budget")
+            if isinstance(budget_raw, list):
+                numeric_budget: List[float] = []
+                for v in budget_raw:
+                    try:
+                        numeric_budget.append(float(v))
+                    except (TypeError, ValueError):
+                        continue
+                safe_params["budget"] = int(numeric_budget[0]) if numeric_budget else ""
+            elif isinstance(budget_raw, (int, float)):
+                safe_params["budget"] = int(budget_raw)
+            elif isinstance(budget_raw, str) and budget_raw.strip():
+                try:
+                    safe_params["budget"] = int(float(budget_raw.strip()))
+                except ValueError:
+                    safe_params["budget"] = ""
+
+            pref_raw = safe_params.get("preference")
+            if isinstance(pref_raw, str) and pref_raw.strip():
+                safe_params["preference"] = [p.strip() for p in pref_raw.split(",") if p.strip()]
             intent_data["parameters"] = safe_params
+
 
 
             # 确保 needs_more_info 存在
