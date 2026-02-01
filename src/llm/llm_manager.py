@@ -8,6 +8,12 @@ from langchain_ollama import OllamaLLM
 import json
 import re
 from datetime import datetime
+from geopy.geocoders import Nominatim
+from src.rag.network.multi_source_search import MultiSourceSearcher
+from src.llm.tool_protocol import ToolSchema, ToolCallResult, ToolRegistry
+from src.llm.tools.weather_tool import get_daily_weather
+from src.llm.tools.geo_tool import geocode_address
+from src.llm.tools.poi_tool import search_poi
 
 
 class DailyPlanItem(BaseModel):
@@ -62,6 +68,14 @@ class LlmManager:
         self.analysis_llm = self._create_llm(self._analysis_config)
         self.generation_llm = self._create_llm(self._generation_config)
         self.parser = JsonOutputParser(pydantic_object=TripPlan)
+        self.tool_registry = ToolRegistry()
+        self._geolocator = Nominatim(
+            user_agent="trip_nexus_tools_v1",
+            timeout=15,
+            domain="nominatim.openstreetmap.org",
+        )
+        self._poi_searcher = MultiSourceSearcher(self.analysis_llm)
+        self._register_default_tools()
 
     def _create_llm(self, cfg: Dict[str, Any]):
         provider = cfg.get("provider") or "ollama"
@@ -127,6 +141,208 @@ class LlmManager:
 
     def get_generation_llm(self):
         return self.generation_llm
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        return self.tool_registry.list_schemas()
+
+    def call_tool(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        result = self.tool_registry.call(tool_name, params)
+        if hasattr(result, "model_dump") and callable(getattr(result, "model_dump")):
+            return result.model_dump()
+        return result
+
+    def _normalize_tool_context(self, context: Optional[List[Any]] = None) -> List[Dict[str, str]]:
+        # 将多种来源的上下文统一成 role/content 结构，避免工具路由依赖特定上游格式
+        if not context:
+            return []
+        normalized: List[Dict[str, str]] = []
+        for msg in context[-6:]:
+            if isinstance(msg, dict):
+                # 标准对话消息：保留 role 与 content
+                role = msg.get("role") or "user"
+                content = msg.get("content") or ""
+                normalized.append({"role": str(role), "content": str(content)})
+            else:
+                # 纯文本上下文：默认视为 user 消息
+                normalized.append({"role": "user", "content": str(msg)})
+        return normalized
+
+    def decide_tool_call(self, query: str, context: Optional[List[Any]] = None) -> Dict[str, Any]:
+        tools = self.list_tools()
+        # 工具路由只依赖统一后的上下文，避免 UI/对话链路差异导致判断失真
+        normalized_context = self._normalize_tool_context(context)
+        context_text = ""
+        if normalized_context:
+            context_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in normalized_context])
+        # 将工具 Schema + 对话上下文 + 用户输入交给分析模型做路由决策
+        prompt = f"""
+你是工具路由器，需要在给定工具列表中选择是否调用工具。
+
+可用工具列表（JSON）：
+{json.dumps(tools, ensure_ascii=False)}
+
+对话上下文：
+{context_text or "无"}
+
+用户输入：
+{query}
+
+请严格返回以下 JSON 结构：
+{{
+  "needs_tool": true/false,
+  "tool_name": "工具名称或空字符串",
+  "params": {{}}
+}}
+"""
+        raw_response = self.analysis_llm.invoke(prompt)
+        response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
+        # 解析失败时降级为“不调用工具”，确保流程可继续
+        clean_response = self.extract_json_from_string(response_text)
+        try:
+            data = json.loads(clean_response)
+        except Exception:
+            data = {"needs_tool": False, "tool_name": "", "params": {}}
+        if not isinstance(data, dict):
+            return {"needs_tool": False, "tool_name": "", "params": {}}
+        if not isinstance(data.get("params"), dict):
+            data["params"] = {}
+        if "needs_tool" not in data:
+            data["needs_tool"] = False
+        if "tool_name" not in data:
+            data["tool_name"] = ""
+        return data
+
+    def call_tool_by_llm(self, query: str, context: Optional[List[Any]] = None) -> Dict[str, Any]:
+        # 第一步：让分析模型决定是否需要工具与工具参数
+        decision = self.decide_tool_call(query, context)
+        if not decision.get("needs_tool"):
+            return {"needs_tool": False, "decision": decision, "result": None}
+        tool_name = decision.get("tool_name") or ""
+        params = decision.get("params") or {}
+        # 第二步：执行工具并返回统一结果结构
+        result = self.call_tool(tool_name, params)
+        return {"needs_tool": True, "decision": decision, "result": result}
+
+    def _build_tool_query(self, user_input: Optional[Dict[str, Any]] = None, edit_cmd: Optional[Dict[str, Any]] = None, query: Optional[str] = None) -> str:
+        # 将结构化输入与编辑指令拼成自然语言查询，便于路由模型理解
+        parts: List[str] = []
+        if query:
+            parts.append(str(query))
+        if user_input:
+            destination = user_input.get("destination")
+            if destination:
+                parts.append(str(destination))
+            preference = user_input.get("preference")
+            if isinstance(preference, list):
+                parts.extend([str(p) for p in preference if p])
+            elif preference:
+                parts.append(str(preference))
+        if edit_cmd:
+            if edit_cmd.get("attraction"):
+                parts.append(str(edit_cmd.get("attraction")))
+            if edit_cmd.get("msg"):
+                parts.append(str(edit_cmd.get("msg")))
+        return " ".join([p for p in parts if p]).strip()
+
+    def _register_default_tools(self) -> None:
+        weather_schema = ToolSchema(
+            name="weather.get_daily",
+            description="按城市获取每日天气预报",
+            params={
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "date": {"type": "string", "description": "YYYY-MM-DD", "optional": True},
+                },
+                "required": ["city"],
+            },
+            returns={
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "latitude": {"type": "number"},
+                    "longitude": {"type": "number"},
+                    "daily": {"type": "array"},
+                    "source": {"type": "string"},
+                },
+            },
+            errors={
+                "TOOL_NOT_FOUND": "工具未注册",
+                "TOOL_EXECUTION_ERROR": "工具执行失败",
+            },
+        )
+        geocode_schema = ToolSchema(
+            name="geo.geocode",
+            description="地址地理编码获取经纬度",
+            params={
+                "type": "object",
+                "properties": {
+                    "address": {"type": "string"},
+                    "city": {"type": "string", "optional": True},
+                    "attraction": {"type": "string", "optional": True},
+                },
+                "required": ["address"],
+            },
+            returns={
+                "type": "object",
+                "properties": {
+                    "address": {"type": "string"},
+                    "latitude": {"type": "number"},
+                    "longitude": {"type": "number"},
+                    "display_name": {"type": "string"},
+                    "query": {"type": "string"},
+                },
+            },
+            errors={
+                "TOOL_NOT_FOUND": "工具未注册",
+                "TOOL_EXECUTION_ERROR": "工具执行失败",
+            },
+        )
+        poi_schema = ToolSchema(
+            name="poi.search",
+            description="按城市和关键词搜索 POI",
+            params={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "city": {"type": "string", "optional": True},
+                    "top_k": {"type": "integer", "optional": True},
+                },
+                "required": ["query"],
+            },
+            returns={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "results": {"type": "array"},
+                },
+            },
+            errors={
+                "TOOL_NOT_FOUND": "工具未注册",
+                "TOOL_EXECUTION_ERROR": "工具执行失败",
+            },
+        )
+        self.tool_registry.register(weather_schema, get_daily_weather, kind="local")
+        self.tool_registry.register(
+            geocode_schema,
+            lambda address, city=None, attraction=None: geocode_address(
+                address,
+                self._geolocator,
+                city=city,
+                attraction=attraction,
+            ),
+            kind="local",
+        )
+        self.tool_registry.register(
+            poi_schema,
+            lambda query, city=None, top_k=5: search_poi(
+                query,
+                self._poi_searcher,
+                city=city,
+                top_k=top_k,
+            ),
+            kind="local",
+        )
 
     def build_prompt(self, user_input: Dict[str, Any], context: List[str],
                      edit_cmd: Optional[Dict[str, Any]] = None) -> str:
@@ -314,6 +530,15 @@ class LlmManager:
             merged_context.extend(context)
         if constraints_text:
             merged_context.append(constraints_text)
+        # 行程生成前先做工具预调用，补充天气/POI/地理编码等外部信息
+        tool_query = self._build_tool_query(user_input=user_input, edit_cmd=edit_cmd)
+        if tool_query:
+            tool_call = self.call_tool_by_llm(tool_query, self._normalize_tool_context(context))
+            if tool_call.get("needs_tool") and tool_call.get("result"):
+                result_payload = tool_call.get("result")
+                if isinstance(result_payload, dict) and result_payload.get("success"):
+                    # 将工具结果注入上下文，参与后续 prompt 构建
+                    merged_context.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
         prompt = self.build_prompt(user_input, merged_context, edit_cmd)
 
         print(f"[{_ts()}][LlmManager] generate_trip start, destination={user_input.get('destination')}, days={user_input.get('days')}, attempt_count=2")
@@ -388,6 +613,18 @@ class LlmManager:
         根据用户查询调整行程，支持多轮对话上下文（不仅仅是调整行程，还支持初始化生成行程）
         """
         intent_data = self.analyze_user_message(query, context, current_trip)
+
+        if intent_data["intent"] == "general_conversation":
+            # 对话型请求优先走工具查询，避免误触发行程生成
+            tool_call = self.call_tool_by_llm(query, context)
+            if tool_call.get("needs_tool") and tool_call.get("result"):
+                result_payload = tool_call.get("result")
+                if isinstance(result_payload, dict) and result_payload.get("success"):
+                    return {
+                        "response": f"工具结果：{json.dumps(result_payload.get('data'), ensure_ascii=False)}",
+                        "trip_data": None,
+                        "intent": "tool_response"
+                    }
 
         if intent_data["intent"] == "generate_trip":
             return self._handle_trip_generation(intent_data, context)
