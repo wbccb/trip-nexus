@@ -146,12 +146,129 @@ class LlmManager:
         return self.tool_registry.list_schemas()
 
     def call_tool(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """统一调用工具注册表，返回标准化的结果结构。"""
         result = self.tool_registry.call(tool_name, params)
         if hasattr(result, "model_dump") and callable(getattr(result, "model_dump")):
             return result.model_dump()
         return result
 
+    def _is_cloud_model(self, llm_role: str) -> bool:
+        """判断当前模型是否为云端模型，基于 provider 配置做轻量识别。"""
+        if llm_role == "analysis":
+            cfg = self._analysis_config
+        else:
+            cfg = self._generation_config
+        provider = (cfg.get("provider") or "").lower()
+        return provider == "openai_compatible"
+
+    def _supports_function_call(self, llm: Any) -> bool:
+        """检查模型实例是否支持 FunctionCall（是否具备 bind_tools 接口）。"""
+        return hasattr(llm, "bind_tools")
+
+    def _build_function_call_tools(self) -> List[Any]:
+        """基于当前内置工具构建 LangChain Tool，用于云端 FunctionCall 调用。"""
+        try:
+            from langchain_core.tools import tool as lc_tool
+        except Exception:
+            return []
+
+        @lc_tool("weather.get_daily")
+        def weather_get_daily(city: str, date: Optional[str] = None) -> Dict[str, Any]:
+            """FunctionCall 天气工具：输入城市与日期，返回每日天气结构化结果。"""
+            return get_daily_weather(city, date)
+
+        @lc_tool("geo.geocode")
+        def geo_geocode(address: str, city: Optional[str] = None, attraction: Optional[str] = None) -> Dict[str, Any]:
+            """FunctionCall 地理编码工具：输入地址与城市，返回经纬度与标准化地址。"""
+            return geocode_address(
+                address,
+                self._geolocator,
+                city=city,
+                attraction=attraction,
+            )
+
+        @lc_tool("poi.search")
+        def poi_search(query: str, city: Optional[str] = None, top_k: int = 5) -> Dict[str, Any]:
+            """FunctionCall POI 工具：输入关键词与城市，返回搜索结果列表。"""
+            return search_poi(
+                query,
+                self._poi_searcher,
+                city=city,
+                top_k=top_k,
+            )
+
+        return [weather_get_daily, geo_geocode, poi_search]
+
+    def _call_tool_by_function_call(self, query: str, context: Optional[List[Any]] = None) -> Dict[str, Any]:
+        """使用云端模型的 FunctionCall 能力完成工具选择与执行。"""
+        tools = self._build_function_call_tools()
+        # 如果工具封装失败，回退到路由方案以保证链路不中断
+        if not tools:
+            return {
+                "needs_tool": False,
+                "decision": {"needs_tool": False, "tool_name": "", "params": {}, "source": "function_call"},
+                "result": None,
+                "fallback": True,
+            }
+
+        # 将上下文整理成可读文本，便于模型理解当前对话状态
+        normalized_context = self._normalize_tool_context(context)
+        context_text = ""
+        if normalized_context:
+            context_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in normalized_context])
+
+        prompt = f"""
+对话上下文：
+{context_text or "无"}
+
+用户输入：
+{query}
+"""
+        # 将工具绑定到云端模型，让模型自行产出 tool_calls
+        bound_llm = self.analysis_llm.bind_tools(tools)
+        response = bound_llm.invoke(prompt)
+
+        # 兼容不同模型返回结构，优先读取 tool_calls
+        tool_calls = getattr(response, "tool_calls", None)
+        if tool_calls is None and hasattr(response, "additional_kwargs"):
+            tool_calls = response.additional_kwargs.get("tool_calls")
+
+        # 模型未触发工具时直接返回，不进行额外兜底路由
+        if not tool_calls:
+            return {
+                "needs_tool": False,
+                "decision": {"needs_tool": False, "tool_name": "", "params": {}, "source": "function_call"},
+                "result": None,
+                "fallback": False,
+            }
+
+        # 当前先取第一个工具调用，避免多工具时的执行顺序问题
+        first_call = tool_calls[0]
+        tool_name = first_call.get("name") if isinstance(first_call, dict) else ""
+        params = first_call.get("args") if isinstance(first_call, dict) else {}
+        if not isinstance(params, dict):
+            params = {}
+
+        # 工具名为空时直接返回，避免误调用
+        if not tool_name:
+            return {
+                "needs_tool": False,
+                "decision": {"needs_tool": False, "tool_name": "", "params": {}, "source": "function_call"},
+                "result": None,
+                "fallback": False,
+            }
+
+        # 执行工具并返回标准化结果
+        result = self.call_tool(tool_name, params)
+        return {
+            "needs_tool": True,
+            "decision": {"needs_tool": True, "tool_name": tool_name, "params": params, "source": "function_call"},
+            "result": result,
+            "fallback": False,
+        }
+
     def _normalize_tool_context(self, context: Optional[List[Any]] = None) -> List[Dict[str, str]]:
+        """统一上下文结构，确保工具路由和 FunctionCall 输入一致。"""
         # 将多种来源的上下文统一成 role/content 结构，避免工具路由依赖特定上游格式
         if not context:
             return []
@@ -168,6 +285,7 @@ class LlmManager:
         return normalized
 
     def decide_tool_call(self, query: str, context: Optional[List[Any]] = None) -> Dict[str, Any]:
+        """使用分析模型进行工具路由决策，返回 needs_tool/tool_name/params。"""
         tools = self.list_tools()
         # 工具路由只依赖统一后的上下文，避免 UI/对话链路差异导致判断失真
         normalized_context = self._normalize_tool_context(context)
@@ -213,6 +331,12 @@ class LlmManager:
         return data
 
     def call_tool_by_llm(self, query: str, context: Optional[List[Any]] = None) -> Dict[str, Any]:
+        """根据模型能力选择 FunctionCall 或工具路由，并执行工具调用。"""
+        if self._is_cloud_model("analysis") and self._supports_function_call(self.analysis_llm):
+            # 云端模型优先走 FunctionCall，只有在工具封装失败时回退
+            function_call_result = self._call_tool_by_function_call(query, context)
+            if not function_call_result.get("fallback"):
+                return function_call_result
         # 第一步：让分析模型决定是否需要工具与工具参数
         decision = self.decide_tool_call(query, context)
         if not decision.get("needs_tool"):
