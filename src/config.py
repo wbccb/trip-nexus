@@ -23,6 +23,17 @@ class Config:
     SEARCH_RESULTS_COUNT = int(os.getenv("SEARCH_RESULTS_COUNT", "10"))
     RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "5"))
     DETAIL_FETCH_TOP_K = int(os.getenv("DETAIL_FETCH_TOP_K", "3"))
+    # RAG 分块与证据预算参数
+    RAG_CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "800"))  # 文本分块大小，影响向量检索粒度
+    RAG_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "160"))  # 分块重叠长度，降低语义切割损失
+    EVIDENCE_SUMMARY_MAX_CHARS = int(os.getenv("EVIDENCE_SUMMARY_MAX_CHARS", "1200"))  # 摘要区总预算
+    EVIDENCE_BODY_MAX_CHARS = int(os.getenv("EVIDENCE_BODY_MAX_CHARS", "2400"))  # 正文区总预算
+    EVIDENCE_SUMMARY_TOP_K = int(os.getenv("EVIDENCE_SUMMARY_TOP_K", "5"))  # 摘要区最多保留条数
+    EVIDENCE_BODY_TOP_N = int(os.getenv("EVIDENCE_BODY_TOP_N", "6"))  # 正文区最多保留段落数
+    EVIDENCE_BODY_CANDIDATE_K = int(os.getenv("EVIDENCE_BODY_CANDIDATE_K", "10"))  # 正文候选检索数量
+    EVIDENCE_SUMMARY_ITEM_MAX_CHARS = int(os.getenv("EVIDENCE_SUMMARY_ITEM_MAX_CHARS", "280"))  # 单条摘要最大长度
+    EVIDENCE_CHUNK_MAX_CHARS = int(os.getenv("EVIDENCE_CHUNK_MAX_CHARS", "700"))  # 单段正文最大长度
+    EVIDENCE_CHUNK_MIN_CHARS = int(os.getenv("EVIDENCE_CHUNK_MIN_CHARS", "80"))  # 单段正文最小长度
 
     # 质量过滤阈值
     RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.7"))

@@ -20,8 +20,8 @@ class VectorStore:
         self.collection_name = collection_name
         self.vector_db = None
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+            chunk_size=self.config.RAG_CHUNK_SIZE,
+            chunk_overlap=self.config.RAG_CHUNK_OVERLAP,
             separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?", " ", ""]
         )
         self._init_db()
@@ -85,4 +85,3 @@ class VectorStore:
                 logger.info(f"Cleared {len(ids)} documents from collection {self.collection_name}")
         except Exception as e:
             logger.error(f"Error clearing vector store: {e}")
-
