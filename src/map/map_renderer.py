@@ -4,7 +4,7 @@ from folium.plugins import MarkerCluster
 from folium.features import DivIcon
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Iterable
 import time
 import logging
 from datetime import datetime
@@ -139,7 +139,6 @@ class TripMap:
             control=True,
         ).add_to(m)
 
-        folium.LayerControl().add_to(m)
         return m
 
     def render_map(self, trip_data: Dict[str, Any]) -> folium.Map:
@@ -169,7 +168,11 @@ class TripMap:
 
         all_coords: List[Tuple[float, float]] = []
 
-        for day_str, items in daily_plans_grouped.items():
+        day_items = sorted(
+            daily_plans_grouped.items(),
+            key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]),
+        )
+        for day_str, items in day_items:
             try:
                 day_idx = int(day_str) - 1
             except ValueError:
@@ -177,6 +180,7 @@ class TripMap:
                 continue
 
             coords_list: List[Tuple[float, float]] = []
+            day_layer = folium.FeatureGroup(name=f"第{day_str}天", overlay=True, control=True)
 
             for idx, item in enumerate(items):
                 address = item.get("address")
@@ -222,7 +226,7 @@ class TripMap:
                     icon=self._create_icon(day_idx, item),
                     tooltip=item.get("attraction", ""),
                 )
-                marker.add_to(m)
+                marker.add_to(day_layer)
                 print(
                     f"[{ts}][MapRenderer] Marker added -> day={day_str}, idx={idx}, "
                     f"lat={coords[0]}, lon={coords[1]}"
@@ -235,7 +239,8 @@ class TripMap:
                     weight=3,
                     opacity=0.7,
                     tooltip=f"第{day_str}天路线",
-                ).add_to(m)
+                ).add_to(day_layer)
+            day_layer.add_to(m)
 
         if all_coords:
             try:
@@ -243,4 +248,176 @@ class TripMap:
             except Exception as e:
                 print(f"[{ts}][MapRenderer] fit_bounds failed: {e}")
 
+        folium.LayerControl().add_to(m)
         return m
+
+    def render_map_batches(self, trip_data: Dict[str, Any], batch_size: int = 4) -> Iterable[Dict[str, Any]]:
+        """
+        按批次渲染地图 POI，并逐步输出可用于前端刷新地图的 HTML 片段。
+
+        Args:
+            trip_data: 行程结构化数据，包含 destination 与 daily_plan。
+            batch_size: 每批 POI 数量，控制地图更新节奏。
+
+        Yields:
+            按序输出 poi_batch 事件，包含当前 HTML 与是否完成标记。
+        """
+        logger.info("\n\n------------------!!开始分批渲染地图!!------------------\n\n")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}][MapRenderer] render_map_batches input trip_data keys: {trip_data.keys()}")
+
+        dest = trip_data.get("destination", "成都")
+        # 解析目的地中心点作为地图初始视角
+        center_coords = self._get_coordinates(dest)
+        m = self._build_base_map(center_coords)
+
+        daily_plan_raw = trip_data.get("daily_plan")
+        if not daily_plan_raw:
+            # 无行程数据时直接返回空地图事件
+            yield {
+                "event": "poi_batch",
+                "sequence": 0,
+                "day": None,
+                "html": m.get_root().render(),
+                "is_final": True,
+                "map_obj": m,
+            }
+            return
+
+        if isinstance(daily_plan_raw, dict):
+            daily_plans_grouped: Dict[str, List[Dict[str, str]]] = daily_plan_raw
+        elif isinstance(daily_plan_raw, list):
+            daily_plans_grouped = {"1": daily_plan_raw}
+        else:
+            # 非法数据结构时降级为返回空地图事件
+            yield {
+                "event": "poi_batch",
+                "sequence": 0,
+                "day": None,
+                "html": m.get_root().render(),
+                "is_final": True,
+                "map_obj": m,
+            }
+            return
+
+        # 按天排序，保证 POI 渲染顺序稳定
+        day_items = sorted(
+            daily_plans_grouped.items(),
+            key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]),
+        )
+        all_coords: List[Tuple[float, float]] = []
+        sequence = 0
+
+        for day_str, items in day_items:
+            try:
+                day_idx = int(day_str) - 1
+            except ValueError:
+                continue
+
+            # 每天一个图层，支持前端按天开关显示
+            day_layer = folium.FeatureGroup(name=f"第{day_str}天", overlay=True, control=True)
+            coords_list: List[Tuple[float, float]] = []
+            pending_flush = False
+
+            for idx, item in enumerate(items):
+                address = item.get("address")
+                attraction = item.get("attraction", "未知景点")
+                lat = item.get("latitude")
+                lon = item.get("longitude")
+
+                if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and not (lat == 0 and lon == 0):
+                    coords = (float(lat), float(lon))
+                else:
+                    # 缺少经纬度时尝试地址解析
+                    if not address:
+                        continue
+                    coords = self._get_coordinates(
+                        address,
+                        city_name=dest,
+                        attraction_name=attraction,
+                        fallback=center_coords,
+                        max_offset_deg=1.0,
+                    )
+
+                if not coords or all(c == 0 for c in coords):
+                    continue
+
+                # 记录坐标用于绘制路线与整体视角适配
+                coords_list.append(coords)
+                all_coords.append(coords)
+
+                popup_html = (
+                    f"<b>第{day_str}天</b><br>"
+                    f"{item.get('time', '')}：{item.get('attraction', '')}<br>"
+                    f"交通：{item.get('transport', '')}"
+                )
+
+                marker = folium.Marker(
+                    location=coords,
+                    popup=popup_html,
+                    icon=self._create_icon(day_idx, item),
+                    tooltip=item.get("attraction", ""),
+                )
+                marker.add_to(day_layer)
+                pending_flush = True
+
+                # 达到批次大小时输出一次中间渲染结果
+                if batch_size > 0 and len(coords_list) % batch_size == 0:
+                    day_layer.add_to(m)
+                    if all_coords:
+                        m.fit_bounds(all_coords, padding=(20, 20))
+                    sequence += 1
+                    yield {
+                        "event": "poi_batch",
+                        "sequence": sequence,
+                        "day": day_str,
+                        "html": m.get_root().render(),
+                        "is_final": False,
+                        "map_obj": None,
+                    }
+                    pending_flush = False
+
+            if len(coords_list) >= 2:
+                # 同一天内绘制路线连线，增强可视化指引
+                PolyLine(
+                    locations=coords_list,
+                    color=self.colors[day_idx % len(self.colors)],
+                    weight=3,
+                    opacity=0.7,
+                    tooltip=f"第{day_str}天路线",
+                ).add_to(day_layer)
+                pending_flush = True
+
+            day_layer.add_to(m)
+            if pending_flush:
+                # 当日剩余点位未触发批次时，补发一次渲染更新
+                if all_coords:
+                    m.fit_bounds(all_coords, padding=(20, 20))
+                sequence += 1
+                yield {
+                    "event": "poi_batch",
+                    "sequence": sequence,
+                    "day": day_str,
+                    "html": m.get_root().render(),
+                    "is_final": False,
+                    "map_obj": None,
+                }
+
+        if all_coords:
+            try:
+                # 最终视角适配所有坐标点
+                m.fit_bounds(all_coords, padding=(20, 20))
+            except Exception:
+                pass
+
+        folium.LayerControl().add_to(m)
+        sequence += 1
+        # 最终事件输出完整地图对象，供后续复用
+        yield {
+            "event": "poi_batch",
+            "sequence": sequence,
+            "day": None,
+            "html": m.get_root().render(),
+            "is_final": True,
+            "map_obj": m,
+        }
