@@ -284,6 +284,204 @@ class LlmManager:
                 normalized.append({"role": "user", "content": str(msg)})
         return normalized
 
+
+
+    def build_trip_prompt(
+        self,
+        user_input: Dict[str, Any],
+        context: List[str],
+        edit_cmd: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        构建行程生成的最终提示词，包含约束信息与工具预调用结果。
+
+        Args:
+            user_input: 已整理的行程生成参数。
+            context: 最近上下文文本列表。
+            edit_cmd: 行程修改指令（如添加/删除景点）。
+
+        Returns:
+            适用于 LLM 生成行程 JSON 的提示词。
+        """
+        constraints_text = self._build_constraints_context(user_input)
+        merged_context: List[str] = []
+        if context:
+            merged_context.extend(context)
+        if constraints_text:
+            merged_context.append(constraints_text)
+        # 行程生成前先做工具预调用，补充天气/POI/地理编码等外部信息
+        tool_query = self._build_tool_query(user_input=user_input, edit_cmd=edit_cmd)
+        if tool_query:
+            tool_call = self.call_tool_by_llm(tool_query, self._normalize_tool_context(context))
+            if tool_call.get("needs_tool") and tool_call.get("result"):
+                result_payload = tool_call.get("result")
+                if isinstance(result_payload, dict) and result_payload.get("success"):
+                    # 将工具结果注入上下文，参与后续 prompt 构建
+                    merged_context.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
+        return self.build_prompt(user_input, merged_context, edit_cmd)
+
+    def parse_trip_from_response_text(self, response_text: str) -> Optional[Dict[str, Any]]:
+        """
+        将流式返回的完整文本解析为行程 JSON 数据。
+
+        Args:
+            response_text: LLM 输出的完整文本内容。
+
+        Returns:
+            成功时返回行程数据字典，失败时返回 None。
+        """
+        try:
+            clean_response = self.extract_json_from_string(response_text)
+            trip_data = self.parser.parse(clean_response)
+            if hasattr(trip_data, "model_dump") and callable(getattr(trip_data, "model_dump")):
+                return trip_data.model_dump()
+            if isinstance(trip_data, dict):
+                return trip_data
+            raise TypeError(f"解析器返回了意外类型: {type(trip_data)}")
+        except Exception as e:
+            print(f"[{_ts()}][LlmManager] 行程 JSON 解析失败: {e}")
+            return None
+
+    def prepare_trip_request_from_intent(
+        self,
+        intent_data: Dict[str, Any],
+        context: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """
+        从意图识别结果中整理行程生成所需参数与上下文。
+
+        Args:
+            intent_data: analyze_user_message 返回的意图与参数数据。
+            context: 最近对话上下文。
+
+        Returns:
+            包含是否缺参、缺参列表、user_input 与 context_texts 的字典。
+        """
+        params = intent_data.get("parameters", {})
+        needs_more_info = intent_data.get("needs_more_info", True)
+        missing_info = intent_data.get("missing_info", [])
+
+        # 缺参检测，确保行程生成参数完整
+        if needs_more_info:
+            if not missing_info:
+                if not params.get("destination") or params["destination"] in [None, [], ""]:
+                    missing_info.append("目的地")
+                if not params.get("days") or params["days"] is None:
+                    missing_info.append("旅行天数")
+                if not params.get("budget") or params["budget"] is None:
+                    missing_info.append("预算")
+            if missing_info:
+                return {
+                    "needs_more_info": True,
+                    "missing_info": missing_info,
+                    "user_input": None,
+                    "context_texts": [],
+                }
+
+        # 处理 destination - 可能是列表或字符串
+        destination_raw = params.get("destination", "成都")
+        if isinstance(destination_raw, list) and destination_raw:
+            destination = destination_raw[0]
+        elif isinstance(destination_raw, str) and destination_raw.strip():
+            destination = destination_raw.strip()
+        else:
+            destination = "成都"
+
+        # 处理 days - 安全转换
+        days_raw = params.get("days")
+        try:
+            days = int(days_raw) if days_raw not in [None, ""] else 3
+            days = max(1, min(days, 15))
+        except (TypeError, ValueError):
+            days = 3
+
+        # 处理 budget - 安全转换
+        budget_raw = params.get("budget")
+        try:
+            budget = int(budget_raw) if budget_raw not in [None, ""] else 5000
+            budget = max(1000, min(budget, 50000))
+        except (TypeError, ValueError):
+            budget = 5000
+
+        # 处理 preference - 处理各种可能的格式
+        preference_raw = params.get("preference")
+        if isinstance(preference_raw, list) and preference_raw:
+            preference = [str(p) for p in preference_raw if p]
+        elif isinstance(preference_raw, str) and preference_raw.strip():
+            preference = [pref.strip() for pref in preference_raw.split(",") if pref.strip()]
+        else:
+            preference = ["美食", "历史"]
+
+        # 从上下文中补充缺失的信息
+        if context:
+            for msg in reversed(context[-5:]):
+                content = msg["content"].lower()
+                if days == 3:
+                    day_match = re.search(r'(\d+)[\s]*天', content)
+                    if day_match:
+                        try:
+                            days = max(1, min(int(day_match.group(1)), 15))
+                        except ValueError:
+                            pass
+                if budget == 5000:
+                    budget_match = re.search(r'(\d+)[\s]*(?:元|块|rmb)', content)
+                    if budget_match:
+                        try:
+                            budget = max(1000, min(int(budget_match.group(1)), 50000))
+                        except ValueError:
+                            pass
+
+        user_input = {
+            "destination": destination,
+            "days": days,
+            "budget": budget,
+            "preference": preference if isinstance(preference, list) else [preference],
+            "guide_links": [],
+        }
+        context_texts = [msg["content"] for msg in context[-3:]] if context else []
+        return {
+            "needs_more_info": False,
+            "missing_info": [],
+            "user_input": user_input,
+            "context_texts": context_texts,
+        }
+
+    def _build_chat_prompt(
+        self,
+        query: str,
+        context: Optional[List[Dict[str, str]]] = None,
+        current_trip: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        构建通用对话提示词，将最近上下文与行程摘要合并到对话中。
+
+        Args:
+            query: 用户本次输入文本。
+            context: 最近对话上下文列表。
+            current_trip: 当前行程数据，用于补充背景信息。
+
+        Returns:
+            用于生成自然语言回复的提示词。
+        """
+        normalized_context = self._normalize_tool_context(context)
+        context_text = ""
+        if normalized_context:
+            context_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in normalized_context])
+        trip_text = ""
+        if isinstance(current_trip, dict) and current_trip:
+            destination = current_trip.get("destination")
+            days = current_trip.get("days")
+            if destination or days:
+                trip_text = f"当前行程：目的地={destination or '未知'}，天数={days or '未知'}。"
+        return (
+            "你是旅行规划助手，请根据上下文清晰回答用户问题。\n"
+            f"{trip_text}\n"
+            f"对话上下文：\n{context_text or '无'}\n\n"
+            f"用户输入：{query}\n"
+            "助手："
+        )
+
+
     def decide_tool_call(self, query: str, context: Optional[List[Any]] = None) -> Dict[str, Any]:
         """使用分析模型进行工具路由决策，返回 needs_tool/tool_name/params。"""
         tools = self.list_tools()
@@ -648,22 +846,7 @@ class LlmManager:
     def generate_trip(self, user_input: Dict[str, Any], context: List[str],
                       edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """生成行程：通过可视化界面操作输入文字进行行程的生成"""
-        constraints_text = self._build_constraints_context(user_input)
-        merged_context: List[str] = []
-        if context:
-            merged_context.extend(context)
-        if constraints_text:
-            merged_context.append(constraints_text)
-        # 行程生成前先做工具预调用，补充天气/POI/地理编码等外部信息
-        tool_query = self._build_tool_query(user_input=user_input, edit_cmd=edit_cmd)
-        if tool_query:
-            tool_call = self.call_tool_by_llm(tool_query, self._normalize_tool_context(context))
-            if tool_call.get("needs_tool") and tool_call.get("result"):
-                result_payload = tool_call.get("result")
-                if isinstance(result_payload, dict) and result_payload.get("success"):
-                    # 将工具结果注入上下文，参与后续 prompt 构建
-                    merged_context.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
-        prompt = self.build_prompt(user_input, merged_context, edit_cmd)
+        prompt = self.build_trip_prompt(user_input, context, edit_cmd)
 
         print(f"[{_ts()}][LlmManager] generate_trip start, destination={user_input.get('destination')}, days={user_input.get('days')}, attempt_count=2")
 
@@ -930,102 +1113,18 @@ class LlmManager:
 
     def _handle_trip_generation(self, intent_data: Dict[str, Any], context: List[Dict[str, str]]) -> Dict[str, Any]:
         """处理新行程生成请求"""
-        params = intent_data.get("parameters", {})
-        needs_more_info = intent_data.get("needs_more_info", True)
+        prepared = self.prepare_trip_request_from_intent(intent_data, context)
+        if prepared.get("needs_more_info"):
+            missing_info = prepared.get("missing_info", [])
+            return {
+                "response": f"我需要更多信息才能为您生成行程。请提供以下信息：{', '.join(missing_info)}。例如：'我想去成都玩3天，预算5000元'",
+                "trip_data": None,
+                "needs_more_info": True,
+            }
 
-        # 1. 首先检查是否需要更多信息
-        if needs_more_info:
-            missing_info = intent_data.get("missing_info", [])
-
-            # 如果 LLM 没有返回 missing_info，尝试自动检测
-            if not missing_info:
-                # 检查必需参数
-                if not params.get("destination") or params["destination"] in [None, [], ""]:
-                    missing_info.append("目的地")
-                if not params.get("days") or params["days"] is None:
-                    missing_info.append("旅行天数")
-                if not params.get("budget") or params["budget"] is None:
-                    missing_info.append("预算")
-
-            if missing_info:
-                return {
-                    "response": f"我需要更多信息才能为您生成行程。请提供以下信息：{', '.join(missing_info)}。例如：'我想去成都玩3天，预算5000元'",
-                    "trip_data": None,
-                    "needs_more_info": True
-                }
-
-        # 2. 安全地提取和转换参数
-        # 处理 destination - 可能是列表或字符串
-        destination_raw = params.get("destination", "成都")
-        if isinstance(destination_raw, list) and destination_raw:
-            destination = destination_raw[0]  # 取第一个目的地
-        elif isinstance(destination_raw, str) and destination_raw.strip():
-            destination = destination_raw.strip()
-        else:
-            destination = "成都"
-
-        # 处理 days - 安全转换
-        days_raw = params.get("days")
-        try:
-            days = int(days_raw) if days_raw not in [None, ""] else 3
-            days = max(1, min(days, 15))  # 限制在1-15天范围内
-        except (TypeError, ValueError):
-            days = 3
-
-        # 处理 budget - 安全转换
-        budget_raw = params.get("budget")
-        try:
-            budget = int(budget_raw) if budget_raw not in [None, ""] else 5000
-            budget = max(1000, min(budget, 50000))  # 限制在1000-50000元范围内
-        except (TypeError, ValueError):
-            budget = 5000
-
-        # 处理 preference - 处理各种可能的格式
-        preference_raw = params.get("preference")
-        if isinstance(preference_raw, list) and preference_raw:
-            # 确保列表中的元素都是字符串
-            preference = [str(p) for p in preference_raw if p]
-        elif isinstance(preference_raw, str) and preference_raw.strip():
-            preference = [pref.strip() for pref in preference_raw.split(",") if pref.strip()]
-        else:
-            preference = ["美食", "历史"]
-
-        # 3. 从上下文中补充缺失的信息
-        if context:
-            for msg in reversed(context[-5:]):  # 检查最近5条消息
-                content = msg["content"].lower()
-
-                # 从上下文中提取天数
-                if days == 3:  # 如果使用的是默认值，尝试从上下文获取
-                    day_match = re.search(r'(\d+)[\s]*天', content)
-                    if day_match:
-                        try:
-                            days = max(1, min(int(day_match.group(1)), 15))
-                        except ValueError:
-                            pass
-
-                # 从上下文中提取预算
-                if budget == 5000:  # 如果使用的是默认值，尝试从上下文获取
-                    budget_match = re.search(r'(\d+)[\s]*(?:元|块|rmb)', content)
-                    if budget_match:
-                        try:
-                            budget = max(1000, min(int(budget_match.group(1)), 50000))
-                        except ValueError:
-                            pass
-
-        # 4. 构建用户输入格式
-        user_input = {
-            "destination": destination,
-            "days": days,
-            "budget": budget,
-            "preference": preference if isinstance(preference, list) else [preference],
-            "guide_links": []
-        }
-
-        # 5. 从上下文中提取攻略信息
-        context_texts = [msg["content"] for msg in context[-3:]] if context else []
-
-        # 6. 生成行程
+        user_input = prepared.get("user_input") or {}
+        context_texts = prepared.get("context_texts") or []
+        # 生成行程
         trip_data = self.generate_trip(user_input, context_texts)
 
         if isinstance(trip_data, dict):
@@ -1040,12 +1139,18 @@ class LlmManager:
             print(f"[{_ts()}][LlmManager] 生成的行程数据类型: {type(trip_data)}, str_len={len(str(trip_data))}")
 
         if trip_data:
+            destination = user_input.get("destination", "目的地")
+            days = user_input.get("days", "未知")
+            budget = user_input.get("budget", "未知")
             return {
                 "response": f"太棒了！我已经为您规划了去{destination}的{days}天行程，预算{budget}元。行程已生成，请查看右侧地图和详细安排！",
                 "trip_data": trip_data,
                 "intent": "trip_generated"
             }
         else:
+            destination = user_input.get("destination", "未知")
+            days = user_input.get("days", "未知")
+            budget = user_input.get("budget", "未知")
             fallback_response = (
                 "抱歉，我无法生成满足您要求的行程。"
                 f"我尝试使用以下参数：目的地={destination}, 天数={days}, 预算={budget}。"
