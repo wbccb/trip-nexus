@@ -1,0 +1,195 @@
+import time
+import uuid
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Iterable
+
+import streamlit as st
+
+from src.frontend.context.entity import MessageType
+from src.llm.llm_manager import LlmManager
+
+
+def build_chat_html(messages: List[Dict[str, Any]]) -> str:
+    """
+    构建聊天消息的 HTML 字符串，用于在 Streamlit 中以自定义样式渲染消息列表。
+
+    设计目标：
+    1. 支持用户与助手消息的左右对齐展示；
+    2. 支持助手消息的“流式分段”展示（冻结段 + 活跃段）；
+    3. 适配较长对话的滚动区域并隐藏默认滚动条。
+
+    参数说明：
+    - messages: 消息列表，每条消息包含 role/content/metadata 等字段。
+
+    返回：
+    - 可以直接传入 st.markdown(unsafe_allow_html=True) 的 HTML 字符串。
+    """
+    css = """
+    <style>
+    .chat-outer{
+        display:flex;
+        flex-direction:column;
+        height:calc(100vh - 260px);
+    }
+    .chat-wrapper{
+        display:flex;
+        flex-direction:column;
+        gap:12px;
+        flex:1;
+        min-height:0;
+        overflow-y:auto;
+        padding:8px;
+    }
+    .msg{display:flex;align-items:flex-start;margin:24px 0px;}
+    .msg.assistant{justify-content:flex-start;}
+    .msg.user{justify-content:flex-end;}
+    .bubble{border-radius:8px;padding:10px 12px;max-width:80%;line-height:1.6;font-size:14px;}
+    .assistant .bubble{background:#fff;border:1px solid #eee;}
+    .user .bubble{background:#E6F4FF;border:1px solid #CDE6FF;}
+    .avatar{width:28px;height:28px;border-radius:50%;background:#eef;display:flex;align-items:center;justify-content:center;font-size:14px;margin-right: 10px;}
+    .user .avatar{display:none;}
+    .bubble.loading{display:flex;align-items:center;gap:8px;}
+    .loading-dots{display:inline-flex;gap:4px;}
+    .loading-dots span{width:6px;height:6px;border-radius:50%;background:#999;animation:ai-loading 1.2s infinite ease-in-out;}
+    .loading-dots span:nth-child(2){animation-delay:0.2s;}
+    .loading-dots span:nth-child(3){animation-delay:0.4s;}
+    @keyframes ai-loading{
+        0%,80%,100%{transform:scale(0);}
+        40%{transform:scale(1);}
+    }
+    .stream-segment{display:block;white-space:pre-wrap;}
+    .stream-segment.frozen{opacity:0.95;}
+    </style>
+    """
+    body = ['<div class="chat-outer"><div class="chat-wrapper">']
+    for message in messages:
+        role = message.get("role")
+        role_str = "assistant" if role == MessageType.ASSISTANT or role == "assistant" else "user"
+        content = message.get("content", "")
+        metadata = message.get("metadata", {}) if isinstance(message, dict) else {}
+
+        # 当 metadata 中包含 segments/active 时，说明该消息处于流式渲染状态
+        if isinstance(metadata, dict) and metadata.get("segments") is not None:
+            segments = metadata.get("segments") or []
+            active = metadata.get("active") or ""
+            combined_parts: List[str] = []
+            for segment in segments:
+                combined_parts.append(f'<span class="stream-segment frozen">{segment}</span>')
+            combined_parts.append(f'<span class="stream-segment">{active}</span>')
+            content = "".join(combined_parts)
+
+        is_loading = isinstance(metadata, dict) and metadata.get("loading", False)
+        body.append(f'<div class="msg {role_str}">')
+        if role_str == "assistant":
+            body.append('<div class="avatar">AI</div>')
+        if is_loading:
+            body.append(
+                '<div class="bubble loading">AI处理中'
+                '<span class="loading-dots"><span></span><span></span><span></span></span>'
+                '</div>'
+            )
+        else:
+            body.append(f'<div class="bubble">{content}</div>')
+        body.append('</div>')
+    body.append('</div></div>')
+    return css + "".join(body)
+
+
+class ChatStreamRenderer:
+    """
+    聊天流式渲染工具类。
+
+    职责说明：
+    1. 负责消费 LlmManager 提供的 start/delta/end 事件序列；
+    2. 维护“冻结段 + 活跃段”的双缓冲结构，减少 Markdown 重排抖动；
+    3. 使用时间窗口进行渲染节流，避免过于频繁的 UI 刷新；
+    4. 在流式结束后返回完整文本，供 JSON 解析与历史存储使用。
+    """
+
+    def __init__(self, llm_manager: LlmManager) -> None:
+        """
+        初始化 ChatStreamRenderer。
+
+        参数说明：
+        - llm_manager: LlmManager 实例，用于构建统一流式事件序列。
+        """
+        self.llm_manager = llm_manager
+
+    def render_stream_response(
+        self,
+        response_text: str,
+        base_messages: List[Dict[str, Any]],
+        placeholder,
+        response_stream: Optional[Iterable[str]] = None,
+    ) -> str:
+        """
+        按统一协议消费 LLM 流式输出，并通过 Streamlit 实时渲染。
+
+        处理流程：
+        1. 生成唯一 message_id，构建 start/delta/end 事件序列；
+        2. 对 delta 事件进行增量累积，并按空行分段，将完成段落放入冻结区；
+        3. 按 120ms 为单位节流刷新 UI，仅在必要时重绘聊天区域；
+        4. 收到 end 事件时停止流式更新，并返回完整输出文本。
+
+        参数说明：
+        - response_text: 非流式兜底路径下的一次性完整回复文本；
+        - base_messages: 当前已有对话历史，用于在其后追加流式消息；
+        - placeholder: Streamlit 占位符，用于替换渲染聊天 HTML；
+        - response_stream: LLM 的增量文本迭代器；为 None 时退化为本地分片流式。
+
+        返回：
+        - full_text: 流式期间累积的完整回复文本。
+        """
+        message_id = f"assistant_{uuid.uuid4().hex[:12]}"
+        if response_stream is not None:
+            events = self.llm_manager.build_stream_events_from_stream(
+                response_stream,
+                message_id,
+            )
+        else:
+            events = self.llm_manager.build_stream_events(
+                response_text,
+                message_id,
+                chunk_size=24,
+            )
+
+        frozen_segments: List[str] = []
+        active_segment = ""
+        full_text = ""
+        last_flush = time.perf_counter()
+        flush_interval = 0.12
+
+        for event in events:
+            if event.get("event") == "delta":
+                delta_text = event.get("content_delta", "")
+                full_text += delta_text
+                active_segment += delta_text
+                parts = active_segment.split("\n\n")
+                if len(parts) > 1:
+                    for piece in parts[:-1]:
+                        frozen_segments.append(piece + "\n\n")
+                    active_segment = parts[-1]
+
+            now = time.perf_counter()
+            should_flush = event.get("event") == "end" or (now - last_flush) >= flush_interval
+            if should_flush:
+                stream_message = {
+                    "role": MessageType.ASSISTANT,
+                    "content": "",
+                    "timestamp": datetime.now().isoformat(),
+                    "metadata": {
+                        "segments": frozen_segments,
+                        "active": active_segment,
+                        "streaming": True,
+                    },
+                }
+                placeholder.markdown(
+                    build_chat_html(base_messages + [stream_message]),
+                    unsafe_allow_html=True,
+                )
+                last_flush = now
+                if event.get("event") != "end":
+                    time.sleep(0.02)
+
+        return full_text
+

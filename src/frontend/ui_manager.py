@@ -1,18 +1,20 @@
 import logging
-import streamlit as st
-from streamlit.components.v1 import html
-from typing import Optional, Dict, List, Any
-from datetime import datetime
-
-from src.frontend.context.conversation_manager import ConversationManager
-from src.frontend.context.storage import get_conversation_storage
-from src.frontend.context.entity import Message, MessageType
-from src.llm.llm_manager import LlmManager
-from src.config import Config
-from src.utils.console import console_log
-from src.map.map_renderer import TripMap
 import json
 import base64
+from datetime import datetime, time
+from typing import Optional, Dict, List, Any
+
+import streamlit as st
+from streamlit.components.v1 import html
+
+from src.config import Config
+from src.frontend.chat_stream_renderer import ChatStreamRenderer, build_chat_html
+from src.frontend.context.conversation_manager import ConversationManager
+from src.frontend.context.entity import Message, MessageType
+from src.frontend.context.storage import get_conversation_storage
+from src.llm.llm_manager import LlmManager
+from src.map.map_renderer import TripMap
+from src.utils.console import console_log
 
 class UIManager:
     def __init__(self, llm_manager: LlmManager, config: Config, map_renderer: TripMap | None = None):
@@ -22,6 +24,8 @@ class UIManager:
         self.conversation_storage = get_conversation_storage(config)
         self.conversation_manager = ConversationManager(conversation_storage=self.conversation_storage, llm_manager=llm_manager)
         self.map_renderer = map_renderer or TripMap()
+        # 使用独立的流式渲染工具类，降低 UIManager 体积并复用逻辑
+        self.chat_stream_renderer = ChatStreamRenderer(llm_manager)
 
     def _init_session_state(self) -> None:
         """初始化会话状态"""
@@ -264,70 +268,12 @@ class UIManager:
         chat_container = st.container()
         with chat_container:
             chat_placeholder = st.empty()
-            # input_placeholder = st.empty()  # Removed as we use st.chat_input directly
 
-        def build_chat_html(messages: List[Dict[str, Any]]) -> str:
-            css = """
-            <style>
-            /* 外层容器：占满视口的一部分高度 */
-            .chat-outer{
-                display:flex;
-                flex-direction:column;
-                /* 视口高度减去上面标题/输入框的大致高度，自行微调 */
-                height:calc(100vh - 260px);
-            }
-            /* 内层真正滚动的区域 */
-            .chat-wrapper{
-                display:flex;
-                flex-direction:column;
-                gap:12px;
-                flex:1;
-                min-height:0;
-                overflow-y:auto;
-                padding:8px;
-            }
-            .msg{display:flex;align-items:flex-start;margin:24px 0px;}
-            .msg.assistant{justify-content:flex-start;}
-            .msg.user{justify-content:flex-end;}
-            .bubble{border-radius:8px;padding:10px 12px;max-width:80%;line-height:1.6;font-size:14px;}
-            .assistant .bubble{background:#fff;border:1px solid #eee;}
-            .user .bubble{background:#E6F4FF;border:1px solid #CDE6FF;}
-            .avatar{width:28px;height:28px;border-radius:50%;background:#eef;display:flex;align-items:center;justify-content:center;font-size:14px;margin-right: 10px;}
-            .user .avatar{display:none;}
-            .bubble.loading{display:flex;align-items:center;gap:8px;}
-            .loading-dots{display:inline-flex;gap:4px;}
-            .loading-dots span{width:6px;height:6px;border-radius:50%;background:#999;animation:ai-loading 1.2s infinite ease-in-out;}
-            .loading-dots span:nth-child(2){animation-delay:0.2s;}
-            .loading-dots span:nth-child(3){animation-delay:0.4s;}
-            @keyframes ai-loading{
-                0%,80%,100%{transform:scale(0);}
-                40%{transform:scale(1);}
-            }
-            </style>
-            """
-            body = ['<div class="chat-outer"><div class="chat-wrapper">']
-            for m in messages:
-                role = m.get("role")
-                role_str = "assistant" if role == MessageType.ASSISTANT or role == "assistant" else "user"
-                content = m.get("content", "")
-                metadata = m.get("metadata", {}) if isinstance(m, dict) else {}
-                is_loading = isinstance(metadata, dict) and metadata.get("loading", False)
-                body.append(f'<div class="msg {role_str}">')
-                if role_str == "assistant":
-                    body.append('<div class="avatar">AI</div>')
-                if is_loading:
-                    body.append(
-                        '<div class="bubble loading">AI处理中'
-                        '<span class="loading-dots"><span></span><span></span><span></span></span>'
-                        '</div>'
-                    )
-                else:
-                    body.append(f'<div class="bubble">{content}</div>')
-                body.append('</div>')
-            body.append('</div></div>')
-            return css + "".join(body)
         with chat_container:
-            chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
+            chat_placeholder.markdown(
+                build_chat_html(st.session_state.chat_history),
+                unsafe_allow_html=True,
+            )
             
         # 使用原生 chat_input 固定在底部
         if st.session_state.ai_processing:
@@ -366,8 +312,29 @@ class UIManager:
                 intent_data=intent_data,
             )
             intent_type = intent_data.get("intent", "general_conversation")
+            response_stream = None
+            trip_streaming_request = None
             if intent_type == "generate_trip":
-                response_data = self.llm_manager._handle_trip_generation(intent_data, st.session_state.chat_history)
+                prepared_request = self.llm_manager.prepare_trip_request_from_intent(
+                    intent_data,
+                    st.session_state.chat_history,
+                )
+                if prepared_request.get("needs_more_info"):
+                    missing_info = prepared_request.get("missing_info", [])
+                    response_data = {
+                        "response": f"我需要更多信息才能为您生成行程。请提供以下信息：{', '.join(missing_info)}。例如：'我想去成都玩3天，预算5000元'",
+                        "trip_data": None,
+                    }
+                else:
+                    trip_streaming_request = prepared_request
+                    response_stream = self.llm_manager.stream_trip_generation(
+                        prepared_request.get("user_input") or {},
+                        prepared_request.get("context_texts") or [],
+                    )
+                    response_data = {
+                        "response": "",
+                        "trip_data": None,
+                    }
             elif intent_type in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
                 if st.session_state.trip_data:
                     response_data = self.llm_manager._handle_trip_modification(intent_data, st.session_state.trip_data, st.session_state.chat_history)
@@ -377,8 +344,13 @@ class UIManager:
                         "trip_data": None,
                     }
             else:
+                response_stream = self.llm_manager.stream_chat_response(
+                    prompt,
+                    st.session_state.chat_history,
+                    st.session_state.trip_data,
+                )
                 response_data = {
-                    "response": f"我理解您想{intent_data.get('summary', '进一步讨论行程')}. 请告诉我更多细节，比如目的地、旅行天数和您的偏好，我可以为您规划具体的行程。",
+                    "response": "",
                     "trip_data": None,
                 }
             if isinstance(response_data, dict) and "response" in response_data:
@@ -386,12 +358,32 @@ class UIManager:
             else:
                 chat_response = str(response_data)
             trip_data = None
-            if isinstance(response_data, dict) and "trip_data" in response_data:
-                trip_data = response_data["trip_data"]
-                if trip_data:
-                    st.session_state.trip_data = trip_data
-                    st.session_state.map_obj = None
-                    self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
+            if response_stream is not None:
+                chat_response = self.chat_stream_renderer.render_stream_response(
+                    chat_response,
+                    st.session_state.chat_history,
+                    chat_placeholder,
+                    response_stream=response_stream,
+                )
+                if trip_streaming_request is not None:
+                    trip_data = self.llm_manager.parse_trip_from_response_text(chat_response)
+                    if trip_data:
+                        st.session_state.trip_data = trip_data
+                        st.session_state.map_obj = None
+                        self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
+            else:
+                self.chat_stream_renderer.render_stream_response(
+                    chat_response,
+                    st.session_state.chat_history,
+                    chat_placeholder,
+                    response_stream=None,
+                )
+                if isinstance(response_data, dict) and "trip_data" in response_data:
+                    trip_data = response_data["trip_data"]
+                    if trip_data:
+                        st.session_state.trip_data = trip_data
+                        st.session_state.map_obj = None
+                        self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
             assistant_msg = {
                 "role": MessageType.ASSISTANT,
                 "content": chat_response,
@@ -708,63 +700,75 @@ class UIManager:
         if map_visible and has_trip_data:
             # 渲染地图内容
             trip_data = st.session_state.get("trip_data")
+            map_placeholder = st.empty()
+            map_rendered_inline = False
+            st.markdown("""
+                <style>
+                div.element-container:has(div#close-map-marker) + div.element-container {
+                    position: fixed !important;
+                    top: 64px;
+                    right: 20px;
+                    z-index: 1000001;
+                    width: auto !important;
+                }
+                div.element-container:has(div#close-map-marker) + div.element-container button {
+                    background-color: transparent;
+                    border: none;
+                    color: #666;
+                    font-size: 16px;
+                    padding: 4px 12px;
+                    line-height: 1;
+                }
+                div.element-container:has(div#close-map-marker) + div.element-container button:hover {
+                    color: #333;
+                    border: none;
+                    background-color: rgba(0,0,0,0.05);
+                }
+                div.element-container:has(div#close-map-marker) + div.element-container button:focus {
+                    border: none;
+                    outline: none;
+                    box-shadow: none;
+                }
+                </style>
+                <div id="close-map-marker"></div>
+            """, unsafe_allow_html=True)
+            
+            if st.button("✕", key="close_map_overlay_btn", help="关闭地图"):
+                st.session_state.map_visible = False
+                st.rerun()
             if not st.session_state.get("map_obj") and self.map_renderer:
                  print("[DEBUG] Generating map object...")
                  with st.spinner("地图生成中..."):
                     try:
-                        st.session_state.map_obj = self.map_renderer.render_map(trip_data)
-                        print("[DEBUG] Map object generated successfully")
+                        last_event = None
+                        for event in self.map_renderer.render_map_batches(trip_data, batch_size=4):
+                            map_html_content = event.get("html") or ""
+                            if map_html_content:
+                                sidebar_html = self._build_map_sidebar_html(map_html_content)
+                                map_placeholder.markdown(sidebar_html, unsafe_allow_html=True)
+                                map_rendered_inline = True
+                            last_event = event
+                            if not event.get("is_final"):
+                                time.sleep(0.25)
+                        if last_event and last_event.get("map_obj"):
+                            st.session_state.map_obj = last_event.get("map_obj")
+                            print("[DEBUG] Map object generated successfully")
+                        elif not st.session_state.get("map_obj"):
+                            st.session_state.map_obj = self.map_renderer.render_map(trip_data)
+                            print("[DEBUG] Map object generated successfully")
                     except Exception as e:
                         print(f"[DEBUG] Map generation failed: {e}")
                         st.error(f"地图生成失败: {str(e)}")
             
-            if st.session_state.get("map_obj"):
+            if st.session_state.get("map_obj") and not map_rendered_inline:
                 try:
-                    # 1. 渲染关闭按钮（悬浮在侧边栏右上角）
-                    # 使用 CSS Hack 将 Streamlit 原生按钮定位到侧边栏标题栏位置
-                    # 利用 div.element-container:has(...) + div.element-container 选择相邻的按钮容器
-                    st.markdown("""
-                        <style>
-                        div.element-container:has(div#close-map-marker) + div.element-container {
-                            position: fixed !important;
-                            top: 64px;
-                            right: 20px;
-                            z-index: 1000001;
-                            width: auto !important;
-                        }
-                        div.element-container:has(div#close-map-marker) + div.element-container button {
-                            background-color: transparent;
-                            border: none;
-                            color: #666;
-                            font-size: 16px;
-                            padding: 4px 12px;
-                            line-height: 1;
-                        }
-                        div.element-container:has(div#close-map-marker) + div.element-container button:hover {
-                            color: #333;
-                            border: none;
-                            background-color: rgba(0,0,0,0.05);
-                        }
-                        div.element-container:has(div#close-map-marker) + div.element-container button:focus {
-                            border: none;
-                            outline: none;
-                            box-shadow: none;
-                        }
-                        </style>
-                        <div id="close-map-marker"></div>
-                    """, unsafe_allow_html=True)
-                    
-                    if st.button("✕", key="close_map_overlay_btn", help="关闭地图"):
-                        st.session_state.map_visible = False
-                        st.rerun()
-
                     # 2. 获取地图的完整 HTML 字符串
                     map_html_content = st.session_state.map_obj.get_root().render()
                     print(f"[DEBUG] Map HTML generated, length: {len(map_html_content)}")
                     
                     sidebar_html = self._build_map_sidebar_html(map_html_content)
                     print("[DEBUG] Injecting map sidebar HTML")
-                    st.markdown(sidebar_html, unsafe_allow_html=True)
+                    map_placeholder.markdown(sidebar_html, unsafe_allow_html=True)
                 except Exception as e:
                     print(f"[DEBUG] Error rendering map sidebar: {e}")
                     st.error(f"地图渲染错误: {e}")

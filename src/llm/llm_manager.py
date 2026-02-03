@@ -1,7 +1,7 @@
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Iterable
 import torch  # 仍然保留，以防其他部分使用，但在 __init__ 中不再强制需要
 
 from langchain_ollama import OllamaLLM
@@ -14,6 +14,7 @@ from src.llm.tool_protocol import ToolSchema, ToolCallResult, ToolRegistry
 from src.llm.tools.weather_tool import get_daily_weather
 from src.llm.tools.geo_tool import geocode_address
 from src.llm.tools.poi_tool import search_poi
+from src.llm.streaming_adapter import LlmStreamingAdapter
 
 
 class DailyPlanItem(BaseModel):
@@ -76,6 +77,7 @@ class LlmManager:
         )
         self._poi_searcher = MultiSourceSearcher(self.analysis_llm)
         self._register_default_tools()
+        self._streaming_adapter = LlmStreamingAdapter()
 
     def _create_llm(self, cfg: Dict[str, Any]):
         provider = cfg.get("provider") or "ollama"
@@ -284,7 +286,55 @@ class LlmManager:
                 normalized.append({"role": "user", "content": str(msg)})
         return normalized
 
+    def build_stream_events(
+        self,
+        content: str,
+        message_id: str,
+        chunk_size: int = 32,
+    ) -> List[Dict[str, Any]]:
+        """
+        构建前端可消费的流式事件序列，按统一协议拆分完整文本。
 
+        参数说明：
+        - content: 完整输出文本；
+        - message_id: 本次消息唯一标识；
+        - chunk_size: 单个增量片段最大长度。
+
+        返回：
+        - 由 LlmStreamingAdapter 生成的事件列表。
+        """
+        return self._streaming_adapter.build_stream_events(content, message_id, chunk_size)
+
+    def build_stream_events_from_stream(
+        self,
+        stream: Iterable[str],
+        message_id: str,
+    ) -> Iterable[Dict[str, Any]]:
+        """
+        将模型原生流式输出适配为统一的 start/delta/end 事件序列。
+
+        参数说明：
+        - stream: 模型返回的增量文本迭代器；
+        - message_id: 当前消息唯一标识。
+
+        返回：
+        - 由 LlmStreamingAdapter 生成的事件迭代器。
+        """
+        return self._streaming_adapter.build_stream_events_from_stream(stream, message_id)
+
+    def stream_llm_text(self, prompt: str, llm_role: str = "generation") -> Iterable[str]:
+        """
+        使用大模型原生 stream 输出文本增量，失败时由适配器降级为一次性 invoke。
+
+        Args:
+            prompt: 发送给模型的完整提示词。
+            llm_role: 使用的模型角色，默认 generation。
+
+        返回：
+            增量文本片段迭代器，由 LlmStreamingAdapter 统一处理流式与降级逻辑。
+        """
+        llm = self.generation_llm if llm_role == "generation" else self.analysis_llm
+        return self._streaming_adapter.stream_llm_text(llm, prompt)
 
     def build_trip_prompt(
         self,
@@ -341,6 +391,26 @@ class LlmManager:
         except Exception as e:
             print(f"[{_ts()}][LlmManager] 行程 JSON 解析失败: {e}")
             return None
+
+    def stream_trip_generation(
+        self,
+        user_input: Dict[str, Any],
+        context: List[str],
+        edit_cmd: Optional[Dict[str, Any]] = None,
+    ) -> Iterable[str]:
+        """
+        使用大模型真实流式输出行程 JSON 文本。
+
+        Args:
+            user_input: 行程生成参数。
+            context: 最近上下文文本列表。
+            edit_cmd: 行程修改指令（如添加/删除景点）。
+
+        Returns:
+            可迭代的文本增量流。
+        """
+        prompt = self.build_trip_prompt(user_input, context, edit_cmd)
+        return self.stream_llm_text(prompt, llm_role="generation")
 
     def prepare_trip_request_from_intent(
         self,
@@ -481,6 +551,25 @@ class LlmManager:
             "助手："
         )
 
+    def stream_chat_response(
+        self,
+        query: str,
+        context: Optional[List[Dict[str, str]]] = None,
+        current_trip: Optional[Dict[str, Any]] = None,
+    ) -> Iterable[str]:
+        """
+        生成对话回复的真实流式输出，返回增量文本迭代器。
+
+        Args:
+            query: 用户输入文本。
+            context: 最近对话上下文。
+            current_trip: 当前行程数据。
+
+        Returns:
+            大模型流式输出的增量文本迭代器。
+        """
+        prompt = self._build_chat_prompt(query, context, current_trip)
+        return self.stream_llm_text(prompt, llm_role="generation")
 
     def decide_tool_call(self, query: str, context: Optional[List[Any]] = None) -> Dict[str, Any]:
         """使用分析模型进行工具路由决策，返回 needs_tool/tool_name/params。"""
