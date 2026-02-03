@@ -470,6 +470,44 @@ class UIManager:
                 width=1000,
             )
 
+    def _build_map_sidebar_html(self, map_html_content: str) -> str:
+        b64_html = base64.b64encode(map_html_content.encode("utf-8")).decode("utf-8")
+        sidebar_html = f"""
+            <div style="
+                position: fixed;
+                top: 60px;
+                right: 0;
+                width: 40%;
+                height: calc(100vh - 60px);
+                background-color: white;
+                box-shadow: -4px 0 10px rgba(0,0,0,0.1);
+                z-index: 999999;
+                border-left: 1px solid #e0e0e0;
+                display: flex;
+                flex-direction: column;
+            ">
+                <div style="
+                    padding: 12px 16px;
+                    background: #f8f9fa;
+                    border-bottom: 1px solid #eee;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    flex-shrink: 0;
+                    height: 50px;
+                ">
+                    <span style="font-weight: 600; font-size: 16px; color: #333;">🗺️ 行程地图</span>
+                    <span style="width: 40px;"></span>
+                </div>
+                <div style="flex: 1; width: 100%; position: relative;">
+                    <iframe src="data:text/html;charset=utf-8;base64,{b64_html}" 
+                            style="width: 100%; height: 100%; border: none;">
+                    </iframe>
+                </div>
+            </div>
+        """
+        return sidebar_html
+
     def _display_trip_in_chat(self, trip_data: Dict[str, Any]):
         """在聊天界面中显示格式化的行程"""
         if not trip_data:
@@ -724,46 +762,7 @@ class UIManager:
                     map_html_content = st.session_state.map_obj.get_root().render()
                     print(f"[DEBUG] Map HTML generated, length: {len(map_html_content)}")
                     
-                    # 3. 转换为 base64 编码
-                    b64_html = base64.b64encode(map_html_content.encode('utf-8')).decode('utf-8')
-                    print(f"[DEBUG] Base64 encoded length: {len(b64_html)}")
-                    
-                    # 4. 使用 CSS 实现右侧固定浮动侧边栏，并嵌入 iframe
-                    sidebar_html = f"""
-                        <div style="
-                            position: fixed;
-                            top: 60px;
-                            right: 0;
-                            width: 40%;
-                            height: calc(100vh - 60px);
-                            background-color: white;
-                            box-shadow: -4px 0 10px rgba(0,0,0,0.1);
-                            z-index: 999999;
-                            border-left: 1px solid #e0e0e0;
-                            display: flex;
-                            flex-direction: column;
-                        ">
-                            <div style="
-                                padding: 12px 16px;
-                                background: #f8f9fa;
-                                border-bottom: 1px solid #eee;
-                                display: flex;
-                                justify-content: space-between;
-                                align-items: center;
-                                flex-shrink: 0;
-                                height: 50px; /* 固定高度以配合按钮定位 */
-                            ">
-                                <span style="font-weight: 600; font-size: 16px; color: #333;">🗺️ 行程地图</span>
-                                <!-- 右侧空间留给悬浮的关闭按钮 -->
-                                <span style="width: 40px;"></span>
-                            </div>
-                            <div style="flex: 1; width: 100%; position: relative;">
-                                <iframe src="data:text/html;charset=utf-8;base64,{b64_html}" 
-                                        style="width: 100%; height: 100%; border: none;">
-                                </iframe>
-                            </div>
-                        </div>
-                    """
+                    sidebar_html = self._build_map_sidebar_html(map_html_content)
                     print("[DEBUG] Injecting map sidebar HTML")
                     st.markdown(sidebar_html, unsafe_allow_html=True)
                 except Exception as e:
