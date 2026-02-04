@@ -3,6 +3,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", os.path.join(PROJECT_ROOT, "model_cache"))
+os.environ.setdefault("MODEL_CACHE_DIR", MODEL_CACHE_DIR)
+HF_HOME = os.getenv("HF_HOME", os.path.join(MODEL_CACHE_DIR, "huggingface"))
+os.environ.setdefault("HF_HOME", HF_HOME)
+SENTENCE_TRANSFORMERS_HOME = os.getenv(
+    "SENTENCE_TRANSFORMERS_HOME",
+    os.path.join(MODEL_CACHE_DIR, "sentence_transformers"),
+)
+os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", SENTENCE_TRANSFORMERS_HOME)
+os.environ.pop("TRANSFORMERS_CACHE", None)
+HUGGINGFACE_HUB_CACHE = os.getenv("HUGGINGFACE_HUB_CACHE", os.path.join(HF_HOME, "hub"))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", HUGGINGFACE_HUB_CACHE)
+
 class Config:
     # SearXNG配置
     SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080")

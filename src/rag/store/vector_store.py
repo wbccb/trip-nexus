@@ -1,21 +1,31 @@
 from typing import List, Dict, Any, Optional
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from src.config import Config
+from src.rag.module.intent_recognition import _get_sentence_transformer
 import logging
 import shutil
 import os
 
 logger = logging.getLogger(__name__)
 
+
+class _SentenceTransformerEmbeddings:
+    def __init__(self, model_name: str) -> None:
+        self._model = _get_sentence_transformer(model_name)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self._model.encode(texts, show_progress_bar=False).tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._model.encode([text], show_progress_bar=False)[0].tolist()
+
+
 class VectorStore:
     def __init__(self, collection_name: str = "web_search_cache"):
         self.config = Config()
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=self.config.SENTENCE_BERT_MODEL
-        )
+        self.embeddings = _SentenceTransformerEmbeddings(self.config.SENTENCE_BERT_MODEL)
         self.persist_directory = self.config.CHROMA_DB_PATH
         self.collection_name = collection_name
         self.vector_db = None

@@ -1,15 +1,31 @@
 import json
 from typing import Dict
+from functools import lru_cache
 from sentence_transformers import SentenceTransformer, util
 from langchain_core.prompts import ChatPromptTemplate
 
 from src.config import Config
 
+try:
+    import streamlit as st
+    _st_cache_resource = st.cache_resource
+except Exception:
+    _st_cache_resource = None
+
+if _st_cache_resource:
+    @_st_cache_resource
+    def _get_sentence_transformer(model_name: str) -> SentenceTransformer:
+        return SentenceTransformer(model_name)
+else:
+    @lru_cache(maxsize=1)
+    def _get_sentence_transformer(model_name: str) -> SentenceTransformer:
+        return SentenceTransformer(model_name)
+
 class IntentRecognizer:
     def __init__(self, llm):
         self.config = Config()
         self.llm = llm
-        self.intent_classifier = SentenceTransformer(self.config.SENTENCE_BERT_MODEL)
+        self.intent_classifier = _get_sentence_transformer(self.config.SENTENCE_BERT_MODEL)
 
         # 预定义的意图类别和示例
         # TODO: 初步简单处理，后续需要优化这部分的内置意图

@@ -10,10 +10,25 @@ from src.config import Config
 from src.utils.console import console_log
 
 
+@st.cache_resource
+def _get_config() -> Config:
+    return Config()
+
+
+@st.cache_resource
+def _get_map_renderer() -> TripMap:
+    return TripMap()
+
+
+@st.cache_resource
+def _get_llm_manager() -> LlmManager:
+    return LlmManager()
+
+
 def main() -> None:
-    config = Config()
-    map_renderer = TripMap()
-    llm_manager = LlmManager()
+    config = _get_config()
+    map_renderer = _get_map_renderer()
+    llm_manager = _get_llm_manager()
     # rag = AIRetrievalPipeline(llm)
     ui_manager = UIManager(llm_manager, config, map_renderer)
 

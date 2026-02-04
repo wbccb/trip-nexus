@@ -10,8 +10,7 @@ An AI-planned travel product
 3. llm: 根据用户的输入 + rag数据生成prompt，进行本地Ollama的模型调用
 4. map: 根据llm转化为地图数据进行Marker的添加显示 + 文字显示llm的行程规划列表
 
-
-### v0.0.2(开发中)
+### v0.0.2
 1. frontend: 实现前端对话式更新行程
 2. rag: 爬虫优化，提高数据采集稳定性
 3. llm: LLM 双模式支持（线上 + 本地）
@@ -32,6 +31,35 @@ pip install -r requirements.txt
 > 如果使用`PyCharm`，需要设置`Python Interpreter` -> `/xxxx/TripNexus/venv/bin/python`
 
 
+## 预下载 all-MiniLM-L6-v2（SentenceTransformer）
+
+1. 在项目内创建缓存目录
+
+```shell
+mkdir -p model_cache
+```
+
+4. 可选：显式设置缓存目录（如需自定义路径）
+
+```shell
+export MODEL_CACHE_DIR="$(pwd)/model_cache"
+```
+
+5. 触发预下载（会将 all-MiniLM-L6-v2 缓存到 model_cache）
+
+```shell
+PYTHONPATH=. python -c "from src.config import Config; from sentence_transformers import SentenceTransformer; SentenceTransformer(Config.SENTENCE_BERT_MODEL)"
+```
+
+6. 验证缓存目录（可选）
+
+```shell
+ls -la ./model_cache
+```
+
+
+
+
 ## 安装本地模型
 
 安装`Ollama`的`deepseek-r1:7b`并且运行模型
@@ -41,3 +69,4 @@ pip install -r requirements.txt
 ```shell
 streamlit run main.py
 ```
+

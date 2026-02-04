@@ -2,7 +2,8 @@ import logging
 import json
 import base64
 import hashlib
-from datetime import datetime, time
+from datetime import datetime
+import time as time_module
 from typing import Optional, Dict, List, Any
 
 import streamlit as st
@@ -19,6 +20,11 @@ from src.utils.console import console_log
 from src.agent.orchestrator import AgentOrchestrator
 from src.agent.event_bus import event_bus, snapshot_store
 from src.observability import ErrorCodes, normalize_exception, get_global_recorder
+
+@st.cache_resource(hash_funcs={LlmManager: lambda _: "llm_manager", TripMap: lambda _: "map_renderer"})
+def _get_agent_orchestrator(llm_manager: LlmManager, map_renderer: TripMap) -> AgentOrchestrator:
+    return AgentOrchestrator(llm_manager, map_renderer)
+
 
 class UIManager:
     def __init__(self, llm_manager: LlmManager, config: Config, map_renderer: TripMap | None = None):
@@ -40,7 +46,7 @@ class UIManager:
         self.chat_stream_renderer = ChatStreamRenderer(llm_manager)
         # 初始化全局指标记录器，用于 UI 链路的观测打点
         self._metrics = get_global_recorder()
-        self.agent_orchestrator = AgentOrchestrator(llm_manager, self.map_renderer)
+        self.agent_orchestrator = _get_agent_orchestrator(llm_manager, self.map_renderer)
 
     def _init_session_state(self) -> None:
         """
@@ -1333,7 +1339,7 @@ class UIManager:
                                 map_rendered_inline = True
                             last_event = event
                             if not event.get("is_final"):
-                                time.sleep(0.25)
+                                time_module.sleep(0.25)
                         if last_event and last_event.get("map_obj"):
                             st.session_state.map_obj = last_event.get("map_obj")
                             print("[DEBUG] Map object generated successfully")
