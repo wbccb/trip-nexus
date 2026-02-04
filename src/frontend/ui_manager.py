@@ -15,9 +15,19 @@ from src.frontend.context.storage import get_conversation_storage
 from src.llm.llm_manager import LlmManager
 from src.map.map_renderer import TripMap
 from src.utils.console import console_log
+from src.agent.orchestrator import AgentOrchestrator
+from src.agent.event_bus import event_bus, snapshot_store
 
 class UIManager:
     def __init__(self, llm_manager: LlmManager, config: Config, map_renderer: TripMap | None = None):
+        """
+        UI 管理器（Streamlit 页面入口）。
+
+        v0.0.3 新增能力：
+        - 注入 AgentOrchestrator，使侧边栏具备“可恢复的编排状态机”调试面板；
+        - 通过 EventBus/SnapshotStore 展示节点事件与快照时间线，方便定位 Planner/Checker/Optimizer/Map-RAG 的问题。
+        """
+
         st.set_page_config(page_title="TripNexus", layout="wide")
         self._init_session_state()
         self.llm_manager = llm_manager
@@ -26,10 +36,28 @@ class UIManager:
         self.map_renderer = map_renderer or TripMap()
         # 使用独立的流式渲染工具类，降低 UIManager 体积并复用逻辑
         self.chat_stream_renderer = ChatStreamRenderer(llm_manager)
+        self.agent_orchestrator = AgentOrchestrator(llm_manager, self.map_renderer)
 
     def _init_session_state(self) -> None:
-        """初始化会话状态"""
-        required_keys = {"trip_data", "map_obj", "edit_cmd", "current_conversation_id", "map_visible"}
+        """
+        初始化会话状态。
+
+        关键点：
+        - Streamlit 的 st.session_state 用于跨 rerun 保持交互状态；
+        - Agent 调试能力需要保存 thread_id、上次 state、输入文本与配置项，
+          以便用户多次点击“运行/继续/清空”时保持一致行为。
+        """
+        required_keys = {
+            "trip_data",
+            "map_obj",
+            "edit_cmd",
+            "current_conversation_id",
+            "map_visible",
+            "agent_thread_id",
+            "agent_last_state",
+            "agent_user_input",
+            "agent_config",
+        }
         for key in required_keys:
             if key not in st.session_state:
                 st.session_state[key] = None
@@ -59,6 +87,26 @@ class UIManager:
                 "generation_model_name": "deepseek-r1:7b",
                 "generation_api_key": "",
                 "generation_temperature": 0.7,
+            }
+        if st.session_state.get("agent_thread_id") is None:
+            st.session_state.agent_thread_id = ""
+        if st.session_state.get("agent_last_state") is None:
+            st.session_state.agent_last_state = {}
+        if st.session_state.get("agent_user_input") is None:
+            st.session_state.agent_user_input = ""
+        if st.session_state.get("agent_config") is None:
+            # Agent 配置是“控制平面”：决定编排链路是否启用某些节点，以及工具偏好参数等。
+            st.session_state.agent_config = {
+                "enable_checker": True,
+                "enable_optimizer": True,
+                "enable_rag": True,
+                "budget_cap": None,
+                "trip_density": "medium",
+                "prefer_indoor": False,
+                "poi_top_k": 5,
+                "poi_query": "热门景点",
+                "rag_top_k": 3,
+                "weather_days": 3,
             }
 
     def render_input_form(self) -> Optional[Dict[str, Any]]:
@@ -208,6 +256,14 @@ class UIManager:
                     return None
 
     def render_llm_settings(self) -> None:
+        """
+        渲染 LLM 设置面板。
+
+        说明：
+        - 该面板用于配置“两次调用”模型：第 1 次做分析（抽取实体/意图），第 2 次做生成（行程生成/修改）；
+        - AgentOrchestrator 内部复用同一个 LlmManager，因此此处配置更新后，Agent 调试面板也会同步生效。
+        """
+
         config = st.session_state.get("llm_config", {})
         provider_options = ["ollama", "openai_compatible"]
 
@@ -256,6 +312,153 @@ class UIManager:
                 "generation_temperature": generation_temperature,
             }
             self.llm_manager.update_llm_config(st.session_state.llm_config)
+
+    def render_agent_debug_panel(self) -> None:
+        """
+        渲染 Agent 调试面板（最小实现）。
+
+        面板能力：
+        1) 控制平面：配置链路开关（Checker/Optimizer/RAG）与参数（预算上限、密度、室内优先、工具偏好）；
+        2) 运行入口：触发 orchestrator.run_stream 执行一次链路；
+        3) 恢复入口：触发 orchestrator.resume_from_latest 从最近快照恢复；
+        4) 观测面板：展示 EventBus 的事件流与 SnapshotStore 的快照面板。
+        """
+
+        st.subheader("Agent 调试")
+        if not st.session_state.agent_thread_id:
+            # thread_id 是一次编排执行的会话指针：事件过滤、快照归属、恢复都依赖它
+            st.session_state.agent_thread_id = self.agent_orchestrator.create_thread_id()
+        thread_id = st.session_state.agent_thread_id
+        st.text_input("Thread ID", value=thread_id, key="agent_thread_display", disabled=True)
+
+        # 用户输入支持两种形态：
+        # 1) JSON：直接作为 user_input 传给 Orchestrator（例如 {"destination":"成都","days":3,"budget":5000}）
+        # 2) 纯文本：视为 destination 的快捷输入（例如 "成都"）
+        input_text = st.text_area("输入(JSON 或目的地文本)", value=st.session_state.agent_user_input or "", height=120)
+        st.session_state.agent_user_input = input_text
+
+        enable_checker = st.checkbox("启用 Checker", value=st.session_state.agent_config.get("enable_checker", True))
+        enable_optimizer = st.checkbox("启用 Optimizer", value=st.session_state.agent_config.get("enable_optimizer", True))
+        enable_rag = st.checkbox("启用 RAG", value=st.session_state.agent_config.get("enable_rag", True))
+
+        budget_cap_value = st.number_input(
+            "预算上限(0 为不限)",
+            min_value=0,
+            max_value=20000,
+            value=int(st.session_state.agent_config.get("budget_cap") or 0),
+        )
+        trip_density = st.selectbox(
+            "行程密度",
+            ["low", "medium", "high"],
+            index=["low", "medium", "high"].index(st.session_state.agent_config.get("trip_density", "medium")),
+        )
+        prefer_indoor = st.checkbox("室内优先", value=st.session_state.agent_config.get("prefer_indoor", False))
+
+        poi_top_k = st.number_input(
+            "POI 结果数量",
+            min_value=1,
+            max_value=10,
+            value=int(st.session_state.agent_config.get("poi_top_k") or 5),
+        )
+        weather_days = st.number_input(
+            "天气预报天数",
+            min_value=1,
+            max_value=7,
+            value=int(st.session_state.agent_config.get("weather_days") or 3),
+        )
+        rag_top_k = st.number_input(
+            "检索 TopK",
+            min_value=1,
+            max_value=10,
+            value=int(st.session_state.agent_config.get("rag_top_k") or 3),
+        )
+        poi_query = st.text_input("POI 查询关键词", value=st.session_state.agent_config.get("poi_query") or "热门景点")
+
+        pause_option = st.selectbox("暂停点", ["不暂停", "planner", "checker"], index=0)
+        pause_at = None if pause_option == "不暂停" else pause_option
+
+        st.session_state.agent_config = {
+            "enable_checker": enable_checker,
+            "enable_optimizer": enable_optimizer,
+            "enable_rag": enable_rag,
+            "budget_cap": None if budget_cap_value == 0 else budget_cap_value,
+            "trip_density": trip_density,
+            "prefer_indoor": prefer_indoor,
+            "poi_top_k": poi_top_k,
+            "poi_query": poi_query,
+            "rag_top_k": rag_top_k,
+            "weather_days": weather_days,
+        }
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            run_agent = st.button("运行 Agent", use_container_width=True)
+        with col2:
+            resume_agent = st.button("继续执行", use_container_width=True)
+        with col3:
+            clear_agent = st.button("清空事件", use_container_width=True)
+
+        if clear_agent:
+            # 清空只影响当前 thread_id 的事件与快照，避免污染其他会话
+            event_bus.clear(thread_id)
+            snapshot_store.clear(thread_id)
+
+        if run_agent:
+            # 为了让一次“运行”有完整的可视化链路，先清空旧事件与旧快照
+            event_bus.clear(thread_id)
+            snapshot_store.clear(thread_id)
+            user_input = {}
+            if input_text:
+                try:
+                    # 优先按 JSON 解析，失败则回退为 destination 文本
+                    user_input = json.loads(input_text)
+                except Exception:
+                    user_input = {"destination": input_text}
+            elif st.session_state.get("trip_data"):
+                # 若未输入，则尝试从已有 trip_data 自动构造一个最小 user_input
+                trip_data = st.session_state.get("trip_data") or {}
+                user_input = {
+                    "destination": trip_data.get("destination"),
+                    "days": trip_data.get("days"),
+                    "budget": trip_data.get("budget"),
+                }
+            # 执行编排：pause_at 可用于演示 HITL（在 planner/checker 结束后暂停）
+            state = self.agent_orchestrator.run_stream(
+                user_input=user_input,
+                thread_id=thread_id,
+                agent_config=st.session_state.agent_config,
+                context=None,
+                pause_at=pause_at,
+                resume_state=None,
+                retry_limit=1,
+            )
+            st.session_state.agent_last_state = state
+
+        if resume_agent:
+            # 从最近业务快照恢复执行：内部会复用已有 draft/constraints/optimized，快速跳过已完成步骤
+            state = self.agent_orchestrator.resume_from_latest(thread_id, st.session_state.agent_config)
+            if state:
+                st.session_state.agent_last_state = state
+
+        events = event_bus.list(thread_id)
+        if events:
+            st.markdown("#### 事件流")
+            for event in sorted(events, key=lambda e: e["ts"]):
+                ts = datetime.fromtimestamp(event["ts"]).strftime("%H:%M:%S")
+                node = event.get("node") or "-"
+                kind = event.get("kind")
+                detail_keys = ", ".join(list((event.get("detail") or {}).keys()))
+                st.markdown(f"- {ts} | {kind} | {node} | {detail_keys}")
+
+        snapshots = snapshot_store.list(thread_id)
+        if snapshots:
+            st.markdown("#### 快照面板")
+            for snap in snapshots:
+                ts = datetime.fromtimestamp(snap["ts"]).strftime("%H:%M:%S")
+                step = snap.get("step")
+                duration_ms = snap.get("duration_ms")
+                payload_keys = ", ".join(list((snap.get("payload") or {}).keys()))
+                st.markdown(f"- {ts} | {step} | {duration_ms}ms | {payload_keys}")
 
     def render_chat_interface(self, user_id: str, device_id: str, session_id: str) -> None:
         """渲染聊天界面，支持多轮对话"""
@@ -656,6 +859,8 @@ class UIManager:
             st.markdown("---")
             st.subheader("LLM 设置")
             self.render_llm_settings()
+            st.markdown("---")
+            self.render_agent_debug_panel()
 
         # 预加载 trip_data，确保界面渲染前数据已就绪
         if st.session_state.current_conversation_id and not st.session_state.get("trip_data"):
