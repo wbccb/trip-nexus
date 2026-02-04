@@ -533,7 +533,7 @@ class AgentOrchestrator:
         - trip_data：优先使用 optimized，其次回退到 draft；
         - 地图：调用 TripMap.render_map(trip_data)，并将渲染结果转为 HTML（供前端悬浮地图使用）；
         - RAG：若 enable_rag=True，则构造 destination 相关查询并走 AIRetrievalPipeline，
-          将 evidence.summary 与 answer 摘要写入 map_payload。
+          将 evidence（Summary/Body + Budget）与 answer 写入 map_payload，供前端做证据可视化与调试。
         """
 
         draft = state.get("draft") or {}
@@ -548,6 +548,9 @@ class AgentOrchestrator:
             destination = trip_data.get("destination") or state.get("user_input", {}).get("destination") or ""
             rag_query = agent_config.get("rag_query") or f"{destination} 行程 旅行 建议"
             rag_result = self.rag_pipeline.run(rag_query)
-            map_payload["evidence_summary"] = rag_result.get("evidence", {}).get("summary", {})
+            map_payload["rag_query"] = rag_query
             map_payload["rag_answer"] = rag_result.get("answer")
+            map_payload["rag_evidence"] = rag_result.get("evidence", {})
+            map_payload["evidence_summary"] = rag_result.get("evidence", {}).get("summary", {})
+            map_payload["rag_processing_time"] = rag_result.get("processing_time")
         return {"map_payload": map_payload}

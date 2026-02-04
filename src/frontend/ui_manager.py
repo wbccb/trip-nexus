@@ -1,6 +1,7 @@
 import logging
 import json
 import base64
+import hashlib
 from datetime import datetime, time
 from typing import Optional, Dict, List, Any
 
@@ -57,6 +58,7 @@ class UIManager:
             "agent_last_state",
             "agent_user_input",
             "agent_config",
+            "rag_evidence_ui",
         }
         for key in required_keys:
             if key not in st.session_state:
@@ -108,6 +110,288 @@ class UIManager:
                 "rag_top_k": 3,
                 "weather_days": 3,
             }
+
+        if st.session_state.get("rag_evidence_ui") is None:
+            st.session_state.rag_evidence_ui = {}
+
+    def _build_evidence_item_id(self, section: str, item: Dict[str, Any]) -> str:
+        """
+        为单条 Evidence 构建稳定 ID，便于在 Streamlit session_state 中保存交互状态。
+
+        说明：
+        - Evidence 可能来自联网搜索摘要或正文分块，字段并不完全一致；
+        - 为了让“勾选/置顶/编辑”在 rerun 后仍能对齐同一条证据，这里将若干关键字段做哈希。
+        """
+        source = str(item.get("source") or "")
+        title = str(item.get("title") or "")
+        text = str(item.get("text") or "")
+        raw = f"{section}||{source}||{title}||{text}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _get_rag_evidence_entries(self, evidence: Dict[str, Any], section: str) -> List[Dict[str, Any]]:
+        """
+        将 RAG evidence 的某个分区（summary/body）归一化为可渲染列表。
+
+        设计目标：
+        - 优先展示 candidates（可编辑、可筛选），以满足“手动编辑候选摘要”的需求；
+        - 若 candidates 为空，则回退到 items（管线已选入上下文的证据）。
+        """
+        section_payload = evidence.get(section) or {}
+        candidates = section_payload.get("candidates") or []
+        items = section_payload.get("items") or []
+        base_list = candidates if candidates else items
+        if not isinstance(base_list, list):
+            return []
+
+        normalized: List[Dict[str, Any]] = []
+        for it in base_list:
+            if not isinstance(it, dict):
+                continue
+            normalized.append(
+                {
+                    "id": self._build_evidence_item_id(section, it),
+                    "section": section,
+                    "type": it.get("type") or section,
+                    "source": it.get("source"),
+                    "engine": it.get("engine"),
+                    "title": it.get("title"),
+                    "text": it.get("text") or "",
+                    "confidence": it.get("confidence", it.get("score")),
+                    "timestamp": it.get("timestamp"),
+                    "_is_candidate": bool(candidates),
+                }
+            )
+        return normalized
+
+    def render_rag_evidence_panel(self, evidence: Dict[str, Any], panel_key: str) -> None:
+        """
+        渲染可交互的 RAG 证据面板（Summary/Body 分区 + 筛选/编辑/预算预警）。
+
+        功能覆盖：
+        - 证据结构：Summary/Body 分区展示，显示来源、置信度、时间戳与摘要文本；
+        - 交互能力：勾选保留、排序置顶、单条折叠/展开、手动编辑候选摘要；
+        - 预算提示：展示当前 Evidence Budget 使用量，并在超限时预警。
+        """
+        if not isinstance(evidence, dict) or not evidence:
+            st.info("暂无 RAG 证据可展示。")
+            return
+
+        ui_state: Dict[str, Any] = st.session_state.rag_evidence_ui.setdefault(panel_key, {})
+        defaults_applied_key = f"{panel_key}__defaults_applied"
+
+        summary_entries = self._get_rag_evidence_entries(evidence, "summary")
+        body_entries = self._get_rag_evidence_entries(evidence, "body")
+
+        summary_budget = int((evidence.get("summary") or {}).get("budget_chars") or 0)
+        body_budget = int((evidence.get("body") or {}).get("budget_chars") or 0)
+
+        all_entries = summary_entries + body_entries
+        if all_entries and not ui_state.get(defaults_applied_key):
+            selected_summary = (evidence.get("summary") or {}).get("items") or []
+            selected_body = (evidence.get("body") or {}).get("items") or []
+            selected_texts = set()
+            for it in selected_summary + selected_body:
+                if isinstance(it, dict) and it.get("text"):
+                    selected_texts.add(str(it.get("text")))
+            for entry in all_entries:
+                item_state = ui_state.setdefault(entry["id"], {})
+                if "keep" not in item_state:
+                    item_state["keep"] = entry.get("text") in selected_texts
+                if "pin" not in item_state:
+                    item_state["pin"] = False
+                if "edited_text" not in item_state:
+                    item_state["edited_text"] = entry.get("text") or ""
+            ui_state[defaults_applied_key] = True
+
+        with st.expander("RAG 证据面板（可筛选/编辑/预算预警）", expanded=False):
+            col_a, col_b, col_c = st.columns([1.1, 1, 1])
+            with col_a:
+                show_kept_only = st.checkbox("仅看已勾选", value=bool(ui_state.get("show_kept_only", False)), key=f"{panel_key}__kept_only")
+                ui_state["show_kept_only"] = show_kept_only
+            with col_b:
+                keyword = st.text_input("搜索（标题/文本/来源）", value=str(ui_state.get("keyword", "")), key=f"{panel_key}__keyword")
+                ui_state["keyword"] = keyword
+            with col_c:
+                min_conf = st.number_input(
+                    "最小置信度",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(ui_state.get("min_confidence", 0.0) or 0.0),
+                    step=0.05,
+                    key=f"{panel_key}__min_conf",
+                )
+                ui_state["min_confidence"] = float(min_conf)
+
+            def _passes_filters(entry: Dict[str, Any]) -> bool:
+                item_state = ui_state.get(entry["id"], {})
+                if ui_state.get("show_kept_only") and not item_state.get("keep", False):
+                    return False
+                conf = entry.get("confidence")
+                if conf is not None:
+                    try:
+                        if float(conf) < float(ui_state.get("min_confidence") or 0.0):
+                            return False
+                    except Exception:
+                        pass
+                kw = (ui_state.get("keyword") or "").strip().lower()
+                if kw:
+                    hay = " ".join(
+                        [
+                            str(entry.get("title") or ""),
+                            str(entry.get("text") or ""),
+                            str(entry.get("source") or ""),
+                            str(entry.get("engine") or ""),
+                        ]
+                    ).lower()
+                    if kw not in hay:
+                        return False
+                return True
+
+            def _sort_key(entry: Dict[str, Any]):
+                item_state = ui_state.get(entry["id"], {})
+                pin = 1 if item_state.get("pin") else 0
+                conf = entry.get("confidence")
+                try:
+                    conf_val = float(conf) if conf is not None else -1.0
+                except Exception:
+                    conf_val = -1.0
+                ts = str(entry.get("timestamp") or "")
+                return (-pin, -conf_val, ts)
+
+            def _render_entries(entries: List[Dict[str, Any]], budget_chars: int) -> None:
+                visible_entries = [e for e in entries if _passes_filters(e)]
+                visible_entries.sort(key=_sort_key)
+
+                used_chars = 0
+                for e in entries:
+                    item_state = ui_state.get(e["id"], {})
+                    if not item_state.get("keep"):
+                        continue
+                    used_chars += len(str(item_state.get("edited_text") or ""))
+
+                if budget_chars > 0:
+                    st.markdown(f"**Evidence Budget**：{used_chars}/{budget_chars} chars")
+                    progress = min(max(used_chars / budget_chars, 0.0), 1.0) if budget_chars else 0.0
+                    st.progress(progress)
+                    if used_chars > budget_chars:
+                        st.warning("Evidence Budget 已超限：建议取消勾选或缩短编辑内容。")
+                else:
+                    st.markdown(f"**Evidence Budget**：{used_chars} chars")
+
+                st.markdown(f"**候选条目**：{len(visible_entries)}/{len(entries)}")
+
+                for idx, entry in enumerate(visible_entries):
+                    item_state = ui_state.setdefault(entry["id"], {})
+                    title = str(entry.get("title") or "").strip()
+                    source = str(entry.get("source") or "").strip()
+                    engine = str(entry.get("engine") or "").strip()
+                    confidence = entry.get("confidence")
+                    timestamp = str(entry.get("timestamp") or "").strip()
+
+                    header_bits = []
+                    if title:
+                        header_bits.append(title[:60])
+                    if confidence is not None:
+                        header_bits.append(f"conf={confidence}")
+                    if timestamp:
+                        header_bits.append(f"ts={timestamp}")
+                    header = " | ".join(header_bits) if header_bits else f"Evidence {idx + 1}"
+
+                    with st.expander(header, expanded=False):
+                        col1, col2, col3 = st.columns([0.7, 0.6, 1.7])
+                        with col1:
+                            item_state["keep"] = st.checkbox(
+                                "勾选保留",
+                                value=bool(item_state.get("keep", False)),
+                                key=f"{panel_key}__keep__{entry['id']}",
+                            )
+                            item_state["pin"] = st.checkbox(
+                                "置顶",
+                                value=bool(item_state.get("pin", False)),
+                                key=f"{panel_key}__pin__{entry['id']}",
+                            )
+                        with col2:
+                            st.markdown(f"**分区**：{entry.get('section')}")
+                            if confidence is not None:
+                                st.markdown(f"**置信度**：{confidence}")
+                            if timestamp:
+                                st.markdown(f"**时间戳**：{timestamp}")
+                        with col3:
+                            if source:
+                                st.markdown(f"**来源**：[{source}]({source})")
+                            if engine:
+                                st.markdown(f"**搜索源**：{engine}")
+
+                        item_state["edited_text"] = st.text_area(
+                            "摘要文本（可编辑）",
+                            value=str(item_state.get("edited_text") or entry.get("text") or ""),
+                            height=120 if entry.get("section") == "summary" else 180,
+                            key=f"{panel_key}__edit__{entry['id']}",
+                        )
+
+            tab_summary, tab_body = st.tabs(["Summary", "Body"])
+            with tab_summary:
+                _render_entries(summary_entries, summary_budget)
+            with tab_body:
+                _render_entries(body_entries, body_budget)
+
+            st.divider()
+            st.markdown("#### 基于用户选择生成回答")
+            default_question = str(evidence.get("_query") or ui_state.get("question") or "").strip()
+            question = st.text_area(
+                "问题（将使用你勾选/编辑后的证据作为参考信息）",
+                value=default_question,
+                height=80,
+                key=f"{panel_key}__user_question",
+            )
+            ui_state["question"] = question
+
+            def _build_selected_context_text() -> str:
+                selected_summary: List[str] = []
+                for entry in summary_entries:
+                    item_state = ui_state.get(entry["id"], {})
+                    if not item_state.get("keep"):
+                        continue
+                    text = str(item_state.get("edited_text") or "").strip()
+                    if text:
+                        selected_summary.append(text)
+
+                selected_body: List[str] = []
+                for entry in body_entries:
+                    item_state = ui_state.get(entry["id"], {})
+                    if not item_state.get("keep"):
+                        continue
+                    text = str(item_state.get("edited_text") or "").strip()
+                    if text:
+                        selected_body.append(text)
+
+                summary_text = "\n".join([f"- {t}" for t in selected_summary]) if selected_summary else "无"
+                body_text = "\n\n".join(selected_body) if selected_body else "无"
+                return f"【摘要证据】\n{summary_text}\n\n【正文证据】\n{body_text}"
+
+            col_x, col_y = st.columns([1, 2])
+            with col_x:
+                regenerate = st.button("用已选证据生成回答", use_container_width=True, key=f"{panel_key}__regen_answer")
+            with col_y:
+                st.caption("说明：勾选/编辑会影响这里的回答；不会回写到检索/抓取阶段。")
+
+            if regenerate:
+                context_text = _build_selected_context_text()
+                q = (question or "").strip() or "请基于参考信息给出结论。"
+                prompt_text = (
+                    "基于以下参考信息回答用户的问题。如果参考信息不足以回答问题，请说明。\n\n"
+                    f"参考信息：\n{context_text}\n\n"
+                    f"用户问题：\n{q}\n\n"
+                    "回答："
+                )
+                llm = self.llm_manager.get_llm()
+                response = llm.invoke(prompt_text)
+                answer_text = response.content if hasattr(response, "content") else response
+                ui_state["user_selected_answer"] = str(answer_text).strip()
+
+            if ui_state.get("user_selected_answer"):
+                st.markdown("**回答（基于用户选择证据生成）**")
+                st.markdown(str(ui_state.get("user_selected_answer")))
 
     def render_input_form(self) -> Optional[Dict[str, Any]]:
         """渲染输入表单，返回结构化参数"""
@@ -439,6 +723,27 @@ class UIManager:
             state = self.agent_orchestrator.resume_from_latest(thread_id, st.session_state.agent_config)
             if state:
                 st.session_state.agent_last_state = state
+
+        last_state = st.session_state.agent_last_state or {}
+        if isinstance(last_state, dict):
+            map_payload = last_state.get("map_payload") or {}
+            if isinstance(map_payload, dict):
+                rag_answer = map_payload.get("rag_answer")
+                if rag_answer:
+                    st.markdown("#### RAG 回答")
+                    st.markdown(str(rag_answer))
+
+                rag_query = map_payload.get("rag_query")
+                rag_evidence = (
+                    map_payload.get("rag_evidence")
+                    or map_payload.get("evidence")
+                    or map_payload.get("rag_result", {}).get("evidence")
+                )
+                if isinstance(rag_evidence, dict) and rag_evidence:
+                    evidence_view = dict(rag_evidence)
+                    if rag_query:
+                        evidence_view["_query"] = rag_query
+                    self.render_rag_evidence_panel(evidence_view, panel_key=f"agent::{thread_id}")
 
         events = event_bus.list(thread_id)
         if events:

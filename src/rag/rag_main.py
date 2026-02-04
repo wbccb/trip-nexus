@@ -71,6 +71,12 @@ class AIRetrievalPipeline:
     def _build_summary_section(self, filtered_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         构建 Summary Evidence：按 Top K + token字符预算截断（两个条件都得满足），提供去重后的候选清单。
+
+        输出字段约定（供前端证据可视化使用）：
+        - source：原始 URL
+        - engine：搜索引擎/来源标识（如 searxng 返回的 engine）
+        - confidence/score：重排/相关度分数（0-1 之间时可视为置信度）
+        - timestamp：搜索结果发布时间（如 searxng publishedDate），可能为空
         """
         summary_items = []
         summary_candidates = []
@@ -89,19 +95,28 @@ class AIRetrievalPipeline:
             if not combined or key in seen:
                 continue
             seen.add(key)
+            confidence = r.get("score")
+            timestamp = r.get("timestamp")
             summary_candidates.append({
                 "type": "summary",
                 "source": r.get("url"),
+                "engine": r.get("source"),
                 "title": title,
                 "text": combined,
-                "score": r.get("score")
+                "score": confidence,
+                "confidence": confidence,
+                "timestamp": timestamp,
             })
             if used + len(combined) > budget or len(summary_items) >= top_k:
                 continue
             summary_items.append({
                 "source": r.get("url"),
+                "engine": r.get("source"),
                 "title": title,
-                "text": combined
+                "text": combined,
+                "score": confidence,
+                "confidence": confidence,
+                "timestamp": timestamp,
             })
             used += len(combined)
         return {
@@ -114,6 +129,10 @@ class AIRetrievalPipeline:
     def _build_body_section(self, relevant_docs: List[Any]) -> Dict[str, Any]:
         """
         构建 Body Evidence：候选段落去重后按 Top N 选取，超长段落自动摘要并裁剪预算。
+
+        说明：
+        - Body Evidence 主要来自抓取正文的相似度检索结果；
+        - confidence/score/timestamp/engine 等信息来自写入向量库时的 metadata（按 URL 回填）。
         """
         candidates = []
         selected = []
@@ -132,11 +151,16 @@ class AIRetrievalPipeline:
                 continue
             seen.add(key)
             meta = doc.metadata or {}
+            confidence = meta.get("score")
+            timestamp = meta.get("timestamp")
             candidates.append({
                 "type": "body",
                 "source": meta.get("source"),
                 "title": meta.get("title"),
-                "text": text
+                "text": text,
+                "score": confidence,
+                "confidence": confidence,
+                "timestamp": timestamp,
             })
         for cand in candidates:
             if len(selected) >= top_n:
@@ -158,7 +182,10 @@ class AIRetrievalPipeline:
             selected.append({
                 "source": cand.get("source"),
                 "title": cand.get("title"),
-                "text": content
+                "text": content,
+                "score": cand.get("score"),
+                "confidence": cand.get("confidence"),
+                "timestamp": cand.get("timestamp"),
             })
             used += len(content)
         return {
@@ -237,11 +264,30 @@ class AIRetrievalPipeline:
         if crawled_contents:
             # 存入向量数据库
             # 将抓取的内容转为 Document 格式
+            url_meta: Dict[str, Dict[str, Any]] = {}
+            for r in filtered_results:
+                url = r.get("url")
+                if not url:
+                    continue
+                # 用 URL 作为 key，把“摘要检索阶段”的元信息回填到正文证据上，
+                # 以满足前端“来源/置信度/时间戳”统一展示的需求。
+                url_meta[str(url)] = {
+                    "score": r.get("score"),
+                    "timestamp": r.get("timestamp"),
+                    "engine": r.get("source"),
+                }
             documents = []
             for content in crawled_contents:
+                meta = url_meta.get(str(content.get("url") or ""), {})
                 documents.append({
                     "content": content["content"],
-                    "metadata": {"source": content["url"], "title": content["title"]}
+                    "metadata": {
+                        "source": content["url"],
+                        "title": content["title"],
+                        "score": meta.get("score"),
+                        "timestamp": meta.get("timestamp"),
+                        "engine": meta.get("engine"),
+                    }
                 })
             self.vector_store.add_documents(documents)
             
