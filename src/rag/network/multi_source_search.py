@@ -1,17 +1,29 @@
 from src.config import Config
 from src.rag.module.intent_recognition import IntentRecognizer
 import requests
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from urllib.parse import unquote
+from src.observability import CircuitBreaker, MetricsRecorder, ErrorCodes, build_error_payload, normalize_exception, get_global_recorder
 
 logger = logging.getLogger(__name__)
 
 class MultiSourceSearcher:
     def __init__(self, llm):
+        # 初始化配置参数
         self.config = Config()
+        # 初始化意图识别器
         self.intent_recognizer = IntentRecognizer(llm)
+        # 初始化熔断器，用于避免持续访问异常实例
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=self.config.SEARCH_CIRCUIT_FAILURE_THRESHOLD,
+            cooldown_seconds=self.config.SEARCH_CIRCUIT_COOLDOWN_SECONDS,
+        )
+        # 初始化指标记录器
+        self._metrics = get_global_recorder()
         # 备用公共实例列表，当配置的实例不可用时尝试
         self.fallback_urls = [
             "https://searx.be",
@@ -37,7 +49,10 @@ class MultiSourceSearcher:
         """
         根据意图选择不同的搜索策略进行搜索
         """
-        results = []
+        # 记录搜索开始时间
+        start_ts = time.time()
+        # 初始化结果列表
+        results: List[Dict[str, Any]] = []
 
         # 1. SearXNG基础搜索
         searxng_results = self._search_searxng(query, intent_info)
@@ -45,11 +60,14 @@ class MultiSourceSearcher:
 
         # 2. 根据意图类型添加特定来源 (Reserved for future expansion)
 
+        # 记录搜索完成耗时
+        elapsed_ms = int((time.time() - start_ts) * 1000)
+        self._metrics.record("search_complete", {"elapsed_ms": elapsed_ms, "results": len(results)})
         sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)
 
         return sorted_results[:self.config.SEARCH_RESULTS_COUNT]
 
-    def _search_duckduckgo_fallback(self, query: str) -> List[Dict[str, any]]:
+    def _search_duckduckgo_fallback(self, query: str) -> List[Dict[str, Any]]:
         """
         作为最后的备选，直接抓取 DuckDuckGo HTML 版
         """
@@ -62,7 +80,7 @@ class MultiSourceSearcher:
         
         try:
             logger.info("Fallback to DuckDuckGo HTML search...")
-            response = requests.post(url, data=data, headers=headers, timeout=15)
+            response = requests.post(url, data=data, headers=headers, timeout=self.config.SEARCH_INSTANCE_TIMEOUT_SECONDS)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -98,13 +116,17 @@ class MultiSourceSearcher:
                         break
             
             logger.info(f"DuckDuckGo fallback retrieved {len(results)} results")
+            # 记录 fallback 成功指标
+            self._metrics.record("search_fallback_success", {"engine": "duckduckgo_html", "results": len(results)})
             return results
             
         except Exception as e:
             logger.error(f"DuckDuckGo fallback failed: {e}")
+            # 记录 fallback 失败指标
+            self._metrics.record("search_fallback_failed", {"engine": "duckduckgo_html", "error": str(e)})
             return []
 
-    def _search_searxng(self, query: str, intent_info: Dict[str, any]) -> List[Dict[str, any]]:
+    def _search_searxng(self, query: str, intent_info: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         使用SearXNG进行基础搜索，支持故障转移
         """
@@ -146,53 +168,104 @@ class MultiSourceSearcher:
             if fallback not in candidate_urls:
                 candidate_urls.append(fallback)
 
-        for base_url in candidate_urls:
-            try:
-                # 构造完整URL
-                if not base_url.endswith("/search"):
-                    url = f"{base_url}/search"
-                else:
-                    url = base_url
-
-                logger.info(f"Trying SearXNG instance: {base_url}")
-                # 某些实例需要Cookie或Referer，这里简单模拟
-                response = requests.get(url, params=params, headers=headers, timeout=10)
-                
-                if response.status_code == 200:
-                    try:
-                        data = response.json()
-                        search_results = data.get("results", [])
-                        
-                        if not search_results:
-                            logger.warning(f"No results from {base_url}, trying next...")
-                            continue # 结果为空可能也是实例问题，尝试下一个
-                            
-                        processed_results = []
-                        for result in search_results:
-                            processed_results.append({
-                                'title': result.get('title', ''),
-                                'url': result.get('url', ''),
-                                'content_snippet': result.get('content', ''),
-                                'source': result.get('engine', 'unknown'),
-                                'score': result.get('score', 0.5) or 0.5,
-                                'timestamp': result.get('publishedDate', ''),
-                                'type': 'web'
-                            })
-                        
-                        logger.info(f"Successfully retrieved {len(processed_results)} results from {base_url}")
-                        return processed_results
-                    except ValueError: # JSONDecodeError
-                         logger.warning(f"SearXNG {base_url} returned invalid JSON")
-                         continue
-                else:
-                    logger.warning(f"SearXNG {base_url} returned status {response.status_code}")
-            
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"SearXNG request failed for {base_url}: {e}")
-                continue
-            except Exception as e:
-                logger.error(f"Error processing results from {base_url}: {e}")
-                continue
+        # 并发尝试候选实例，先成功先返回
+        return self._search_searxng_concurrent(candidate_urls, params, headers)
         
+    def _search_searxng_concurrent(
+        self,
+        candidate_urls: List[str],
+        params: Dict[str, Any],
+        headers: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        # 记录开始时间，用于全局超时控制
+        start_ts = time.time()
+        # 过滤掉熔断中的实例
+        filtered_urls = [u for u in candidate_urls if self._circuit_breaker.allow(u)]
+        # 若全部熔断则直接进入 fallback
+        if not filtered_urls:
+            logger.error("All SearXNG instances are circuit-open. Trying DuckDuckGo fallback...")
+            return self._search_duckduckgo_fallback(params.get("q") or "")
+        # 限制并发数量
+        concurrency = max(1, int(self.config.SEARCH_INSTANCE_CONCURRENCY))
+        # 逐个提交并发任务
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            future_to_url = {}
+            for base_url in filtered_urls:
+                future = executor.submit(self._fetch_searxng, base_url, params, headers)
+                future_to_url[future] = base_url
+            # 按完成顺序处理
+            for future in as_completed(future_to_url):
+                base_url = future_to_url[future]
+                # 检查全局超时
+                if (time.time() - start_ts) > self.config.SEARCH_GLOBAL_TIMEOUT_SECONDS:
+                    logger.warning("SearXNG global timeout reached, aborting remaining instances")
+                    self._metrics.record("search_timeout", {"scope": "global"})
+                    break
+                try:
+                    results = future.result(timeout=self.config.SEARCH_INSTANCE_TIMEOUT_SECONDS)
+                    # 成功拿到结果则立即返回
+                    if results:
+                        return results
+                except Exception as e:
+                    logger.warning(f"SearXNG instance failed: {base_url}, error={e}")
+                    self._circuit_breaker.record_failure(base_url)
+                    self._metrics.record("search_instance_failed", {"base_url": base_url, "error": str(e)})
+                    continue
         logger.error("All SearXNG instances failed. Trying DuckDuckGo fallback...")
-        return self._search_duckduckgo_fallback(query)
+        return self._search_duckduckgo_fallback(params.get("q") or "")
+
+    def _fetch_searxng(
+        self,
+        base_url: str,
+        params: Dict[str, Any],
+        headers: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        # 构造完整URL
+        if not base_url.endswith("/search"):
+            url = f"{base_url}/search"
+        else:
+            url = base_url
+        # 记录实例尝试日志
+        logger.info(f"Trying SearXNG instance: {base_url}")
+        # 发起请求，使用实例超时配置
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=self.config.SEARCH_INSTANCE_TIMEOUT_SECONDS,
+        )
+        # 非 200 直接返回失败
+        if response.status_code != 200:
+            logger.warning(f"SearXNG {base_url} returned status {response.status_code}")
+            self._circuit_breaker.record_failure(base_url)
+            self._metrics.record("search_instance_failed", {"base_url": base_url, "status": response.status_code})
+            return []
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.warning(f"SearXNG {base_url} returned invalid JSON")
+            self._circuit_breaker.record_failure(base_url)
+            self._metrics.record("search_instance_failed", {"base_url": base_url, "error": "invalid_json"})
+            return []
+        search_results = data.get("results", [])
+        if not search_results:
+            logger.warning(f"No results from {base_url}, trying next...")
+            self._circuit_breaker.record_failure(base_url)
+            self._metrics.record("search_instance_failed", {"base_url": base_url, "error": "empty_results"})
+            return []
+        processed_results = []
+        for result in search_results:
+            processed_results.append({
+                'title': result.get('title', ''),
+                'url': result.get('url', ''),
+                'content_snippet': result.get('content', ''),
+                'source': result.get('engine', 'unknown'),
+                'score': result.get('score', 0.5) or 0.5,
+                'timestamp': result.get('publishedDate', ''),
+                'type': 'web'
+            })
+        # 记录实例成功指标
+        self._circuit_breaker.record_success(base_url)
+        self._metrics.record("search_instance_success", {"base_url": base_url, "results": len(processed_results)})
+        logger.info(f"Successfully retrieved {len(processed_results)} results from {base_url}")
+        return processed_results

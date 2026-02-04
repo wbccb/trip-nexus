@@ -15,6 +15,11 @@ from src.llm.tools.weather_tool import get_daily_weather
 from src.llm.tools.geo_tool import geocode_address
 from src.llm.tools.poi_tool import search_poi
 from src.llm.streaming_adapter import LlmStreamingAdapter
+from src.observability import (
+    ErrorCodes,
+    normalize_exception,
+    get_global_recorder,
+)
 
 
 class DailyPlanItem(BaseModel):
@@ -77,6 +82,9 @@ class LlmManager:
         )
         self._poi_searcher = MultiSourceSearcher(self.analysis_llm)
         self._register_default_tools()
+        # 初始化全局指标记录器，统一采集 LLM 相关的链路指标
+        self._metrics = get_global_recorder()
+        # 初始化流式适配器，用于统一 stream/invoke 行为
         self._streaming_adapter = LlmStreamingAdapter()
 
     def _create_llm(self, cfg: Dict[str, Any]):
@@ -333,8 +341,51 @@ class LlmManager:
         返回：
             增量文本片段迭代器，由 LlmStreamingAdapter 统一处理流式与降级逻辑。
         """
+        # 根据角色选择对应的模型实例
         llm = self.generation_llm if llm_role == "generation" else self.analysis_llm
-        return self._streaming_adapter.stream_llm_text(llm, prompt)
+        # 记录流式调用开始时间，便于统计耗时
+        start_ts = datetime.now()
+        # 记录流式输出累计字符数
+        output_chars = 0
+        # 记录流式调用开始指标
+        self._metrics.record(
+            "llm_stream_start",
+            {"role": llm_role, "prompt_len": len(prompt)},
+        )
+
+        # 定义包装生成器，用于统计输出长度与异常指标
+        def _stream_wrapper() -> Iterable[str]:
+            nonlocal output_chars
+            try:
+                # 透传适配器输出的增量文本
+                for delta in self._streaming_adapter.stream_llm_text(llm, prompt):
+                    # 累积输出字符数
+                    output_chars += len(str(delta))
+                    # 向上游输出增量内容
+                    yield delta
+                # 记录流式结束指标
+                elapsed_ms = int((datetime.now() - start_ts).total_seconds() * 1000)
+                self._metrics.record(
+                    "llm_stream_end",
+                    {"role": llm_role, "elapsed_ms": elapsed_ms, "output_len": output_chars},
+                )
+            except Exception as exc:
+                # 生成统一错误 payload，便于观测与 UI 提示
+                error_payload = normalize_exception(
+                    exc,
+                    code=ErrorCodes.LLM_FAILED,
+                    source="llm_stream",
+                )
+                # 记录流式失败指标
+                self._metrics.record(
+                    "llm_stream_error",
+                    {"role": llm_role, "error": error_payload},
+                )
+                # 向上抛出异常，交由上层处理
+                raise
+
+        # 返回包装后的生成器
+        return _stream_wrapper()
 
     def build_trip_prompt(
         self,
@@ -941,6 +992,12 @@ class LlmManager:
 
         for attempt in range(2):
             try:
+                # 记录本次行程生成尝试的开始指标
+                self._metrics.record(
+                    "llm_generate_trip_start",
+                    {"attempt": attempt + 1, "prompt_len": len(prompt)},
+                )
+                # 记录尝试开始时间，用于计算耗时
                 start_ts = datetime.now()
                 print(f"[{_ts()}][LlmManager] 第{attempt + 1}次行程生成调用开始")
                 raw_response = self.generation_llm.invoke(prompt)
@@ -957,6 +1014,11 @@ class LlmManager:
 
                 cost = (datetime.now() - start_ts).total_seconds()
                 print(f"[{_ts()}][LlmManager] 第{attempt + 1}次生成成功，耗时 {cost:.2f}s")
+                # 记录生成成功指标，补充耗时与输出长度
+                self._metrics.record(
+                    "llm_generate_trip_success",
+                    {"attempt": attempt + 1, "elapsed_ms": int(cost * 1000), "output_len": len(str(response_text))},
+                )
 
                 # 🌟 Pydantic V2 安全处理：
                 # 如果返回的是 Pydantic 实例，使用 .model_dump() 转换为 dict
@@ -972,6 +1034,17 @@ class LlmManager:
             except Exception as e:
                 cost = (datetime.now() - start_ts).total_seconds()
                 print(f"[{_ts()}][LlmManager] 第{attempt + 1}次生成失败，耗时 {cost:.2f}s，错误={str(e)}")
+                # 构造统一错误 payload，便于 UI 与日志消费
+                error_payload = normalize_exception(
+                    e,
+                    code=ErrorCodes.LLM_FAILED,
+                    source="llm_generate_trip",
+                )
+                # 记录生成失败指标，附带标准化错误信息
+                self._metrics.record(
+                    "llm_generate_trip_error",
+                    {"attempt": attempt + 1, "elapsed_ms": int(cost * 1000), "error": error_payload},
+                )
                 if attempt == 1:
                     return None
 
@@ -986,6 +1059,12 @@ class LlmManager:
         print(f"[{_ts()}][LlmManager] analyze_user_message 构建完成，query={query}")
 
         try:
+            # 记录意图分析调用开始指标
+            self._metrics.record(
+                "llm_analyze_start",
+                {"prompt_len": len(analysis_prompt), "context_size": len(context or [])},
+            )
+            # 记录调用开始时间，用于后续统计耗时
             start_ts = datetime.now()
             print(f"[{_ts()}][LlmManager] analyze_user_message LLM 调用开始")
             raw_analysis_response = self.analysis_llm.invoke(analysis_prompt)
@@ -999,9 +1078,25 @@ class LlmManager:
 
             intent_data = self._parse_intent(analysis_response)
             print(f"[{_ts()}][LlmManager] analyze_user_message 解析出的意图数据={intent_data}")
+            # 记录意图分析成功指标
+            self._metrics.record(
+                "llm_analyze_success",
+                {"elapsed_ms": int(cost * 1000), "output_len": len(str(analysis_response))},
+            )
             return intent_data
         except Exception as e:
             print(f"[{_ts()}][LlmManager] analyze_user_message 调用或解析失败: {str(e)}")
+            # 构造统一错误 payload，便于 UI 与日志消费
+            error_payload = normalize_exception(
+                e,
+                code=ErrorCodes.LLM_FAILED,
+                source="llm_analyze_user_message",
+            )
+            # 记录意图分析失败指标，附带标准化错误信息
+            self._metrics.record(
+                "llm_analyze_error",
+                {"error": error_payload},
+            )
             return self._get_default_intent()
 
     def change_trip(self, query: str, context: List[Dict[str, str]] = None, current_trip: Dict = None) -> Dict[str, Any]:

@@ -18,6 +18,7 @@ from src.map.map_renderer import TripMap
 from src.utils.console import console_log
 from src.agent.orchestrator import AgentOrchestrator
 from src.agent.event_bus import event_bus, snapshot_store
+from src.observability import ErrorCodes, normalize_exception, get_global_recorder
 
 class UIManager:
     def __init__(self, llm_manager: LlmManager, config: Config, map_renderer: TripMap | None = None):
@@ -37,6 +38,8 @@ class UIManager:
         self.map_renderer = map_renderer or TripMap()
         # 使用独立的流式渲染工具类，降低 UIManager 体积并复用逻辑
         self.chat_stream_renderer = ChatStreamRenderer(llm_manager)
+        # 初始化全局指标记录器，用于 UI 链路的观测打点
+        self._metrics = get_global_recorder()
         self.agent_orchestrator = AgentOrchestrator(llm_manager, self.map_renderer)
 
     def _init_session_state(self) -> None:
@@ -765,6 +768,36 @@ class UIManager:
                 payload_keys = ", ".join(list((snap.get("payload") or {}).keys()))
                 st.markdown(f"- {ts} | {step} | {duration_ms}ms | {payload_keys}")
 
+    def _handle_chat_error(self, error: Exception, chat_placeholder) -> None:
+        """
+        统一处理聊天链路异常，输出用户可见提示与观测指标。
+        """
+        # 生成统一错误 payload，便于 UI 展示与后续排查
+        error_payload = normalize_exception(
+            error,
+            code=ErrorCodes.UNEXPECTED_ERROR,
+            source="ui_chat",
+        )
+        # 记录 UI 链路异常指标
+        self._metrics.record("ui_chat_error", {"error": error_payload})
+        # 构造用户可见的错误提示文本
+        error_message = f"系统处理失败（{error_payload.get('code')}）：{error_payload.get('message')}"
+        # 通过 Streamlit 提示用户
+        st.error(error_message)
+        # 追加一条助手错误消息到聊天历史，保证 UI 可见反馈
+        assistant_msg = {
+            "role": MessageType.ASSISTANT,
+            "content": error_message,
+            "timestamp": datetime.now().isoformat(),
+            "metadata": {"error": True, "error_payload": error_payload},
+        }
+        # 写入会话消息列表，维持对话一致性
+        st.session_state.chat_history.append(assistant_msg)
+        # 标记 AI 处理结束，避免输入被锁死
+        st.session_state.ai_processing = False
+        # 刷新聊天区域显示当前历史记录
+        chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
+
     def render_chat_interface(self, user_id: str, device_id: str, session_id: str) -> None:
         """渲染聊天界面，支持多轮对话"""
         if not st.session_state.trip_data:
@@ -790,134 +823,175 @@ class UIManager:
             prompt = st.chat_input("告诉我您想如何调整行程？")
 
         if prompt:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            start_ts = datetime.now()
-            print(f"[{ts}][UIManager] chat_submit start, session_id={session_id}, prompt_len={len(prompt)}")
-            user_msg = {"role": MessageType.USER, "content": prompt, "timestamp": datetime.now().isoformat(), "metadata": {}}
-            st.session_state.chat_history.append(user_msg)
-            user_message_obj = Message.model_validate(user_msg)
-            temp_loading = {
-                "role": MessageType.ASSISTANT,
-                "content": "",
-                "timestamp": datetime.now().isoformat(),
-                "metadata": {"loading": True},
-            }
-            loading_messages = st.session_state.chat_history + [temp_loading]
-            st.session_state.ai_processing = True
-            chat_placeholder.markdown(build_chat_html(loading_messages), unsafe_allow_html=True)
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] analyze_user_message start")
-            intent_data = self.llm_manager.analyze_user_message(
-                query=prompt,
-                context=st.session_state.chat_history,
-                current_trip=st.session_state.trip_data,
-            )
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] analyze_user_message end, intent={intent_data.get('intent')}")
-            self.conversation_manager.process_new_message(
-                user_id,
-                device_id,
-                user_message_obj,
-                session_id,
-                intent_data=intent_data,
-            )
-            intent_type = intent_data.get("intent", "general_conversation")
-            response_stream = None
-            trip_streaming_request = None
-            if intent_type == "generate_trip":
-                prepared_request = self.llm_manager.prepare_trip_request_from_intent(
-                    intent_data,
-                    st.session_state.chat_history,
+            try:
+                # 记录聊天提交开始时间与日志
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                start_ts = datetime.now()
+                print(f"[{ts}][UIManager] chat_submit start, session_id={session_id}, prompt_len={len(prompt)}")
+                # 记录 UI 链路的开始指标
+                self._metrics.record("ui_chat_start", {"session_id": session_id, "prompt_len": len(prompt)})
+                # 组织用户消息结构
+                user_msg = {"role": MessageType.USER, "content": prompt, "timestamp": datetime.now().isoformat(), "metadata": {}}
+                # 写入聊天历史
+                st.session_state.chat_history.append(user_msg)
+                # 转换为消息对象用于后续存储
+                user_message_obj = Message.model_validate(user_msg)
+                # 构造加载中占位消息
+                temp_loading = {
+                    "role": MessageType.ASSISTANT,
+                    "content": "",
+                    "timestamp": datetime.now().isoformat(),
+                    "metadata": {"loading": True},
+                }
+                # 追加加载中消息用于即时渲染
+                loading_messages = st.session_state.chat_history + [temp_loading]
+                # 设置处理中状态，避免重复提交
+                st.session_state.ai_processing = True
+                # 先渲染加载中视图
+                chat_placeholder.markdown(build_chat_html(loading_messages), unsafe_allow_html=True)
+                # 调用 LLM 进行意图识别与参数抽取
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] analyze_user_message start")
+                intent_data = self.llm_manager.analyze_user_message(
+                    query=prompt,
+                    context=st.session_state.chat_history,
+                    current_trip=st.session_state.trip_data,
                 )
-                if prepared_request.get("needs_more_info"):
-                    missing_info = prepared_request.get("missing_info", [])
-                    response_data = {
-                        "response": f"我需要更多信息才能为您生成行程。请提供以下信息：{', '.join(missing_info)}。例如：'我想去成都玩3天，预算5000元'",
-                        "trip_data": None,
-                    }
+                # 打印意图识别结果
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] analyze_user_message end, intent={intent_data.get('intent')}")
+                # 写入用户消息与意图数据到会话管理
+                self.conversation_manager.process_new_message(
+                    user_id,
+                    device_id,
+                    user_message_obj,
+                    session_id,
+                    intent_data=intent_data,
+                )
+                # 获取意图类型，默认走普通对话
+                intent_type = intent_data.get("intent", "general_conversation")
+                # 初始化流式输出变量
+                response_stream = None
+                # 初始化行程流式请求缓存
+                trip_streaming_request = None
+                # 根据意图分支处理逻辑
+                if intent_type == "generate_trip":
+                    # 准备行程生成所需参数
+                    prepared_request = self.llm_manager.prepare_trip_request_from_intent(
+                        intent_data,
+                        st.session_state.chat_history,
+                    )
+                    # 若缺少必要信息，提示用户补充
+                    if prepared_request.get("needs_more_info"):
+                        missing_info = prepared_request.get("missing_info", [])
+                        response_data = {
+                            "response": f"我需要更多信息才能为您生成行程。请提供以下信息：{', '.join(missing_info)}。例如：'我想去成都玩3天，预算5000元'",
+                            "trip_data": None,
+                        }
+                    else:
+                        # 启动行程生成流式调用
+                        trip_streaming_request = prepared_request
+                        response_stream = self.llm_manager.stream_trip_generation(
+                            prepared_request.get("user_input") or {},
+                            prepared_request.get("context_texts") or [],
+                        )
+                        response_data = {
+                            "response": "",
+                            "trip_data": None,
+                        }
+                elif intent_type in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
+                    # 仅在已有行程时支持修改类意图
+                    if st.session_state.trip_data:
+                        response_data = self.llm_manager._handle_trip_modification(intent_data, st.session_state.trip_data, st.session_state.chat_history)
+                    else:
+                        response_data = {
+                            "response": "我需要先为您生成一个基础行程，然后才能进行调整。请先提供目的地、天数和预算信息。",
+                            "trip_data": None,
+                        }
                 else:
-                    trip_streaming_request = prepared_request
-                    response_stream = self.llm_manager.stream_trip_generation(
-                        prepared_request.get("user_input") or {},
-                        prepared_request.get("context_texts") or [],
+                    # 普通对话走聊天流式输出
+                    response_stream = self.llm_manager.stream_chat_response(
+                        prompt,
+                        st.session_state.chat_history,
+                        st.session_state.trip_data,
                     )
                     response_data = {
                         "response": "",
                         "trip_data": None,
                     }
-            elif intent_type in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
-                if st.session_state.trip_data:
-                    response_data = self.llm_manager._handle_trip_modification(intent_data, st.session_state.trip_data, st.session_state.chat_history)
+                # 统一提取回复文本
+                if isinstance(response_data, dict) and "response" in response_data:
+                    chat_response = response_data["response"]
                 else:
-                    response_data = {
-                        "response": "我需要先为您生成一个基础行程，然后才能进行调整。请先提供目的地、天数和预算信息。",
-                        "trip_data": None,
+                    chat_response = str(response_data)
+                # 初始化行程结果
+                trip_data = None
+                # 处理流式输出
+                if response_stream is not None:
+                    chat_response = self.chat_stream_renderer.render_stream_response(
+                        chat_response,
+                        st.session_state.chat_history,
+                        chat_placeholder,
+                        response_stream=response_stream,
+                    )
+                    # 若是行程流式生成，则解析行程数据
+                    if trip_streaming_request is not None:
+                        trip_data = self.llm_manager.parse_trip_from_response_text(chat_response)
+                        if trip_data:
+                            st.session_state.trip_data = trip_data
+                            st.session_state.map_obj = None
+                            self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
+                else:
+                    # 非流式输出直接渲染
+                    self.chat_stream_renderer.render_stream_response(
+                        chat_response,
+                        st.session_state.chat_history,
+                        chat_placeholder,
+                        response_stream=None,
+                    )
+                    # 若返回包含行程数据，则写入状态
+                    if isinstance(response_data, dict) and "trip_data" in response_data:
+                        trip_data = response_data["trip_data"]
+                        if trip_data:
+                            st.session_state.trip_data = trip_data
+                            st.session_state.map_obj = None
+                            self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
+                # 组织助手回复消息
+                assistant_msg = {
+                    "role": MessageType.ASSISTANT,
+                    "content": chat_response,
+                    "timestamp": datetime.now().isoformat(),
+                    "metadata": {
+                        "context_type": "trip_modification",
+                        "conversation_id": st.session_state.current_conversation_id,
+                        "has_trip_data": bool(trip_data),
+                        "trip_data": trip_data
                     }
-            else:
-                response_stream = self.llm_manager.stream_chat_response(
-                    prompt,
-                    st.session_state.chat_history,
-                    st.session_state.trip_data,
-                )
-                response_data = {
-                    "response": "",
-                    "trip_data": None,
                 }
-            if isinstance(response_data, dict) and "response" in response_data:
-                chat_response = response_data["response"]
-            else:
-                chat_response = str(response_data)
-            trip_data = None
-            if response_stream is not None:
-                chat_response = self.chat_stream_renderer.render_stream_response(
-                    chat_response,
-                    st.session_state.chat_history,
-                    chat_placeholder,
-                    response_stream=response_stream,
-                )
-                if trip_streaming_request is not None:
-                    trip_data = self.llm_manager.parse_trip_from_response_text(chat_response)
-                    if trip_data:
-                        st.session_state.trip_data = trip_data
-                        st.session_state.map_obj = None
-                        self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
-            else:
-                self.chat_stream_renderer.render_stream_response(
-                    chat_response,
-                    st.session_state.chat_history,
-                    chat_placeholder,
-                    response_stream=None,
-                )
-                if isinstance(response_data, dict) and "trip_data" in response_data:
-                    trip_data = response_data["trip_data"]
-                    if trip_data:
-                        st.session_state.trip_data = trip_data
-                        st.session_state.map_obj = None
-                        self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
-            assistant_msg = {
-                "role": MessageType.ASSISTANT,
-                "content": chat_response,
-                "timestamp": datetime.now().isoformat(),
-                "metadata": {
-                    "context_type": "trip_modification",
-                    "conversation_id": st.session_state.current_conversation_id,
-                    "has_trip_data": bool(trip_data),
-                    "trip_data": trip_data
-                }
-            }
-            st.session_state.chat_history.append(assistant_msg)
-            assistant_message_obj = Message.model_validate(assistant_msg)
-            # AI消息进行处理：主要是压缩多轮对话消息 + 存储会话信息到数据库中
-            self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
-            total_cost = (datetime.now() - start_ts).total_seconds()
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] chat_submit end, total_cost={total_cost:.2f}s")
-            # 显示AI消息到界面中
-            chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
-            st.session_state.ai_processing = False
-            st.rerun()
-            if trip_data:
-                st.divider()
-                st.markdown("### 🎯 为您生成的行程方案")
-                self._display_trip_in_chat(trip_data)
-                st.success("✨ 行程已生成！右侧地图和详细安排已更新。")
+                # 追加助手消息到历史记录
+                st.session_state.chat_history.append(assistant_msg)
+                # 转换为消息对象用于持久化
+                assistant_message_obj = Message.model_validate(assistant_msg)
+                # AI消息进行处理：主要是压缩多轮对话消息 + 存储会话信息到数据库中
+                self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
+                # 计算总耗时并记录日志
+                total_cost = (datetime.now() - start_ts).total_seconds()
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] chat_submit end, total_cost={total_cost:.2f}s")
+                # 记录 UI 链路成功指标
+                self._metrics.record("ui_chat_success", {"session_id": session_id, "elapsed_ms": int(total_cost * 1000)})
+                # 显示AI消息到界面中
+                chat_placeholder.markdown(build_chat_html(st.session_state.chat_history), unsafe_allow_html=True)
+                # 解除处理中状态
+                st.session_state.ai_processing = False
+                # 触发刷新
+                st.rerun()
+                # 若生成行程则展示提示
+                if trip_data:
+                    st.divider()
+                    st.markdown("### 🎯 为您生成的行程方案")
+                    self._display_trip_in_chat(trip_data)
+                    st.success("✨ 行程已生成！右侧地图和详细安排已更新。")
+            except Exception as exc:
+                # 捕获异常并统一处理 UI 错误提示与指标
+                self._handle_chat_error(exc, chat_placeholder)
 
     def render_map_panel(self) -> None:
         st.subheader("🗺️ 行程地图", divider="blue")
