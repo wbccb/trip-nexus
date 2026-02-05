@@ -95,7 +95,7 @@ class ConversationManager:
             # 3. 调用 LLM，启用 JSON Mode
             start_ts = _dt.now()
             print(
-                f"[{_ts()}][ConversationManager] extract_core_entities LLM 调用开始, "
+                f"[{_ts()}][ConversationManager] 抽取实体=> LLM 调用开始, "
                 f"message_len={len(new_message)}, existing_entities_present={bool(existing_entities)}"
             )
             raw_response = self.llm_manager.get_analysis_llm().invoke(prompt)
@@ -104,7 +104,7 @@ class ConversationManager:
             else:
                 response_text = raw_response
             cost = (_dt.now() - start_ts).total_seconds()
-            print(f"[{_ts()}][ConversationManager] extract_core_entities LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response_text))}")
+            print(f"[{_ts()}][ConversationManager] 抽取实体=> LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response_text))}")
 
             # 4. 解析 LLM 返回的 JSON
             # 考虑到某些 LLM 可能会返回带有 Markdown 标签的字符串，进行简单清洗
@@ -116,12 +116,12 @@ class ConversationManager:
                 if json_match:
                     clean_response = json_match.group(0)
                 else:
-                    print(f"[{_ts()}][ConversationManager] extract_core_entities 未找到可解析 JSON，跳过更新")
+                    print(f"[{_ts()}][ConversationManager] 抽取实体 未找到可解析 JSON，跳过更新")
                     return existing_entities
 
             extracted_data = json.loads(clean_response)
 
-            print(f"[{_ts()}][ConversationManager] extract_core_entities 解析完成，keys={list(extracted_data.keys())}")
+            print(f"[{_ts()}][ConversationManager] 抽取实体=> 解析完成，keys={list(extracted_data.keys())}")
 
             # 5. 增量更新逻辑
             # 使用 model_copy 进行浅拷贝，避免修改原始对象
@@ -203,14 +203,14 @@ class ConversationManager:
         try:
             # 使用 invoke 方法替代不存在的 generate 方法
             start_ts = _dt.now()
-            print(f"[{_ts()}][ConversationManager] generate_summary LLM 调用开始, message_count={len(messages)}")
+            print(f"[{_ts()}][ConversationManager] 概要生成 LLM 调用开始, message_count={len(messages)}")
             raw_response = self.llm_manager.get_analysis_llm().invoke(prompt)
             if hasattr(raw_response, "content"):
                 response = raw_response.content
             else:
                 response = raw_response
             cost = (_dt.now() - start_ts).total_seconds()
-            print(f"[{_ts()}][ConversationManager] generate_summary LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response))}")
+            print(f"[{_ts()}][ConversationManager] 概要生成 LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response))}")
             
             # 清理 <think> 标签及其内容
             clean_response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
@@ -292,7 +292,10 @@ class ConversationManager:
     ) -> SessionContext:
         """处理新消息，更新上下文"""
 
-        print(f"[{_ts()}][ConversationManager] process_new_message start, role={message.role}, user_id={user_id}, device_id={device_id}, session_id={session_id}")
+        if message.role == "user":
+                print(f"[{_ts()}][ConversationManager] 用户消息【实体抽取+意图识别结束】,准备将用户消息添加到会话历史中, user_id={user_id}, device_id={device_id}, session_id={session_id}")
+        else:
+                print(f"[{_ts()}][ConversationManager] AI大模型生成结束，准备将AI消息存入存储中")
 
         # 1. 获取或创建会话上下文
         # session_id = self.conversationStorage.generate_session_id(user_id, device_id)
@@ -361,7 +364,7 @@ class ConversationManager:
             # 4. 增量提取核心实体（如果不是冗余信息）
             if not message.is_redundant:
                 start_ts = _dt.now()
-                print(f"[{_ts()}][ConversationManager] 开始提取出实体数据, has_intent_data={bool(intent_data)}")
+                print(f"[{_ts()}][ConversationManager] 核心实体结束了，开始增量覆盖已经存在的实体, has_intent_data={bool(intent_data)}")
                 if intent_data:
                     context.core_entities = self.merge_core_entities_from_intent_data(intent_data, existing_entities)
                 else:
@@ -378,10 +381,11 @@ class ConversationManager:
         context.message_count += 1
         context.last_active = datetime.now()
 
-        print(f"[{_ts()}][ConversationManager] 添加新消息到短期窗口后的数量为: {context.message_count}")
+        print(f"[{_ts()}][ConversationManager] 添加新消息到short_term_messages后的数量为: {context.message_count}")
 
         # 6. 检查是否需要压缩早期对话
         if context.message_count > 10:
+            print("早期会话数量超过10，准备开始压缩最早的会话消息，不然下次上下文会爆炸")
             context.long_term_summary = self.compress_early_messages(context)
 
         # 7. 更新短期存储
@@ -390,7 +394,11 @@ class ConversationManager:
         # 8. 存储数据到数据库中
         self.conversationStorage.store_session_chat(session_id, message.model_dump_json())
 
-        print(f"[{_ts()}][ConversationManager] process_new_message end, role={message.role}, total_count={context.message_count}")
+        if message.role == "user":
+            print(f"[{_ts()}][ConversationManager] 处理用户消息（更新上下文）结束=======, role={message.role}, total_count={context.message_count}")
+            print("\n")
+        else:
+            print(f"[{_ts()}][ConversationManager] 处理AI消息（更新上下文）结束=======, role={message.role}, total_count={context.message_count}")
 
         return context
 

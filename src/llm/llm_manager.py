@@ -88,12 +88,12 @@ class LlmManager:
         self._streaming_adapter = LlmStreamingAdapter()
 
     def _create_llm(self, cfg: Dict[str, Any]):
-        provider = cfg.get("provider") or "ollama"
-        model_name = cfg.get("model_name") or "deepseek-r1:7b"
-        base_url = cfg.get("base_url") or "http://localhost:11434"
-        temperature = cfg.get("temperature") or 0.7
+        provider = cfg.get("provider") or "ollama"  # 读取提供方配置，缺省为 ollama
+        model_name = cfg.get("model_name") or "deepseek-r1:7b"  # 读取模型名称，缺省为 deepseek-r1:7b
+        base_url = cfg.get("base_url") or "http://localhost:11434"  # 读取 Base URL，缺省为本地 Ollama
+        temperature = cfg.get("temperature") or 0.7  # 读取温度参数，缺省为 0.7
 
-        if provider == "openai_compatible":
+        if provider == "openai_compatible":  # 仅当 provider 为 openai_compatible 时进入该分支
             try:
                 from langchain_openai import ChatOpenAI  # 延迟导入，避免不兼容版本在启动时崩溃
             except ImportError as e:
@@ -102,22 +102,22 @@ class LlmManager:
                     "请升级相关依赖或切换 provider=ollama。"
                 ) from e
 
-            api_key = cfg.get("api_key") or ""
-            print(f"[{_ts()}][LlmManager] 初始化 OpenAI 兼容模型: {model_name} @ {base_url}")
-            return ChatOpenAI(
-                model=model_name,
-                api_key=api_key,
-                base_url=base_url,
-                temperature=temperature,
+            api_key = cfg.get("api_key") or ""  # 读取 API Key，缺省为空字符串
+            print(f"[{_ts()}][LlmManager] 初始化 OpenAI 兼容模型: {model_name} @ {base_url}")  # 记录初始化日志
+            return ChatOpenAI(  # 创建 OpenAI 兼容模型实例
+                model=model_name,  # 模型名称
+                api_key=api_key,  # API Key
+                base_url=base_url,  # 远端 Base URL（/v1）
+                temperature=temperature,  # 温度参数
             )
 
-        print(f"[{_ts()}][LlmManager] 初始化 Ollama 模型: {model_name} @ {base_url}")
-        return OllamaLLM(
-            base_url=base_url,
-            model=model_name,
-            temperature=temperature,
-            num_ctx=4096,
-            timeout=300,
+        print(f"[{_ts()}][LlmManager] 初始化 Ollama 模型: {model_name} @ {base_url}")  # 记录 Ollama 初始化日志
+        return OllamaLLM(  # 创建 Ollama 模型实例
+            base_url=base_url,  # Ollama Base URL
+            model=model_name,  # 模型名称
+            temperature=temperature,  # 温度参数
+            num_ctx=4096,  # 上下文长度
+            timeout=300,  # 请求超时
         )
 
     def update_llm_config(self, config: Dict[str, Any]) -> None:
@@ -330,7 +330,7 @@ class LlmManager:
         """
         return self._streaming_adapter.build_stream_events_from_stream(stream, message_id)
 
-    def stream_llm_text(self, prompt: str, llm_role: str = "generation") -> Iterable[str]:
+    def stream_llm_text(self, prompt: str, llm_role: str = "generation", stage: str = "stream") -> Iterable[str]:
         """
         使用大模型原生 stream 输出文本增量，失败时由适配器降级为一次性 invoke。
 
@@ -352,39 +352,41 @@ class LlmManager:
             "llm_stream_start",
             {"role": llm_role, "prompt_len": len(prompt)},
         )
+        cfg = self._generation_config if llm_role == "generation" else self._analysis_config
+        request_id = f"{llm_role}-{start_ts.strftime('%H%M%S%f')}"
+        print(
+            f"[{_ts()}][LlmManager] llm_http_request_start stage={stage} role={llm_role} "
+            f"provider={cfg.get('provider')} base_url={cfg.get('base_url')} model={cfg.get('model_name')} "
+            f"request_id={request_id}"
+        )
 
-        # 定义包装生成器，用于统计输出长度与异常指标
         def _stream_wrapper() -> Iterable[str]:
             nonlocal output_chars
             try:
-                # 透传适配器输出的增量文本
                 for delta in self._streaming_adapter.stream_llm_text(llm, prompt):
-                    # 累积输出字符数
                     output_chars += len(str(delta))
-                    # 向上游输出增量内容
                     yield delta
-                # 记录流式结束指标
                 elapsed_ms = int((datetime.now() - start_ts).total_seconds() * 1000)
                 self._metrics.record(
                     "llm_stream_end",
                     {"role": llm_role, "elapsed_ms": elapsed_ms, "output_len": output_chars},
                 )
+                print(
+                    f"[{_ts()}][LlmManager] llm_http_request_end stage={stage} role={llm_role} "
+                    f"elapsed_ms={elapsed_ms} output_len={output_chars} request_id={request_id}"
+                )
             except Exception as exc:
-                # 生成统一错误 payload，便于观测与 UI 提示
                 error_payload = normalize_exception(
                     exc,
                     code=ErrorCodes.LLM_FAILED,
                     source="llm_stream",
                 )
-                # 记录流式失败指标
                 self._metrics.record(
                     "llm_stream_error",
                     {"role": llm_role, "error": error_payload},
                 )
-                # 向上抛出异常，交由上层处理
                 raise
 
-        # 返回包装后的生成器
         return _stream_wrapper()
 
     def build_trip_prompt(
@@ -461,7 +463,7 @@ class LlmManager:
             可迭代的文本增量流。
         """
         prompt = self.build_trip_prompt(user_input, context, edit_cmd)
-        return self.stream_llm_text(prompt, llm_role="generation")
+        return self.stream_llm_text(prompt, llm_role="generation", stage="trip_generation_stream")
 
     def prepare_trip_request_from_intent(
         self,
@@ -620,7 +622,7 @@ class LlmManager:
             大模型流式输出的增量文本迭代器。
         """
         prompt = self._build_chat_prompt(query, context, current_trip)
-        return self.stream_llm_text(prompt, llm_role="generation")
+        return self.stream_llm_text(prompt, llm_role="generation", stage="chat_response_stream")
 
     def decide_tool_call(self, query: str, context: Optional[List[Any]] = None) -> Dict[str, Any]:
         """使用分析模型进行工具路由决策，返回 needs_tool/tool_name/params。"""
@@ -1000,6 +1002,13 @@ class LlmManager:
                 # 记录尝试开始时间，用于计算耗时
                 start_ts = datetime.now()
                 print(f"[{_ts()}][LlmManager] 第{attempt + 1}次行程生成调用开始")
+                request_id = f"generation-{start_ts.strftime('%H%M%S%f')}"
+                cfg = self._generation_config
+                print(
+                    f"[{_ts()}][LlmManager] llm_http_request_start stage=trip_generation_invoke role=generation "
+                    f"provider={cfg.get('provider')} base_url={cfg.get('base_url')} model={cfg.get('model_name')} "
+                    f"request_id={request_id} attempt={attempt + 1}"
+                )
                 raw_response = self.generation_llm.invoke(prompt)
                 if hasattr(raw_response, "content"):
                     response_text = raw_response.content
@@ -1013,6 +1022,10 @@ class LlmManager:
                 trip_data = self.parser.parse(clean_response)
 
                 cost = (datetime.now() - start_ts).total_seconds()
+                print(
+                    f"[{_ts()}][LlmManager] llm_http_request_end stage=trip_generation_invoke role=generation "
+                    f"elapsed_s={cost:.2f} response_len={len(str(response_text))} request_id={request_id} attempt={attempt + 1}"
+                )
                 print(f"[{_ts()}][LlmManager] 第{attempt + 1}次生成成功，耗时 {cost:.2f}s")
                 # 记录生成成功指标，补充耗时与输出长度
                 self._metrics.record(
@@ -1056,7 +1069,7 @@ class LlmManager:
     ) -> Dict[str, Any]:
         """仅做第 1 次调用：实体抽取 + 意图识别"""
         analysis_prompt = self._build_analysis_prompt(query, context, current_trip)
-        print(f"[{_ts()}][LlmManager] analyze_user_message 构建完成，query={query}")
+        print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 prompt 构建完成，query={query}")
 
         try:
             # 记录意图分析调用开始指标
@@ -1066,7 +1079,8 @@ class LlmManager:
             )
             # 记录调用开始时间，用于后续统计耗时
             start_ts = datetime.now()
-            print(f"[{_ts()}][LlmManager] analyze_user_message LLM 调用开始")
+            print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 => LLM 调用开始")
+            request_id = f"analysis-{start_ts.strftime('%H%M%S%f')}"
             raw_analysis_response = self.analysis_llm.invoke(analysis_prompt)
             if hasattr(raw_analysis_response, "content"):
                 analysis_response = raw_analysis_response.content
@@ -1074,10 +1088,10 @@ class LlmManager:
                 analysis_response = raw_analysis_response
 
             cost = (datetime.now() - start_ts).total_seconds()
-            print(f"[{_ts()}][LlmManager] analyze_user_message LLM 调用结束，耗时 {cost:.2f}s，原始响应长度={len(str(analysis_response))}")
+            print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 LLM 调用结束，耗时 {cost:.2f}s，原始响应长度={len(str(analysis_response))}")
 
             intent_data = self._parse_intent(analysis_response)
-            print(f"[{_ts()}][LlmManager] analyze_user_message 解析出的意图数据={intent_data}")
+            print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 解析出的意图数据={intent_data}")
             # 记录意图分析成功指标
             self._metrics.record(
                 "llm_analyze_success",

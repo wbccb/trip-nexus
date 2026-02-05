@@ -37,8 +37,9 @@ class UIManager:
         """
 
         st.set_page_config(page_title="TripNexus", layout="wide")
-        self._init_session_state()
+        self.config = config
         self.llm_manager = llm_manager
+        self._init_session_state()
         self.conversation_storage = get_conversation_storage(config)
         self.conversation_manager = ConversationManager(conversation_storage=self.conversation_storage, llm_manager=llm_manager)
         self.map_renderer = map_renderer or TripMap()
@@ -82,22 +83,23 @@ class UIManager:
             st.session_state["map_visible"] = True
 
         if "llm_config" not in st.session_state:
+            cfg = self.config
             st.session_state.llm_config = {
-                "provider": "ollama",
-                "base_url": "http://localhost:11434",
-                "model_name": "deepseek-r1:7b",
-                "api_key": "",
-                "temperature": 0.7,
-                "analysis_provider": "ollama",
-                "analysis_base_url": "http://localhost:11434",
-                "analysis_model_name": "deepseek-r1:7b",
-                "analysis_api_key": "",
-                "analysis_temperature": 0.7,
-                "generation_provider": "ollama",
-                "generation_base_url": "http://localhost:11434",
-                "generation_model_name": "deepseek-r1:7b",
-                "generation_api_key": "",
-                "generation_temperature": 0.7,
+                "provider": cfg.GENERATION_PROVIDER,
+                "base_url": cfg.GENERATION_BASE_URL,
+                "model_name": cfg.GENERATION_MODEL_NAME,
+                "api_key": cfg.GENERATION_API_KEY,
+                "temperature": cfg.GENERATION_TEMPERATURE,
+                "analysis_provider": cfg.ANALYSIS_PROVIDER,
+                "analysis_base_url": cfg.ANALYSIS_BASE_URL,
+                "analysis_model_name": cfg.ANALYSIS_MODEL_NAME,
+                "analysis_api_key": cfg.ANALYSIS_API_KEY,
+                "analysis_temperature": cfg.ANALYSIS_TEMPERATURE,
+                "generation_provider": cfg.GENERATION_PROVIDER,
+                "generation_base_url": cfg.GENERATION_BASE_URL,
+                "generation_model_name": cfg.GENERATION_MODEL_NAME,
+                "generation_api_key": cfg.GENERATION_API_KEY,
+                "generation_temperature": cfg.GENERATION_TEMPERATURE,
             }
         if st.session_state.get("agent_thread_id") is None:
             st.session_state.agent_thread_id = ""
@@ -560,30 +562,96 @@ class UIManager:
         config = st.session_state.get("llm_config", {})
         provider_options = ["ollama", "openai_compatible"]
 
-        analysis_provider_current = config.get("analysis_provider", "ollama")
+        analysis_provider_current = config.get("analysis_provider", self.config.ANALYSIS_PROVIDER or "ollama")
         analysis_provider_index = provider_options.index(analysis_provider_current) if analysis_provider_current in provider_options else 0
         analysis_provider = st.selectbox("第 1 次调用-模型提供方（实体抽取+意图识别）", provider_options, index=analysis_provider_index)
-        analysis_base_url_default = config.get("analysis_base_url") or ("http://localhost:11434" if analysis_provider == "ollama" else "")
-        analysis_model_default = config.get("analysis_model_name") or ("deepseek-r1:7b" if analysis_provider == "ollama" else "")
-        analysis_base_url = st.text_input("第 1 次调用-Base URL", analysis_base_url_default)
-        analysis_model_name = st.text_input("第 1 次调用-模型名称", analysis_model_default)
+        analysis_base_url_default = config.get("analysis_base_url") or (
+            self.config.ANALYSIS_BASE_URL if analysis_provider == "ollama" else ""
+        )
+        analysis_model_default = config.get("analysis_model_name") or (
+            self.config.ANALYSIS_MODEL_NAME if analysis_provider == "ollama" else ""
+        )
+        if analysis_provider == "ollama":
+            # 使用分析阶段配置中的 Base URL 列表渲染下拉选择
+            analysis_base_urls = getattr(self.config, "ANALYSIS_BASE_URL_OPTIONS", []) or [
+                analysis_base_url_default or self.config.ANALYSIS_BASE_URL
+            ]
+            if analysis_base_url_default in analysis_base_urls:
+                analysis_base_url_index = analysis_base_urls.index(analysis_base_url_default)
+            else:
+                analysis_base_url_index = 0
+            analysis_base_url = st.selectbox(
+                "第 1 次调用-Base URL（Ollama）",
+                analysis_base_urls,
+                index=analysis_base_url_index,
+            )
+        else:
+            # 非 Ollama 场景仍然保留自由输入能力
+            analysis_base_url = st.text_input("第 1 次调用-Base URL", analysis_base_url_default)
+        if analysis_provider == "ollama":
+            # 使用分析阶段配置中的模型名称列表渲染下拉选择
+            analysis_models = getattr(self.config, "ANALYSIS_MODEL_NAME_OPTIONS", []) or [analysis_model_default]
+            if analysis_model_default in analysis_models:
+                analysis_model_index = analysis_models.index(analysis_model_default)
+            else:
+                analysis_model_index = 0
+            analysis_model_name = st.selectbox(
+                "第 1 次调用-模型名称（Ollama）",
+                analysis_models,
+                index=analysis_model_index,
+            )
+        else:
+            analysis_model_name = st.text_input("第 1 次调用-模型名称", analysis_model_default)
         analysis_api_key_value = config.get("analysis_api_key") or ""
         if analysis_provider == "openai_compatible":
             analysis_api_key_value = st.text_input("第 1 次调用-API Key", analysis_api_key_value, type="password")
-        analysis_temperature_value = float(config.get("analysis_temperature", 0.7))
+        analysis_temperature_value = float(config.get("analysis_temperature", self.config.ANALYSIS_TEMPERATURE or 0.7))
         analysis_temperature = st.slider("第 1 次调用-温度", 0.0, 1.0, analysis_temperature_value, 0.05)
 
-        generation_provider_current = config.get("generation_provider", "ollama")
+        generation_provider_current = config.get("generation_provider", self.config.GENERATION_PROVIDER or "ollama")
         generation_provider_index = provider_options.index(generation_provider_current) if generation_provider_current in provider_options else 0
         generation_provider = st.selectbox("第 2 次调用-模型提供方（行程生成/修改）", provider_options, index=generation_provider_index)
-        generation_base_url_default = config.get("generation_base_url") or ("http://localhost:11434" if generation_provider == "ollama" else "")
-        generation_model_default = config.get("generation_model_name") or ("deepseek-r1:7b" if generation_provider == "ollama" else "")
-        generation_base_url = st.text_input("第 2 次调用-Base URL", generation_base_url_default)
-        generation_model_name = st.text_input("第 2 次调用-模型名称", generation_model_default)
+        generation_base_url_default = config.get("generation_base_url") or (
+            self.config.GENERATION_BASE_URL if generation_provider == "ollama" else ""
+        )
+        generation_model_default = config.get("generation_model_name") or (
+            self.config.GENERATION_MODEL_NAME if generation_provider == "ollama" else ""
+        )
+        if generation_provider == "ollama":
+            # 使用生成阶段配置中的 Base URL 列表渲染下拉选择
+            generation_base_urls = getattr(self.config, "GENERATION_BASE_URL_OPTIONS", []) or [
+                generation_base_url_default or self.config.GENERATION_BASE_URL
+            ]
+            if generation_base_url_default in generation_base_urls:
+                generation_base_url_index = generation_base_urls.index(generation_base_url_default)
+            else:
+                generation_base_url_index = 0
+            generation_base_url = st.selectbox(
+                "第 2 次调用-Base URL（Ollama）",
+                generation_base_urls,
+                index=generation_base_url_index,
+            )
+        else:
+            # 非 Ollama 场景仍然保留自由输入能力
+            generation_base_url = st.text_input("第 2 次调用-Base URL", generation_base_url_default)
+        if generation_provider == "ollama":
+            # 使用生成阶段配置中的模型名称列表渲染下拉选择
+            generation_models = getattr(self.config, "GENERATION_MODEL_NAME_OPTIONS", []) or [generation_model_default]
+            if generation_model_default in generation_models:
+                generation_model_index = generation_models.index(generation_model_default)
+            else:
+                generation_model_index = 0
+            generation_model_name = st.selectbox(
+                "第 2 次调用-模型名称（Ollama）",
+                generation_models,
+                index=generation_model_index,
+            )
+        else:
+            generation_model_name = st.text_input("第 2 次调用-模型名称", generation_model_default)
         generation_api_key_value = config.get("generation_api_key") or ""
         if generation_provider == "openai_compatible":
             generation_api_key_value = st.text_input("第 2 次调用-API Key", generation_api_key_value, type="password")
-        generation_temperature_value = float(config.get("generation_temperature", 0.7))
+        generation_temperature_value = float(config.get("generation_temperature", self.config.GENERATION_TEMPERATURE or 0.7))
         generation_temperature = st.slider("第 2 次调用-温度", 0.0, 1.0, generation_temperature_value, 0.05)
 
         if st.button("应用 LLM 配置", use_container_width=True):
@@ -856,14 +924,14 @@ class UIManager:
                 # 先渲染加载中视图
                 chat_placeholder.markdown(build_chat_html(loading_messages), unsafe_allow_html=True)
                 # 调用 LLM 进行意图识别与参数抽取
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] analyze_user_message start")
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 实体抽取+意图识别 start")
                 intent_data = self.llm_manager.analyze_user_message(
                     query=prompt,
                     context=st.session_state.chat_history,
                     current_trip=st.session_state.trip_data,
                 )
                 # 打印意图识别结果
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] analyze_user_message end, intent={intent_data.get('intent')}")
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 实体抽取+意图识别 end, intent={intent_data.get('intent')}")
                 # 写入用户消息与意图数据到会话管理
                 self.conversation_manager.process_new_message(
                     user_id,
@@ -872,6 +940,9 @@ class UIManager:
                     session_id,
                     intent_data=intent_data,
                 )
+
+                print(f"处理用户消息结束,当前用户的意图是{intent_data.get('intent')}, 准备开始进行LLM的生成:")
+
                 # 获取意图类型，默认走普通对话
                 intent_type = intent_data.get("intent", "general_conversation")
                 # 初始化流式输出变量
@@ -887,14 +958,22 @@ class UIManager:
                     )
                     # 若缺少必要信息，提示用户补充
                     if prepared_request.get("needs_more_info"):
+                        print("信息缺失，无法生成行程，暂时中断..............")
                         missing_info = prepared_request.get("missing_info", [])
                         response_data = {
-                            "response": f"我需要更多信息才能为您生成行程。请提供以下信息：{', '.join(missing_info)}。例如：'我想去成都玩3天，预算5000元'",
+                            "response": f"我需要更多信息才能为您生成行程。请提供以下信息：{', '.join(missing_info)}",
                             "trip_data": None,
                         }
                     else:
                         # 启动行程生成流式调用
                         trip_streaming_request = prepared_request
+                        stream_start_ts = datetime.now()
+                        stream_request_id = f"trip-{stream_start_ts.strftime('%H%M%S%f')}"
+                        stream_stage = "trip_generation_stream"
+                        print(
+                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] generate_trip使用大模型开始生成行程【流式输出】"
+                            f"stage={stream_stage} request_id={stream_request_id} prompt_len={len(prompt)}"
+                        )
                         response_stream = self.llm_manager.stream_trip_generation(
                             prepared_request.get("user_input") or {},
                             prepared_request.get("context_texts") or [],
@@ -906,6 +985,9 @@ class UIManager:
                 elif intent_type in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
                     # 仅在已有行程时支持修改类意图
                     if st.session_state.trip_data:
+                        print(
+                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 目前是：{intent_type}，准备触发大模型"
+                        )
                         response_data = self.llm_manager._handle_trip_modification(intent_data, st.session_state.trip_data, st.session_state.chat_history)
                     else:
                         response_data = {
@@ -914,6 +996,13 @@ class UIManager:
                         }
                 else:
                     # 普通对话走聊天流式输出
+                    stream_start_ts = datetime.now()
+                    stream_request_id = f"chat-{stream_start_ts.strftime('%H%M%S%f')}"
+                    stream_stage = "chat_response_stream"
+                    print(
+                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 无法获取类型，直接走LLM调用，准备触发大模型 "
+                        f"stage={stream_stage} request_id={stream_request_id} prompt_len={len(prompt)}"
+                    )
                     response_stream = self.llm_manager.stream_chat_response(
                         prompt,
                         st.session_state.chat_history,
@@ -932,11 +1021,17 @@ class UIManager:
                 trip_data = None
                 # 处理流式输出
                 if response_stream is not None:
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager]流式数据渲染-----------------------------开始")
                     chat_response = self.chat_stream_renderer.render_stream_response(
                         chat_response,
                         st.session_state.chat_history,
                         chat_placeholder,
                         response_stream=response_stream,
+                    )
+                    stream_elapsed_ms = int((datetime.now() - stream_start_ts).total_seconds() * 1000)
+                    print(
+                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 流式输出-------结束"
+                        f"stage={stream_stage} request_id={stream_request_id} elapsed_ms={stream_elapsed_ms} response_len={len(chat_response)}"
                     )
                     # 若是行程流式生成，则解析行程数据
                     if trip_streaming_request is not None:
@@ -947,12 +1042,14 @@ class UIManager:
                             self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
                 else:
                     # 非流式输出直接渲染
+                    print("非流式输出直接渲染-----------------------------开始")
                     self.chat_stream_renderer.render_stream_response(
                         chat_response,
                         st.session_state.chat_history,
                         chat_placeholder,
                         response_stream=None,
                     )
+                    print("非流式输出直接渲染-----------------------------结束")
                     # 若返回包含行程数据，则写入状态
                     if isinstance(response_data, dict) and "trip_data" in response_data:
                         trip_data = response_data["trip_data"]
@@ -976,11 +1073,14 @@ class UIManager:
                 st.session_state.chat_history.append(assistant_msg)
                 # 转换为消息对象用于持久化
                 assistant_message_obj = Message.model_validate(assistant_msg)
+                print("追加AI返回信息到历史记录 + 转换为消息对象用于持久化")
+
                 # AI消息进行处理：主要是压缩多轮对话消息 + 存储会话信息到数据库中
                 self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
                 # 计算总耗时并记录日志
                 total_cost = (datetime.now() - start_ts).total_seconds()
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] chat_submit end, total_cost={total_cost:.2f}s")
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] AI消息处理结束！！, total_cost={total_cost:.2f}s")
+                print("\n")
                 # 记录 UI 链路成功指标
                 self._metrics.record("ui_chat_success", {"session_id": session_id, "elapsed_ms": int(total_cost * 1000)})
                 # 显示AI消息到界面中

@@ -16,6 +16,7 @@ os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", SENTENCE_TRANSFORMERS_HOME)
 os.environ.pop("TRANSFORMERS_CACHE", None)
 HUGGINGFACE_HUB_CACHE = os.getenv("HUGGINGFACE_HUB_CACHE", os.path.join(HF_HOME, "hub"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", HUGGINGFACE_HUB_CACHE)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 class Config:
     # SearXNG配置
@@ -25,9 +26,51 @@ class Config:
     SENTENCE_BERT_MODEL = os.getenv("SENTENCE_BERT_MODEL", "all-MiniLM-L6-v2")
     MINILM_MODEL = os.getenv("MINILM_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-    # LLM 配置
+    # LLM 基础配置（兼容旧版简单 OpenAI 场景）
     LLM_MODEL = os.getenv("LLM_MODEL", "gpt-3.5-turbo")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+    # LLM 调用链-分析阶段（第 1 次调用：实体抽取 + 意图识别）
+    # 默认采用 openai_compatible 提供方，方便直接使用远端 /v1 网关
+    ANALYSIS_PROVIDER = os.getenv("ANALYSIS_PROVIDER", "openai_compatible")
+    # 支持使用逗号分隔配置多个 Base URL，第一个作为默认值
+    _ANALYSIS_BASE_URL_RAW = os.getenv(
+        "ANALYSIS_BASE_URL",
+        "",
+    )
+    ANALYSIS_BASE_URL_OPTIONS = [
+        u.strip() for u in _ANALYSIS_BASE_URL_RAW.split(",") if u.strip()
+    ] or ["http://localhost:11434"]
+    ANALYSIS_BASE_URL = ANALYSIS_BASE_URL_OPTIONS[0]
+    # 支持使用逗号分隔配置多个模型名称，第一个作为默认值
+    _ANALYSIS_MODEL_NAME_RAW = os.getenv("ANALYSIS_MODEL_NAME", "deepseek-r1:7b")
+    ANALYSIS_MODEL_NAME_OPTIONS = [
+        m.strip() for m in _ANALYSIS_MODEL_NAME_RAW.split(",") if m.strip()
+    ] or ["deepseek-r1:7b"]
+    ANALYSIS_MODEL_NAME = ANALYSIS_MODEL_NAME_OPTIONS[0]
+    ANALYSIS_API_KEY = os.getenv("ANALYSIS_API_KEY", "")
+    ANALYSIS_TEMPERATURE = float(os.getenv("ANALYSIS_TEMPERATURE", "0.7"))
+
+    # LLM 调用链-生成阶段（第 2 次调用：行程生成 / 修改）
+    # 默认同样采用 openai_compatible 提供方，与分析阶段保持一致
+    GENERATION_PROVIDER = os.getenv("GENERATION_PROVIDER", "openai_compatible")
+    # 同样支持逗号分隔多个 Base URL，第一个作为默认值
+    _GENERATION_BASE_URL_RAW = os.getenv(
+        "GENERATION_BASE_URL",
+        "",
+    )
+    GENERATION_BASE_URL_OPTIONS = [
+        u.strip() for u in _GENERATION_BASE_URL_RAW.split(",") if u.strip()
+    ] or ["http://localhost:11434"]
+    GENERATION_BASE_URL = GENERATION_BASE_URL_OPTIONS[0]
+    # 同样支持逗号分隔配置多个模型名称，第一个作为默认值
+    _GENERATION_MODEL_NAME_RAW = os.getenv("GENERATION_MODEL_NAME", "deepseek-r1:7b")
+    GENERATION_MODEL_NAME_OPTIONS = [
+        m.strip() for m in _GENERATION_MODEL_NAME_RAW.split(",") if m.strip()
+    ] or ["deepseek-r1:7b"]
+    GENERATION_MODEL_NAME = GENERATION_MODEL_NAME_OPTIONS[0]
+    GENERATION_API_KEY = os.getenv("GENERATION_API_KEY", "")
+    GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.7"))
 
     # 向量存储配置
     CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
