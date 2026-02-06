@@ -1,6 +1,7 @@
 import time
 import uuid
 import html as html_lib
+import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Iterable
 
@@ -25,6 +26,83 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
     返回：
     - 可以直接传入 st.markdown(unsafe_allow_html=True) 的 HTML 字符串。
     """
+    def _strip_code_fence(text: str) -> str:
+        lines = text.splitlines()
+        if len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip().startswith("```"):
+            return "\n".join(lines[1:-1]).strip()
+        return text.strip()
+
+    def _try_parse_trip_data(raw: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(raw, dict):
+            return raw
+        if not isinstance(raw, str):
+            return None
+        candidate = _strip_code_fence(raw)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+
+    def _build_trip_table(data: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(data, dict):
+            return None
+        destination = data.get("destination")
+        days = data.get("days")
+        daily_plan = data.get("daily_plan")
+        if not isinstance(daily_plan, dict):
+            return None
+
+        def _day_sort_key(day_key: Any):
+            text = str(day_key)
+            try:
+                return (0, int(text))
+            except Exception:
+                return (1, text)
+
+        def _cell(value: Any) -> str:
+            return html_lib.escape("" if value is None else str(value))
+
+        rows = []
+        for day_key in sorted(daily_plan.keys(), key=_day_sort_key):
+            items = daily_plan.get(day_key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
+                    "<tr>"
+                    f"<td>{_cell(day_key)}</td>"
+                    f"<td>{_cell(item.get('time'))}</td>"
+                    f"<td>{_cell(item.get('attraction'))}</td>"
+                    f"<td>{_cell(item.get('address'))}</td>"
+                    f"<td>{_cell(item.get('transport'))}</td>"
+                    f"<td>{_cell(item.get('duration'))}</td>"
+                    f"<td>{_cell(item.get('latitude'))}</td>"
+                    f"<td>{_cell(item.get('longitude'))}</td>"
+                    "</tr>"
+                )
+
+        if not rows:
+            return None
+
+        caption_text = " · ".join([_cell(destination), f"{_cell(days)}天"] if destination or days else [])
+        caption_html = f"<caption>{caption_text}</caption>" if caption_text else ""
+        header_html = (
+            "<thead><tr>"
+            "<th>天数</th>"
+            "<th>时间</th>"
+            "<th>安排</th>"
+            "<th>地址</th>"
+            "<th>交通</th>"
+            "<th>时长</th>"
+            "<th>纬度</th>"
+            "<th>经度</th>"
+            "</tr></thead>"
+        )
+        body_html = "<tbody>" + "".join(rows) + "</tbody>"
+        return f'<table class="trip-table">{caption_html}{header_html}{body_html}</table>'
+
     css = """
     <style>
     .chat-outer{
@@ -63,6 +141,10 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
     .think-box{margin-top:8px;border:1px dashed #ddd;border-radius:6px;padding:6px 8px;background:#fafafa;}
     .think-box summary{cursor:pointer;color:#666;font-size:12px;}
     .think-box pre{white-space:pre-wrap;margin:6px 0 0 0;font-size:12px;color:#666;}
+    .trip-table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed;}
+    .trip-table caption{text-align:left;font-weight:600;margin-bottom:6px;color:#333;}
+    .trip-table th,.trip-table td{border:1px solid #e6e6e6;padding:6px 8px;vertical-align:top;word-break:break-word;}
+    .trip-table thead th{background:#f7f7f7;}
     </style>
     """
     body = ['<div class="chat-outer"><div class="chat-wrapper">']
@@ -108,7 +190,11 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
         else:
             safe_content = str(content)
             if not is_streaming_content:
-                safe_content = html_lib.escape(safe_content).replace("\n", "<br/>") # 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
+                trip_table = _build_trip_table(_try_parse_trip_data(content))
+                if trip_table:
+                    safe_content = trip_table
+                else:
+                    safe_content = html_lib.escape(safe_content).replace("\n", "<br/>") # 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
             if think_text:
                 print("流式输出已经完全结束，在ui_manager获取think内容，然后隐藏think内容准备重新刷新一次界面UI")
                 safe_think = html_lib.escape(str(think_text)).replace("\n", "<br/>") ## 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
