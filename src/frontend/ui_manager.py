@@ -2,6 +2,7 @@ import logging
 import json
 import base64
 import hashlib
+import re
 from datetime import datetime
 import time as time_module
 from typing import Optional, Dict, List, Any
@@ -48,6 +49,26 @@ class UIManager:
         # 初始化全局指标记录器，用于 UI 链路的观测打点
         self._metrics = get_global_recorder()
         self.agent_orchestrator = _get_agent_orchestrator(llm_manager, self.map_renderer)
+
+    def _split_think_content(self, content: str) -> tuple[str, str]:
+        if not content:
+            return "", ""
+        think_blocks = re.findall(r"<think>(.*?)</think>", content, flags=re.DOTALL)
+        cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+        cleaned = re.sub(r"</?think>", "", cleaned)
+        cleaned = cleaned.strip()
+        think_text = "\n\n".join([block.strip() for block in think_blocks if block and block.strip()])
+        return cleaned, think_text
+
+    def _log_llm_output(self, stage: str, content: str) -> None:
+        safe_content = content or ""
+        head_preview = safe_content[:800]
+        tail_preview = safe_content[-800:] if len(safe_content) > 800 else ""
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] llm_output stage={stage} len={len(safe_content)}")
+        if head_preview:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] llm_output_head stage={stage} >>> {head_preview}")
+        if tail_preview:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] llm_output_tail stage={stage} >>> {tail_preview}")
 
     def _init_session_state(self) -> None:
         """
@@ -988,7 +1009,24 @@ class UIManager:
                         print(
                             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 目前是：{intent_type}，准备触发大模型"
                         )
-                        response_data = self.llm_manager._handle_trip_modification(intent_data, st.session_state.trip_data, st.session_state.chat_history)
+                        prepared_request = self.llm_manager.prepare_trip_request_from_modification(
+                            intent_data,
+                            st.session_state.trip_data,
+                            st.session_state.chat_history,
+                        )
+                        trip_streaming_request = prepared_request
+                        stream_start_ts = datetime.now()
+                        stream_request_id = f"trip-{stream_start_ts.strftime('%H%M%S%f')}"
+                        stream_stage = "trip_generation_stream"
+                        response_stream = self.llm_manager.stream_trip_generation(
+                            prepared_request.get("user_input") or {},
+                            prepared_request.get("context_texts") or [],
+                            prepared_request.get("edit_cmd"),
+                        )
+                        response_data = {
+                            "response": "",
+                            "trip_data": None,
+                        }
                     else:
                         response_data = {
                             "response": "我需要先为您生成一个基础行程，然后才能进行调整。请先提供目的地、天数和预算信息。",
@@ -1033,6 +1071,8 @@ class UIManager:
                         f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 流式输出-------结束"
                         f"stage={stream_stage} request_id={stream_request_id} elapsed_ms={stream_elapsed_ms} response_len={len(chat_response)}"
                     )
+                    self._log_llm_output(stream_stage, chat_response)
+                    chat_response, think_text = self._split_think_content(chat_response)
                     # 若是行程流式生成，则解析行程数据
                     if trip_streaming_request is not None:
                         trip_data = self.llm_manager.parse_trip_from_response_text(chat_response)
@@ -1041,6 +1081,8 @@ class UIManager:
                             st.session_state.map_obj = None
                             self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
                 else:
+                    self._log_llm_output("non_stream_response", chat_response)
+                    chat_response, think_text = self._split_think_content(chat_response)
                     # 非流式输出直接渲染
                     print("非流式输出直接渲染-----------------------------开始")
                     self.chat_stream_renderer.render_stream_response(
@@ -1058,16 +1100,21 @@ class UIManager:
                             st.session_state.map_obj = None
                             self.conversation_manager.conversationStorage.store_trip_data(session_id, trip_data)
                 # 组织助手回复消息
+                metadata_payload = {
+                    "context_type": "trip_modification",
+                    "conversation_id": st.session_state.current_conversation_id,
+                    "has_trip_data": bool(trip_data),
+                    "trip_data": trip_data
+                }
+                if think_text:
+                    metadata_payload["think"] = think_text
+                    # print(f"目前抽离出来的<think>内容是: \n + {think_text} \n\n")
+                    # print(f"目前抽离出来的回答文本是: \n + {chat_response}")
                 assistant_msg = {
                     "role": MessageType.ASSISTANT,
                     "content": chat_response,
                     "timestamp": datetime.now().isoformat(),
-                    "metadata": {
-                        "context_type": "trip_modification",
-                        "conversation_id": st.session_state.current_conversation_id,
-                        "has_trip_data": bool(trip_data),
-                        "trip_data": trip_data
-                    }
+                    "metadata": metadata_payload,
                 }
                 # 追加助手消息到历史记录
                 st.session_state.chat_history.append(assistant_msg)

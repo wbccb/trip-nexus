@@ -1,5 +1,6 @@
 import time
 import uuid
+import html as html_lib
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Iterable
 
@@ -43,7 +44,7 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
     .msg{display:flex;align-items:flex-start;margin:24px 0px;}
     .msg.assistant{justify-content:flex-start;}
     .msg.user{justify-content:flex-end;}
-    .bubble{border-radius:8px;padding:10px 12px;max-width:80%;line-height:1.6;font-size:14px;}
+    .bubble{border-radius:8px;padding:10px 12px;max-width:80%;line-height:1.6;font-size:14px;white-space:pre-wrap;word-break:break-word;}
     .assistant .bubble{background:#fff;border:1px solid #eee;}
     .user .bubble{background:#E6F4FF;border:1px solid #CDE6FF;}
     .avatar{width:28px;height:28px;border-radius:50%;background:#eef;display:flex;align-items:center;justify-content:center;font-size:14px;margin-right: 10px;}
@@ -59,6 +60,9 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
     }
     .stream-segment{display:block;white-space:pre-wrap;}
     .stream-segment.frozen{opacity:0.95;}
+    .think-box{margin-top:8px;border:1px dashed #ddd;border-radius:6px;padding:6px 8px;background:#fafafa;}
+    .think-box summary{cursor:pointer;color:#666;font-size:12px;}
+    .think-box pre{white-space:pre-wrap;margin:6px 0 0 0;font-size:12px;color:#666;}
     </style>
     """
     body = ['<div class="chat-outer"><div class="chat-wrapper">']
@@ -67,16 +71,29 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
         role_str = "assistant" if role == MessageType.ASSISTANT or role == "assistant" else "user"
         content = message.get("content", "")
         metadata = message.get("metadata", {}) if isinstance(message, dict) else {}
+        think_text = ""
+        if isinstance(metadata, dict):
+            think_value = metadata.get("think")
+            if isinstance(think_value, list):
+                think_text = "\n\n".join([str(item) for item in think_value if item])
+            elif isinstance(think_value, str):
+                think_text = think_value
 
         # 当 metadata 中包含 segments/active 时，说明该消息处于流式渲染状态
+        is_streaming_content = False
         if isinstance(metadata, dict) and metadata.get("segments") is not None:
             segments = metadata.get("segments") or []
             active = metadata.get("active") or ""
             combined_parts: List[str] = []
             for segment in segments:
-                combined_parts.append(f'<span class="stream-segment frozen">{segment}</span>')
-            combined_parts.append(f'<span class="stream-segment">{active}</span>')
+                # print(f"""\n 处理前的片段: {str(segment)}""")
+                safe_segment = html_lib.escape(str(segment)).replace("\n", "<br/>") # 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
+                # print(f"处理后的片段: {str(safe_segment)} \n")
+                combined_parts.append(f'<span class="stream-segment frozen">{safe_segment}</span>')
+            safe_active = html_lib.escape(str(active)).replace("\n", "<br/>") # 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
+            combined_parts.append(f'<span class="stream-segment">{safe_active}</span>')
             content = "".join(combined_parts)
+            is_streaming_content = True
 
         is_loading = isinstance(metadata, dict) and metadata.get("loading", False)
         body.append(f'<div class="msg {role_str}">')
@@ -89,9 +106,18 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
                 '</div>'
             )
         else:
-            body.append(f'<div class="bubble">{content}</div>')
+            safe_content = str(content)
+            if not is_streaming_content:
+                safe_content = html_lib.escape(safe_content).replace("\n", "<br/>") # 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
+            if think_text:
+                print("流式输出已经完全结束，在ui_manager获取think内容，然后隐藏think内容准备重新刷新一次界面UI")
+                safe_think = html_lib.escape(str(think_text)).replace("\n", "<br/>") ## 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
+                safe_content = f'{safe_content}<details class="think-box"><summary>思考过程</summary><pre>{safe_think}</pre></details>'
+            body.append(f'<div class="bubble">{safe_content}</div>')
         body.append('</div>')
     body.append('</div></div>')
+
+    # print(f"body: {body}")
     return css + "".join(body)
 
 
@@ -192,4 +218,3 @@ class ChatStreamRenderer:
                     time.sleep(0.02)
 
         return full_text
-
