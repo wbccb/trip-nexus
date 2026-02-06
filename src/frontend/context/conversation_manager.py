@@ -364,7 +364,7 @@ class ConversationManager:
             # 4. 增量提取核心实体（如果不是冗余信息）
             if not message.is_redundant:
                 start_ts = _dt.now()
-                print(f"[{_ts()}][ConversationManager] 核心实体结束了，开始增量覆盖已经存在的实体, has_intent_data={bool(intent_data)}")
+                print(f"[{_ts()}][ConversationManager] 核心实体结束了，开始增量覆盖已经存在的实体, 本来的实体数据为: {existing_entities}")
                 if intent_data:
                     context.core_entities = self.merge_core_entities_from_intent_data(intent_data, existing_entities)
                 else:
