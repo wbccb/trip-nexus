@@ -1406,8 +1406,8 @@ class UIManager:
                 <style>
                 div.element-container:has(div#map-toggle-marker) + div.element-container {
                     position: absolute;
-                    top: 8px;
-                    left: 20px;
+                    top: 10px;
+                    left: 50px;
                     z-index: 1000001;
                     width: auto !important;
                 }
