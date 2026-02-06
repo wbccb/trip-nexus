@@ -112,7 +112,7 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
             if think_text:
                 print("流式输出已经完全结束，在ui_manager获取think内容，然后隐藏think内容准备重新刷新一次界面UI")
                 safe_think = html_lib.escape(str(think_text)).replace("\n", "<br/>") ## 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
-                safe_content = f'{safe_content}<details class="think-box"><summary>思考过程</summary><pre>{safe_think}</pre></details>'
+                safe_content = f'<details class="think-box"><summary>思考过程</summary><pre>{safe_think}</pre></details>{safe_content}'
             body.append(f'<div class="bubble">{safe_content}</div>')
         body.append('</div>')
     body.append('</div></div>')
