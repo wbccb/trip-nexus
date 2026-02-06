@@ -987,6 +987,7 @@ class LlmManager:
 
     def generate_trip(self, user_input: Dict[str, Any], context: List[str],
                       edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        print("-------------------------------一次性generate_trip（非流式）生成 触发-------------------------------")
         """生成行程：通过可视化界面操作输入文字进行行程的生成"""
         prompt = self.build_trip_prompt(user_input, context, edit_cmd)
 
@@ -1361,59 +1362,12 @@ class LlmManager:
 
     def _handle_trip_modification(self, intent_data: Dict[str, Any], current_trip: Dict,
                                   context: List[Dict[str, str]]) -> Dict[str, Any]:
-        """处理行程修改请求"""
         print(f"[{_ts()}][LlmManager] 处理行程修改请求，intent={intent_data.get('intent')}, params_keys={list((intent_data.get('parameters') or {}).keys())}")
-        params = intent_data.get("parameters", {})
-        intent_type = intent_data["intent"]
-
-        edit_cmd = None
-
-        if intent_type == "add_attraction":
-            edit_cmd = {
-                "type": "add",
-                "attraction": params.get("attraction_name", "新景点"),
-                "day": int(params.get("day_number", 1))
-            }
-        elif intent_type == "delete_attraction":
-            edit_cmd = {
-                "type": "delete",
-                "attraction": params.get("attraction_name", "景点"),
-                "day": int(params.get("day_number", 1))
-            }
-        elif intent_type == "reorder_trip":
-            edit_cmd = {
-                "type": "reorder",
-                "msg": "调整行程顺序"
-            }
-        elif intent_type == "modify_trip":
-            # 通用修改逻辑
-            summary = intent_data.get("summary", "调整行程")
-            edit_cmd = {
-                "type": "modify",
-                "msg": summary,
-                # 尝试从参数中提取更新值，用于覆盖原有行程参数
-                "updates": {
-                    "destination": params.get("destination"),
-                    "days": params.get("days"),
-                    "budget": params.get("budget"),
-                    "preference": params.get("preference")
-                }
-            }
-
-        # 重新生成行程
-        # 优先使用 updates 中的新参数，否则回退到 current_trip，最后回退到默认值
-        updates = edit_cmd.get("updates", {}) if edit_cmd else {}
-        
-        user_input = {
-            "destination": updates.get("destination") or current_trip.get("destination", "成都"),
-            "days": updates.get("days") or current_trip.get("days", 3),
-            "budget": updates.get("budget") or current_trip.get("budget", 5000),
-            "preference": updates.get("preference") or current_trip.get("preference", ["美食", "历史"]),
-            "guide_links": []
-        }
-
-        context_texts = [msg["content"] for msg in context[-3:]] if context else []
-
+        prepared = self.prepare_trip_request_from_modification(intent_data, current_trip, context)
+        user_input = prepared.get("user_input") or {}
+        context_texts = prepared.get("context_texts") or []
+        edit_cmd = prepared.get("edit_cmd")
+        action_desc = prepared.get("action_desc") or "已调整行程"
         modified_trip = self.generate_trip(user_input, context_texts, edit_cmd)
 
         if isinstance(modified_trip, dict):
@@ -1428,16 +1382,6 @@ class LlmManager:
             print(f"[{_ts()}][LlmManager] 处理行程修改完成: type={type(modified_trip)}, str_len={len(str(modified_trip))}")
 
         if modified_trip:
-            if edit_cmd and "type" in edit_cmd:
-                 action_desc = {
-                    "add": f"已成功在第{edit_cmd.get('day')}天添加{edit_cmd.get('attraction')}",
-                    "delete": f"已成功从第{edit_cmd.get('day')}天删除{edit_cmd.get('attraction')}",
-                    "reorder": "已重新优化行程顺序",
-                    "modify": edit_cmd.get("msg", "已根据您的要求调整行程")
-                }.get(edit_cmd["type"], "已调整行程")
-            else:
-                 action_desc = "已调整行程"
-
             return {
                 "response": f"{action_desc}。新的行程已生成，请查看更新后的安排！",
                 "trip_data": modified_trip,
@@ -1448,3 +1392,65 @@ class LlmManager:
                 "response": "行程调整失败。请尝试更具体的修改要求，或重新生成行程。",
                 "trip_data": None,
             }
+
+    def prepare_trip_request_from_modification(
+        self,
+        intent_data: Dict[str, Any],
+        current_trip: Dict[str, Any],
+        context: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        params = intent_data.get("parameters", {})
+        intent_type = intent_data.get("intent")
+        edit_cmd = None
+        if intent_type == "add_attraction":
+            edit_cmd = {
+                "type": "add",
+                "attraction": params.get("attraction_name", "新景点"),
+                "day": int(params.get("day_number", 1)),
+            }
+        elif intent_type == "delete_attraction":
+            edit_cmd = {
+                "type": "delete",
+                "attraction": params.get("attraction_name", "景点"),
+                "day": int(params.get("day_number", 1)),
+            }
+        elif intent_type == "reorder_trip":
+            edit_cmd = {
+                "type": "reorder",
+                "msg": "调整行程顺序",
+            }
+        elif intent_type == "modify_trip":
+            summary = intent_data.get("summary", "调整行程")
+            edit_cmd = {
+                "type": "modify",
+                "msg": summary,
+                "updates": {
+                    "destination": params.get("destination"),
+                    "days": params.get("days"),
+                    "budget": params.get("budget"),
+                    "preference": params.get("preference"),
+                },
+            }
+        updates = edit_cmd.get("updates", {}) if edit_cmd else {}
+        user_input = {
+            "destination": updates.get("destination") or current_trip.get("destination", "成都"),
+            "days": updates.get("days") or current_trip.get("days", 3),
+            "budget": updates.get("budget") or current_trip.get("budget", 5000),
+            "preference": updates.get("preference") or current_trip.get("preference", ["美食", "历史"]),
+            "guide_links": [],
+        }
+        context_texts = [msg["content"] for msg in context[-3:]] if context else []
+        action_desc = "已调整行程"
+        if edit_cmd and "type" in edit_cmd:
+            action_desc = {
+                "add": f"已成功在第{edit_cmd.get('day')}天添加{edit_cmd.get('attraction')}",
+                "delete": f"已成功从第{edit_cmd.get('day')}天删除{edit_cmd.get('attraction')}",
+                "reorder": "已重新优化行程顺序",
+                "modify": edit_cmd.get("msg", "已根据您的要求调整行程"),
+            }.get(edit_cmd["type"], "已调整行程")
+        return {
+            "user_input": user_input,
+            "context_texts": context_texts,
+            "edit_cmd": edit_cmd,
+            "action_desc": action_desc,
+        }
