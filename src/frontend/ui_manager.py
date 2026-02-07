@@ -19,7 +19,7 @@ from src.llm.llm_manager import LlmManager
 from src.map.map_renderer import TripMap
 from src.utils.console import console_log
 from src.agent.orchestrator import AgentOrchestrator
-from src.agent.event_bus import event_bus, snapshot_store
+from src.frontend.agent_ui import AgentUI
 from src.observability import ErrorCodes, normalize_exception, get_global_recorder
 
 @st.cache_resource(hash_funcs={LlmManager: lambda _: "llm_manager", TripMap: lambda _: "map_renderer"})
@@ -37,7 +37,10 @@ class UIManager:
         - 通过 EventBus/SnapshotStore 展示节点事件与快照时间线，方便定位 Planner/Checker/Optimizer/Map-RAG 的问题。
         """
 
-        st.set_page_config(page_title="TripNexus", layout="wide")
+        try:
+            st.set_page_config(page_title="TripNexus", layout="wide")
+        except Exception:
+            pass
         self.config = config
         self.llm_manager = llm_manager
         self._init_session_state()
@@ -49,6 +52,12 @@ class UIManager:
         # 初始化全局指标记录器，用于 UI 链路的观测打点
         self._metrics = get_global_recorder()
         self.agent_orchestrator = _get_agent_orchestrator(llm_manager, self.map_renderer)
+        self.agent_ui = AgentUI(
+            llm_manager=self.llm_manager,
+            agent_orchestrator=self.agent_orchestrator,
+            metrics=self._metrics,
+            render_rag_evidence_panel=self.render_rag_evidence_panel,
+        )
 
     def _split_think_content(self, content: str) -> tuple[str, str]:
         if not content:
@@ -698,172 +707,7 @@ class UIManager:
             self.llm_manager.update_llm_config(st.session_state.llm_config)
 
     def render_agent_debug_panel(self) -> None:
-        """
-        渲染 Agent 调试面板（最小实现）。
-
-        面板能力：
-        1) 控制平面：配置链路开关（Checker/Optimizer/RAG）与参数（预算上限、密度、室内优先、工具偏好）；
-        2) 运行入口：触发 orchestrator.run_stream 执行一次链路；
-        3) 恢复入口：触发 orchestrator.resume_from_latest 从最近快照恢复；
-        4) 观测面板：展示 EventBus 的事件流与 SnapshotStore 的快照面板。
-        """
-
-        st.subheader("Agent 调试")
-        if not st.session_state.agent_thread_id:
-            # thread_id 是一次编排执行的会话指针：事件过滤、快照归属、恢复都依赖它
-            st.session_state.agent_thread_id = self.agent_orchestrator.create_thread_id()
-        thread_id = st.session_state.agent_thread_id
-        st.text_input("Thread ID", value=thread_id, key="agent_thread_display", disabled=True)
-
-        # 用户输入支持两种形态：
-        # 1) JSON：直接作为 user_input 传给 Orchestrator（例如 {"destination":"成都","days":3,"budget":5000}）
-        # 2) 纯文本：视为 destination 的快捷输入（例如 "成都"）
-        input_text = st.text_area("输入(JSON 或目的地文本)", value=st.session_state.agent_user_input or "", height=120)
-        st.session_state.agent_user_input = input_text
-
-        enable_checker = st.checkbox("启用 Checker", value=st.session_state.agent_config.get("enable_checker", True))
-        enable_optimizer = st.checkbox("启用 Optimizer", value=st.session_state.agent_config.get("enable_optimizer", True))
-        enable_rag = st.checkbox("启用 RAG", value=st.session_state.agent_config.get("enable_rag", True))
-
-        budget_cap_value = st.number_input(
-            "预算上限(0 为不限)",
-            min_value=0,
-            max_value=20000,
-            value=int(st.session_state.agent_config.get("budget_cap") or 0),
-        )
-        trip_density = st.selectbox(
-            "行程密度",
-            ["low", "medium", "high"],
-            index=["low", "medium", "high"].index(st.session_state.agent_config.get("trip_density", "medium")),
-        )
-        prefer_indoor = st.checkbox("室内优先", value=st.session_state.agent_config.get("prefer_indoor", False))
-
-        poi_top_k = st.number_input(
-            "POI 结果数量",
-            min_value=1,
-            max_value=10,
-            value=int(st.session_state.agent_config.get("poi_top_k") or 5),
-        )
-        weather_days = st.number_input(
-            "天气预报天数",
-            min_value=1,
-            max_value=7,
-            value=int(st.session_state.agent_config.get("weather_days") or 3),
-        )
-        rag_top_k = st.number_input(
-            "检索 TopK",
-            min_value=1,
-            max_value=10,
-            value=int(st.session_state.agent_config.get("rag_top_k") or 3),
-        )
-        poi_query = st.text_input("POI 查询关键词", value=st.session_state.agent_config.get("poi_query") or "热门景点")
-
-        pause_option = st.selectbox("暂停点", ["不暂停", "planner", "checker"], index=0)
-        pause_at = None if pause_option == "不暂停" else pause_option
-
-        st.session_state.agent_config = {
-            "enable_checker": enable_checker,
-            "enable_optimizer": enable_optimizer,
-            "enable_rag": enable_rag,
-            "budget_cap": None if budget_cap_value == 0 else budget_cap_value,
-            "trip_density": trip_density,
-            "prefer_indoor": prefer_indoor,
-            "poi_top_k": poi_top_k,
-            "poi_query": poi_query,
-            "rag_top_k": rag_top_k,
-            "weather_days": weather_days,
-        }
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            run_agent = st.button("运行 Agent", use_container_width=True)
-        with col2:
-            resume_agent = st.button("继续执行", use_container_width=True)
-        with col3:
-            clear_agent = st.button("清空事件", use_container_width=True)
-
-        if clear_agent:
-            # 清空只影响当前 thread_id 的事件与快照，避免污染其他会话
-            event_bus.clear(thread_id)
-            snapshot_store.clear(thread_id)
-
-        if run_agent:
-            # 为了让一次“运行”有完整的可视化链路，先清空旧事件与旧快照
-            event_bus.clear(thread_id)
-            snapshot_store.clear(thread_id)
-            user_input = {}
-            if input_text:
-                try:
-                    # 优先按 JSON 解析，失败则回退为 destination 文本
-                    user_input = json.loads(input_text)
-                except Exception:
-                    user_input = {"destination": input_text}
-            elif st.session_state.get("trip_data"):
-                # 若未输入，则尝试从已有 trip_data 自动构造一个最小 user_input
-                trip_data = st.session_state.get("trip_data") or {}
-                user_input = {
-                    "destination": trip_data.get("destination"),
-                    "days": trip_data.get("days"),
-                    "budget": trip_data.get("budget"),
-                }
-            # 执行编排：pause_at 可用于演示 HITL（在 planner/checker 结束后暂停）
-            state = self.agent_orchestrator.run_stream(
-                user_input=user_input,
-                thread_id=thread_id,
-                agent_config=st.session_state.agent_config,
-                context=None,
-                pause_at=pause_at,
-                resume_state=None,
-                retry_limit=1,
-            )
-            st.session_state.agent_last_state = state
-
-        if resume_agent:
-            # 从最近业务快照恢复执行：内部会复用已有 draft/constraints/optimized，快速跳过已完成步骤
-            state = self.agent_orchestrator.resume_from_latest(thread_id, st.session_state.agent_config)
-            if state:
-                st.session_state.agent_last_state = state
-
-        last_state = st.session_state.agent_last_state or {}
-        if isinstance(last_state, dict):
-            map_payload = last_state.get("map_payload") or {}
-            if isinstance(map_payload, dict):
-                rag_answer = map_payload.get("rag_answer")
-                if rag_answer:
-                    st.markdown("#### RAG 回答")
-                    st.markdown(str(rag_answer))
-
-                rag_query = map_payload.get("rag_query")
-                rag_evidence = (
-                    map_payload.get("rag_evidence")
-                    or map_payload.get("evidence")
-                    or map_payload.get("rag_result", {}).get("evidence")
-                )
-                if isinstance(rag_evidence, dict) and rag_evidence:
-                    evidence_view = dict(rag_evidence)
-                    if rag_query:
-                        evidence_view["_query"] = rag_query
-                    self.render_rag_evidence_panel(evidence_view, panel_key=f"agent::{thread_id}")
-
-        events = event_bus.list(thread_id)
-        if events:
-            st.markdown("#### 事件流")
-            for event in sorted(events, key=lambda e: e["ts"]):
-                ts = datetime.fromtimestamp(event["ts"]).strftime("%H:%M:%S")
-                node = event.get("node") or "-"
-                kind = event.get("kind")
-                detail_keys = ", ".join(list((event.get("detail") or {}).keys()))
-                st.markdown(f"- {ts} | {kind} | {node} | {detail_keys}")
-
-        snapshots = snapshot_store.list(thread_id)
-        if snapshots:
-            st.markdown("#### 快照面板")
-            for snap in snapshots:
-                ts = datetime.fromtimestamp(snap["ts"]).strftime("%H:%M:%S")
-                step = snap.get("step")
-                duration_ms = snap.get("duration_ms")
-                payload_keys = ", ".join(list((snap.get("payload") or {}).keys()))
-                st.markdown(f"- {ts} | {step} | {duration_ms}ms | {payload_keys}")
+        self.agent_ui.render_debug_panel()
 
     def _handle_chat_error(self, error: Exception, chat_placeholder) -> None:
         """
@@ -1407,11 +1251,8 @@ class UIManager:
                     st.session_state.chat_history = []
                     st.rerun()
 
-            st.markdown("---")
             st.subheader("LLM 设置")
             self.render_llm_settings()
-            st.markdown("---")
-            self.render_agent_debug_panel()
 
         # 预加载 trip_data，确保界面渲染前数据已就绪
         if st.session_state.current_conversation_id and not st.session_state.get("trip_data"):
@@ -1493,8 +1334,8 @@ class UIManager:
                 st.session_state.map_visible = False
                 st.rerun()
             if not st.session_state.get("map_obj") and self.map_renderer:
-                 print("[DEBUG] Generating map object...")
-                 with st.spinner("地图生成中..."):
+                print("[DEBUG] Generating map object...")
+                with st.spinner("地图生成中..."):
                     try:
                         last_event = None
                         for event in self.map_renderer.render_map_batches(trip_data, batch_size=4):
@@ -1511,7 +1352,6 @@ class UIManager:
                             print("[DEBUG] Map object generated successfully")
                         elif not st.session_state.get("map_obj"):
                             st.session_state.map_obj = self.map_renderer.render_map(trip_data)
-                            print("[DEBUG] Map object generated successfully")
                     except Exception as e:
                         print(f"[DEBUG] Map generation failed: {e}")
                         st.error(f"地图生成失败: {str(e)}")
@@ -1530,6 +1370,8 @@ class UIManager:
                     st.error(f"地图渲染错误: {e}")
             else:
                 print("[DEBUG] No map object available to render")
+
+        self.agent_ui.render_status_panel(floating=True)
 
     def render_session_list(self, user_id: str, device_id: str) -> None:
         """绘制左侧的会话列表（侧边栏内）"""

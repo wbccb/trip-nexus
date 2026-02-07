@@ -78,6 +78,8 @@ def _get_llm_manager() -> LlmManager:
 
 
 def main() -> None:
+    st.switch_page("pages/agent.py")
+    return
     config = _get_config()
     map_renderer = _get_map_renderer()
     llm_manager = _get_llm_manager()

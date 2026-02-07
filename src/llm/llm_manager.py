@@ -905,25 +905,51 @@ class LlmManager:
             }
         )
 
+        # 打印提示词构建的关键输入，便于定位 user_input/context/edit_note 引起的格式化异常
         print(f"[{_ts()}][LlmManager] 构建行程生成提示词，用户输入={user_input}，上下文条数={len(context)}, 编辑指令={edit_note}")
-
-        # 安全处理 preference
+        # 打印 user_input 的所有字段，确保每个属性都可见
+        print(f"[{_ts()}][LlmManager] user_input.destination={user_input.get('destination')}")
+        print(f"[{_ts()}][LlmManager] user_input.days={user_input.get('days')}")
+        print(f"[{_ts()}][LlmManager] user_input.budget={user_input.get('budget')}")
+        print(f"[{_ts()}][LlmManager] user_input.preference(raw)={user_input.get('preference')}")
+        print(f"[{_ts()}][LlmManager] user_input.keys={list(user_input.keys())}")
+        # 打印上下文细节，逐条展示，便于确认是否存在空值或异常格式
+        for idx, ctx in enumerate(context or []):
+            print(f"[{_ts()}][LlmManager] context[{idx}]={ctx}")
+        # 安全处理 preference，保证后续 join 不报错
         preference = user_input.get("preference", [])
+        # 如果 preference 是单字符串，转换为列表，保证统一处理逻辑
         if isinstance(preference, str):
             preference = [preference]
+        # 如果 preference 既不是字符串也不是列表，则转成字符串列表兜底
         elif not isinstance(preference, list):
             preference = [str(preference)] if preference is not None else []
-            
+        # 拼接 preference 文本，供提示词 format 使用
         preference_str = ", ".join([str(p) for p in preference if p])
-
-        return prompt.format(
+        # 打印归一化后的 preference 结果，确认拼接是否正确
+        print(f"[{_ts()}][LlmManager] preference(normalized)={preference}")
+        print(f"[{_ts()}][LlmManager] preference_str={preference_str}")
+        # 预先组装上下文文本，避免 format 时隐藏错误
+        context_text = "\n".join(context) if context else "无参考攻略"
+        # 打印最终 format 输入的每一个属性，确保全部字段齐全
+        print(f"[{_ts()}][LlmManager] format.destination={user_input.get('destination')}")
+        print(f"[{_ts()}][LlmManager] format.days={user_input.get('days')}")
+        print(f"[{_ts()}][LlmManager] format.budget={user_input.get('budget')}")
+        print(f"[{_ts()}][LlmManager] format.preference={preference_str}")
+        print(f"[{_ts()}][LlmManager] format.context={context_text}")
+        print(f"[{_ts()}][LlmManager] format.edit_note={edit_note}")
+        # 执行提示词格式化，若字段缺失会在此处抛出异常，前面的日志可辅助定位
+        res = prompt.format(
             destination=user_input["destination"],
             days=user_input["days"],
             budget=user_input["budget"],
             preference=preference_str,
-            context="\n".join(context) if context else "无参考攻略",
+            context=context_text,
             edit_note=edit_note
         )
+        print(f"[{_ts()}][LlmManager] 返回构建完成的提示词文本={res}")
+        # 返回构建完成的提示词文本
+        return res
 
     def _build_constraints_context(self, user_input: Dict[str, Any]) -> str:
         destination = user_input.get("destination")
