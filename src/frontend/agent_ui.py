@@ -1,11 +1,14 @@
 import json
+import uuid
+import textwrap
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import streamlit as st
 
 from src.agent.event_bus import event_bus, snapshot_store
-from src.agent.orchestrator import AgentOrchestrator
+from src.agent.agent_loop import PlannerAgent, run_agent_loop_sync
+from src.agent.plan_models import Plan, Task
 from src.llm.llm_manager import LlmManager
 from src.observability import ErrorCodes, normalize_exception
 
@@ -14,26 +17,178 @@ class AgentUI:
     def __init__(
         self,
         llm_manager: LlmManager,
-        agent_orchestrator: AgentOrchestrator,
         metrics,
         render_rag_evidence_panel: Callable[[Dict[str, Any], str], None],
     ) -> None:
         self.llm_manager = llm_manager
-        self.agent_orchestrator = agent_orchestrator
         self._metrics = metrics
         self._render_rag_evidence_panel = render_rag_evidence_panel
+        self._planner_agent = PlannerAgent(llm_manager)
 
     def ensure_thread_id(self) -> str:
         if not st.session_state.get("agent_thread_id"):
-            st.session_state.agent_thread_id = self.agent_orchestrator.create_thread_id()
+            st.session_state.agent_thread_id = str(uuid.uuid4())
         return st.session_state.agent_thread_id
 
+    def _render_plan_preview(self, plan: Plan) -> None:
+        st.markdown("#### 计划预览")
+        task_names = {
+            "tool_call": "工具调用",
+            "trip_generate": "生成行程",
+            "map_render": "渲染地图",
+            "trip_summarize": "输出摘要",
+        }
+        tool_names = {
+            "weather.get_daily": "查询天气",
+            "poi.search": "查询景点",
+            "geo.geocode": "查询地理编码",
+        }
+        for index, task in enumerate(plan.tasks, start=1):
+            if task.type == "tool_call":
+                title = tool_names.get(task.tool or "", "工具调用")
+            else:
+                title = task_names.get(task.type, task.type or "任务")
+            deps_text = "、".join(task.dependencies or [])
+            suffix = f"（依赖：{deps_text}）" if deps_text else ""
+            st.markdown(f"- {index}. {title}{suffix}")
+
+    def _task_title(self, task: Task) -> str:
+        task_names = {
+            "tool_call": "工具调用",
+            "trip_generate": "生成行程",
+            "map_render": "渲染地图",
+            "trip_summarize": "输出摘要",
+        }
+        tool_names = {
+            "weather.get_daily": "查询天气",
+            "poi.search": "查询景点",
+            "geo.geocode": "查询地理编码",
+        }
+        if task.type == "tool_call":
+            return tool_names.get(task.tool or "", "工具调用")
+        return task_names.get(task.type, task.type or "任务")
+
+    def _extract_plan_tasks(self, plan_payload: Any) -> List[Task]:
+        if isinstance(plan_payload, Plan):
+            return list(plan_payload.tasks)
+        if isinstance(plan_payload, dict):
+            items = plan_payload.get("tasks") or []
+        elif isinstance(plan_payload, list):
+            items = plan_payload
+        else:
+            items = []
+        tasks: List[Task] = []
+        for item in items:
+            if isinstance(item, Task):
+                tasks.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            try:
+                tasks.append(Task(**item))
+            except Exception:
+                continue
+        return tasks
+
+    def _build_task_title_map(self, plan_payload: Any) -> Dict[str, str]:
+        title_map: Dict[str, str] = {}
+        for task in self._extract_plan_tasks(plan_payload):
+            if task.id:
+                title_map[task.id] = self._task_title(task)
+        return title_map
+
+    def _truncate_text(self, text: str, max_len: int = 40) -> str:
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1] + "…"
+
+    def _render_task_summaries(
+        self,
+        task_summaries: Dict[str, Any],
+        task_title_map: Dict[str, str],
+        task_results: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not task_summaries:
+            return
+        st.markdown("#### 任务摘要")
+        status_map = {"success": "成功", "failed": "失败"}
+        for key, value in task_summaries.items():
+            text = str(value or "")
+            parts = text.split(":")
+            task_id = parts[0] if parts else str(key)
+            status_key = parts[-1] if len(parts) >= 3 else ""
+            status_text = status_map.get(status_key, status_key or "未知")
+            title = task_title_map.get(task_id, "任务")
+            reason_text = ""
+            if task_results and isinstance(task_results.get(task_id), dict):
+                error = task_results.get(task_id, {}).get("error")
+                if isinstance(error, dict):
+                    reason_text = error.get("message") or error.get("code") or ""
+                elif isinstance(error, str):
+                    reason_text = error
+            reason_suffix = f"，原因：{self._truncate_text(str(reason_text))}" if reason_text else ""
+            st.markdown(f"- {title}（{task_id}）：{status_text}{reason_suffix}")
+
+    def _format_event_line(
+        self,
+        event: Dict[str, Any],
+        task_title_map: Dict[str, str],
+        task_summaries: Dict[str, Any],
+    ) -> str:
+        ts_value = event.get("ts")
+        ts = datetime.fromtimestamp(ts_value).strftime("%H:%M:%S") if ts_value else "--:--:--"
+        kind = event.get("kind") or ""
+        detail = event.get("detail") or {}
+        if kind == "batch_start":
+            tasks = detail.get("tasks") or []
+            task_names = [task_title_map.get(task_id, str(task_id)) for task_id in tasks]
+            if len(task_names) > 3:
+                task_text = "、".join(task_names[:3]) + "…"
+            else:
+                task_text = "、".join(task_names)
+            task_text = task_text or "暂无任务"
+            return f"{ts} 开始批量执行任务：{task_text}"
+        if kind == "replan":
+            depth = detail.get("depth")
+            depth_text = f"第{depth}次" if depth is not None else "重新规划"
+            result_text = ""
+            if task_summaries:
+                sample = list(task_summaries.values())[:2]
+                result_text = "；执行结果：" + "、".join([self._truncate_text(str(item)) for item in sample])
+                if len(task_summaries) > 2:
+                    result_text += "…"
+            return f"{ts} 重新规划（{depth_text}），原因：上一步工具结果为空或失败{result_text}"
+        if kind == "loop_end":
+            status = detail.get("status") or ""
+            status_text = {"done": "完成", "failed": "失败"}.get(status, status or "结束")
+            return f"{ts} 执行结束：{status_text}"
+        if kind == "error":
+            error_text = ""
+            error_detail = detail.get("error")
+            if isinstance(error_detail, dict):
+                error_text = error_detail.get("message") or error_detail.get("code") or ""
+            elif isinstance(error_detail, str):
+                error_text = error_detail
+            error_text = self._truncate_text(str(error_text)) if error_text else "未知错误"
+            return f"{ts} 执行失败：{error_text}"
+        return f"{ts} 事件：{kind}"
+
     def _resolve_intent(self, query: str) -> Tuple[Optional[Dict[str, Any]], List[str], Optional[str]]:
+        # [LOG] 意图识别前
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 开始意图识别: {self._truncate_text(query)}")
+        
+        # 调用 LLM 分析用户意图
         intent_data = self.llm_manager.analyze_user_message(
             query=query,
             context=[],
             current_trip=None,
         )
+        
+        # [LOG] 意图识别后
+        intent_type = intent_data.get("intent")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 意图识别完成: {intent_type}")
+        
+        # 根据意图准备行程请求参数
         trip_request = self.llm_manager.prepare_trip_request_from_intent(
             intent_data,
             context=[],
@@ -41,6 +196,7 @@ class AgentUI:
         if trip_request.get("needs_more_info"):
             missing_info = trip_request.get("missing_info") or []
             missing_text = "、".join([str(item) for item in missing_info if item])
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 信息缺失: {missing_text}")
             return None, [], missing_text
         return trip_request.get("user_input"), trip_request.get("context_texts") or [], None
 
@@ -104,12 +260,8 @@ class AgentUI:
         thread_id = self.ensure_thread_id()
         st.text_input("Thread ID", value=thread_id, key="agent_thread_display", disabled=True)
 
-        input_text = st.text_area("输入(JSON 或目的地文本)", value=st.session_state.agent_user_input or "上海到广州旅游3天，预算1000元", height=120)
+        input_text = st.text_area("输入(JSON 或目的地文本)", value=st.session_state.agent_user_input or "上海到广州旅游2天，预算1000元, 2025年11月从上海飞机出发，在广州侧重于地铁交通，住宿预算每晚100元", height=120)
         st.session_state.agent_user_input = input_text
-
-        enable_checker = st.checkbox("启用 Checker", value=st.session_state.agent_config.get("enable_checker", True))
-        enable_optimizer = st.checkbox("启用 Optimizer", value=st.session_state.agent_config.get("enable_optimizer", True))
-        enable_rag = st.checkbox("启用 RAG", value=st.session_state.agent_config.get("enable_rag", True))
 
         budget_cap_value = st.number_input(
             "预算上限(0 为不限)",
@@ -144,13 +296,7 @@ class AgentUI:
         )
         poi_query = st.text_input("POI 查询关键词", value=st.session_state.agent_config.get("poi_query") or "热门景点")
 
-        pause_option = st.selectbox("暂停点", ["不暂停", "planner", "checker"], index=0)
-        pause_at = None if pause_option == "不暂停" else pause_option
-
         st.session_state.agent_config = {
-            "enable_checker": enable_checker,
-            "enable_optimizer": enable_optimizer,
-            "enable_rag": enable_rag,
             "budget_cap": None if budget_cap_value == 0 else budget_cap_value,
             "trip_density": trip_density,
             "prefer_indoor": prefer_indoor,
@@ -158,13 +304,16 @@ class AgentUI:
             "poi_query": poi_query,
             "rag_top_k": rag_top_k,
             "weather_days": weather_days,
+            "max_concurrency": 4,
+            "rate_limit_per_min": 60,
+            "max_total_tasks": None,
         }
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            run_agent = st.button("运行 Agent", use_container_width=True)
+            build_plan = st.button("生成计划", use_container_width=True)
         with col2:
-            resume_agent = st.button("继续执行", use_container_width=True)
+            confirm_plan = st.button("确认执行", use_container_width=True)
         with col3:
             clear_agent = st.button("清空事件", use_container_width=True)
 
@@ -172,7 +321,7 @@ class AgentUI:
             event_bus.clear(thread_id)
             snapshot_store.clear(thread_id)
 
-        if run_agent:
+        if build_plan:
             event_bus.clear(thread_id)
             snapshot_store.clear(thread_id)
             trip_data = st.session_state.get("trip_data") or {}
@@ -180,34 +329,85 @@ class AgentUI:
             if error_text:
                 st.error(error_text)
                 return
+            
+            # [LOG] 生成计划前
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 用户点击生成计划，开始处理...")
+            
+            # 再次调用意图分析，确认最新意图
+            intent_data = self.llm_manager.analyze_user_message(input_text, context=[], current_trip=None)
+            user_intent = intent_data.get("intent") or "generate_trip"
+            
+            # [LOG] 意图确认
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 确认用户意图: {user_intent}")
+            
+            tool_whitelist = [schema.get("name") for schema in self.llm_manager.list_tools()]
+            
+            # 调用 PlannerAgent 生成计划
+            # plan() 内部会调用 LLM 生成 DAG 任务图
+            plan = self._planner_agent.plan(
+                user_intent=user_intent,
+                user_input=user_input,
+                agent_config=st.session_state.agent_config,
+                tool_whitelist=tool_whitelist,
+                force_sop=True,
+            )
+            
+            # [LOG] 计划生成后
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 计划生成完成，任务数: {len(plan.tasks)}")
+            
+            st.session_state.agent_plan_preview = plan.model_dump()
+            st.session_state.agent_plan_intent = user_intent
+            st.session_state.agent_plan_confirmed = False
+
+        if confirm_plan:
+            plan_payload = st.session_state.get("agent_plan_preview")
+            if not plan_payload:
+                st.warning("请先生成计划")
+                return
+            trip_data = st.session_state.get("trip_data") or {}
+            user_input, context_texts, error_text = self._build_agent_input(input_text, trip_data)
+            if error_text:
+                st.error(error_text)
+                return
+            plan_tasks = [Task(**item) for item in (plan_payload.get("tasks") or [])]
+            plan = Plan(tasks=plan_tasks)
             try:
-                state = self.agent_orchestrator.run_stream(
+                state = run_agent_loop_sync(
+                    llm_manager=self.llm_manager,
                     user_input=user_input,
                     thread_id=thread_id,
                     agent_config=st.session_state.agent_config,
+                    user_intent=st.session_state.get("agent_plan_intent") or "generate_trip",
                     context=context_texts or None,
-                    pause_at=pause_at,
-                    resume_state=None,
+                    plan_override=plan,
                     retry_limit=1,
+                    max_replan_depth=2,
                 )
-                st.session_state.agent_last_state = state
+                st.session_state.agent_last_state = state.model_dump()
+                st.session_state.agent_plan_confirmed = True
             except Exception as error:
                 error_payload = normalize_exception(
                     error,
                     code=ErrorCodes.UNEXPECTED_ERROR,
-                    source="ui_agent",
+                    source="ui_agent_loop",
                 )
                 self._metrics.record("ui_agent_error", {"error": error_payload})
                 st.error(f"系统处理失败（{error_payload.get('code')}）：{error_payload.get('message')}")
                 st.session_state.agent_last_state = {"status": "failed", "error": error_payload}
                 return
 
-        if resume_agent:
-            state = self.agent_orchestrator.resume_from_latest(thread_id, st.session_state.agent_config)
-            if state:
-                st.session_state.agent_last_state = state
-
         last_state = st.session_state.agent_last_state or {}
+        plan_preview = st.session_state.get("agent_plan_preview")
+        plan_payload_for_map = plan_preview
+        if isinstance(last_state, dict) and last_state.get("plan"):
+            plan_payload_for_map = {"tasks": last_state.get("plan")}
+        task_title_map = self._build_task_title_map(plan_payload_for_map)
+        if plan_preview:
+            try:
+                preview_plan = Plan(tasks=[Task(**item) for item in (plan_preview.get("tasks") or [])])
+                self._render_plan_preview(preview_plan)
+            except Exception:
+                st.warning("计划预览解析失败")
         if isinstance(last_state, dict):
             map_payload = last_state.get("map_payload") or {}
             if isinstance(map_payload, dict):
@@ -227,84 +427,75 @@ class AgentUI:
                     if rag_query:
                         evidence_view["_query"] = rag_query
                     self._render_rag_evidence_panel(evidence_view, panel_key=f"agent::{thread_id}")
+            self._render_task_summaries(
+                last_state.get("task_summaries") or {},
+                task_title_map,
+                last_state.get("task_results") or {},
+            )
 
         events = event_bus.list(thread_id)
         if events:
             st.markdown("#### 事件流")
             for event in sorted(events, key=lambda e: e["ts"]):
-                ts = datetime.fromtimestamp(event["ts"]).strftime("%H:%M:%S")
-                node = event.get("node") or "-"
-                kind = event.get("kind")
-                detail_keys = ", ".join(list((event.get("detail") or {}).keys()))
-                st.markdown(f"- {ts} | {kind} | {node} | {detail_keys}")
+                st.markdown(f"- {self._format_event_line(event, task_title_map, last_state.get('task_summaries') or {})}")
 
         snapshots = snapshot_store.list(thread_id)
         if snapshots:
             st.markdown("#### 快照面板")
             for snap in snapshots:
-                ts = datetime.fromtimestamp(snap["ts"]).strftime("%H:%M:%S")
+                ts_value = snap.get("ts")
+                ts = datetime.fromtimestamp(ts_value).strftime("%H:%M:%S") if ts_value else "-"
                 step = snap.get("step")
                 duration_ms = snap.get("duration_ms")
                 payload_keys = ", ".join(list((snap.get("payload") or {}).keys()))
                 st.markdown(f"- {ts} | {step} | {duration_ms}ms | {payload_keys}")
 
-    def _build_node_status(self, thread_id: str) -> Tuple[Dict[str, str], Dict[str, str]]:
-        node_labels = {
-            "planner": "Planner",
-            "checker": "Checker",
-            "optimizer": "Optimizer",
-            "map_rag": "Map/RAG",
-        }
-        node_desc = {
-            "planner": "生成草案与意图解析",
-            "checker": "调用工具校验约束",
-            "optimizer": "预算与偏好修正",
-            "map_rag": "地图渲染与检索",
-        }
+    def _build_task_status_from_plan(
+        self,
+        plan: List[Dict[str, Any]],
+        completed_tasks: List[str],
+        failed_tasks: List[str],
+    ) -> Tuple[Dict[str, str], Dict[str, str], List[str]]:
+        # 初始化状态映射
         status_map: Dict[str, str] = {}
         activity_map: Dict[str, str] = {}
-        events = event_bus.list(thread_id)
-        for node in node_labels.keys():
-            node_events = [event for event in events if event.get("node") == node]
-            if not node_events:
-                status_map[node] = "pending"
-                activity_map[node] = "未开始"
+        # 构建顺序列表
+        node_order: List[str] = []
+        # 读取完成/失败集合
+        completed_set = set(completed_tasks or [])
+        failed_set = set(failed_tasks or [])
+        # 遍历计划任务
+        for task in plan:
+            task_id = str(task.get("id") or "")
+            if not task_id:
                 continue
-            last_event = node_events[-1]
-            kind = last_event.get("kind")
-            detail = last_event.get("detail") or {}
-            if kind == "node_start":
-                status_map[node] = "running"
-                activity_map[node] = node_desc.get(node, "执行中")
-            elif kind == "tool_call":
-                status_map[node] = "running"
-                tool_name = detail.get("tool") or detail.get("name") or ""
-                activity_map[node] = f"调用工具 {tool_name}".strip()
-            elif kind == "tool_result":
-                status_map[node] = "running"
-                activity_map[node] = "工具返回处理中"
-            elif kind == "node_end":
-                status_map[node] = "done"
-                activity_map[node] = "完成"
-            elif kind == "interrupt":
-                status_map[node] = "paused"
-                activity_map[node] = "已暂停"
-            elif kind == "error":
-                status_map[node] = "failed"
-                activity_map[node] = str(detail.get("error") or "失败")
+            node_order.append(task_id)
+            # 计算状态
+            if task_id in failed_set:
+                status_map[task_id] = "failed"
+            elif task_id in completed_set:
+                status_map[task_id] = "done"
             else:
-                status_map[node] = str(kind or "unknown")
-                activity_map[node] = str(kind or "unknown")
-        return status_map, activity_map
+                status_map[task_id] = "pending"
+            # 填充活动文本
+            activity_map[task_id] = str(task.get("description") or task.get("type") or "")
+        # 返回状态结果
+        return status_map, activity_map, node_order
 
     def render_status_panel(self, thread_id: Optional[str] = None, floating: bool = True) -> None:
         active_thread_id = thread_id or st.session_state.get("agent_thread_id") or ""
         if not active_thread_id:
             return
-        if not event_bus.list(active_thread_id):
+        last_state = st.session_state.get("agent_last_state") or {}
+        plan = last_state.get("plan") if isinstance(last_state, dict) else None
+        if plan:
+            status_map, activity_map, node_order = self._build_task_status_from_plan(
+                plan=plan,
+                completed_tasks=list(last_state.get("completed_tasks") or []),
+                failed_tasks=list(last_state.get("failed_tasks") or []),
+            )
+        else:
             return
-        status_map, activity_map = self._build_node_status(active_thread_id)
-        node_order = ["planner", "checker", "optimizer", "map_rag"]
         status_color = {
             "pending": "#9aa0a6",
             "running": "#1a73e8",
@@ -312,13 +503,18 @@ class AgentUI:
             "paused": "#f9ab00",
             "failed": "#d93025",
         }
+        # 初始化 HTML 行列表
         rows_html = []
         for node in node_order:
+            # 获取节点状态、颜色、活动信息和标签
             status = status_map.get(node, "pending")
             color = status_color.get(status, "#5f6368")
             activity = activity_map.get(node, "")
             label = node.replace("_", " ").title()
-            rows_html.append(
+            
+            # 使用 textwrap.dedent 去除缩进，防止 Markdown 将其渲染为代码块
+            # 并使用 strip() 去除首尾空白
+            row_content = textwrap.dedent(
                 f"""
                 <div class="agent-node-row">
                     <div class="agent-node-title">
@@ -329,61 +525,74 @@ class AgentUI:
                     <div class="agent-node-activity">{activity}</div>
                 </div>
                 """
-            )
-        panel_html = f"""
-        <div id="agent-status-panel">
-            <div class="agent-panel-title">Agent 运行状态</div>
-            {''.join(rows_html)}
-        </div>
-        <style>
-        #agent-status-panel {{
-            background: #ffffff;
-            border: 1px solid #e0e0e0;
-            border-radius: 12px;
-            padding: 12px 14px;
-            box-shadow: 0 8px 18px rgba(0,0,0,0.08);
-            width: 320px;
-            font-size: 13px;
-            line-height: 1.4;
-        }}
-        .agent-panel-title {{
-            font-weight: 600;
-            margin-bottom: 8px;
-            color: #202124;
-        }}
-        .agent-node-row {{
-            padding: 6px 0;
-            border-bottom: 1px dashed #ececec;
-        }}
-        .agent-node-row:last-child {{
-            border-bottom: none;
-        }}
-        .agent-node-title {{
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            margin-bottom: 4px;
-        }}
-        .agent-dot {{
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            display: inline-block;
-        }}
-        .agent-node-label {{
-            font-weight: 600;
-            color: #202124;
-        }}
-        .agent-node-status {{
-            margin-left: auto;
-            color: #5f6368;
-            text-transform: capitalize;
-        }}
-        .agent-node-activity {{
-            color: #5f6368;
-        }}
-        </style>
-        """
+            ).strip()
+            rows_html.append(row_content)
+
+        # 构建面板头部 HTML，使用 textwrap.dedent 确保无缩进
+        panel_header = textwrap.dedent(
+            """
+            <div id="agent-status-panel">
+                <div class="agent-panel-title">Agent 运行状态</div>
+            """
+        ).strip()
+
+        # 构建面板样式 CSS
+        # 注意：此处使用普通字符串而非 f-string，因此 CSS 中的大括号不需要转义
+        panel_css = textwrap.dedent(
+            """
+            <style>
+            #agent-status-panel {
+                background: #ffffff;
+                border: 1px solid #e0e0e0;
+                border-radius: 12px;
+                padding: 12px 14px;
+                box-shadow: 0 8px 18px rgba(0,0,0,0.08);
+                width: 320px;
+                font-size: 13px;
+                line-height: 1.4;
+            }
+            .agent-panel-title {
+                font-weight: 600;
+                margin-bottom: 8px;
+                color: #202124;
+            }
+            .agent-node-row {
+                padding: 6px 0;
+                border-bottom: 1px dashed #ececec;
+            }
+            .agent-node-row:last-child {
+                border-bottom: none;
+            }
+            .agent-node-title {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin-bottom: 4px;
+            }
+            .agent-dot {
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                display: inline-block;
+            }
+            .agent-node-label {
+                font-weight: 600;
+                color: #202124;
+            }
+            .agent-node-status {
+                margin-left: auto;
+                color: #5f6368;
+                text-transform: capitalize;
+            }
+            .agent-node-activity {
+                color: #5f6368;
+            }
+            </style>
+            """
+        ).strip()
+
+        # 拼接最终的 HTML 字符串：头部 + 所有行 + 闭合标签 + CSS
+        panel_html = f"{panel_header}\n{''.join(rows_html)}\n</div>\n{panel_css}"
         if floating:
             st.markdown(
                 """
@@ -397,6 +606,93 @@ class AgentUI:
                 }
                 </style>
                 <div id="agent-status-marker"></div>
+                """,
+                unsafe_allow_html=True,
+            )
+        st.markdown(panel_html, unsafe_allow_html=True)
+
+    def render_live_panel(self, floating: bool = True) -> None:
+        thread_id = st.session_state.get("agent_thread_id") or ""
+        last_state = st.session_state.get("agent_last_state") or {}
+        plan_preview = st.session_state.get("agent_plan_preview")
+        events = event_bus.list(thread_id) if thread_id else []
+        if not plan_preview and not last_state and not events:
+            return
+        plan_payload_for_map = plan_preview
+        if isinstance(last_state, dict) and last_state.get("plan"):
+            plan_payload_for_map = {"tasks": last_state.get("plan")}
+        task_title_map = self._build_task_title_map(plan_payload_for_map)
+        lines: List[str] = []
+        if plan_preview:
+            tasks = self._extract_plan_tasks(plan_preview)
+            if tasks:
+                plan_text = " → ".join([self._task_title(task) for task in tasks])
+                lines.append(f"计划预览：{self._truncate_text(plan_text, 60)}")
+        if isinstance(last_state, dict):
+            summaries = last_state.get("task_summaries") or {}
+            if summaries:
+                summary_lines = []
+                for key, value in list(summaries.items())[:3]:
+                    text = str(value or "")
+                    parts = text.split(":")
+                    task_id = parts[0] if parts else str(key)
+                    status_key = parts[-1] if len(parts) >= 3 else ""
+                    status_text = {"success": "成功", "failed": "失败"}.get(status_key, status_key or "未知")
+                    title = task_title_map.get(task_id, "任务")
+                    summary_lines.append(f"{title}（{task_id}）{status_text}")
+                summary_text = "、".join(summary_lines)
+                if len(summaries) > 3:
+                    summary_text += "…"
+                lines.append(f"任务摘要：{summary_text}")
+        if events:
+            event_lines = [self._format_event_line(event, task_title_map, last_state.get("task_summaries") or {}) for event in sorted(events, key=lambda e: e["ts"])]
+            if len(event_lines) > 3:
+                event_lines = event_lines[-3:]
+            lines.append("事件：")
+            lines.extend([f"- {line}" for line in event_lines])
+        content_html = "".join([f"<div class='agent-live-line'>{line}</div>" for line in lines])
+        panel_html = textwrap.dedent(
+            f"""
+        <div id="agent-live-panel">
+            <div class="agent-live-title">Agent 实时</div>
+            {content_html}
+        </div>
+        <style>
+        #agent-live-panel {{
+            background: #ffffff;
+            border: 1px solid #e0e0e0;
+            border-radius: 12px;
+            padding: 12px 14px;
+            box-shadow: 0 8px 18px rgba(0,0,0,0.08);
+            width: 320px;
+            font-size: 13px;
+            line-height: 1.4;
+        }}
+        .agent-live-title {{
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #202124;
+        }}
+        .agent-live-line {{
+            margin-bottom: 6px;
+            color: #5f6368;
+        }}
+        </style>
+        """
+        ).strip()
+        if floating:
+            st.markdown(
+                """
+                <style>
+                div.element-container:has(div#agent-live-marker) + div.element-container {
+                    position: fixed !important;
+                    right: 20px;
+                    bottom: 120px;
+                    z-index: 1000001;
+                    width: auto !important;
+                }
+                </style>
+                <div id="agent-live-marker"></div>
                 """,
                 unsafe_allow_html=True,
             )

@@ -132,6 +132,8 @@ class SnapshotStore:
         - snapshot：快照数据（建议包含 step、duration_ms、payload、state 等）
         """
 
+        if "ts" not in snapshot:
+            snapshot["ts"] = time.time()
         self._snapshots.setdefault(thread_id, []).append(snapshot)
 
     def list(self, thread_id: str) -> List[Dict[str, Any]]:

@@ -5,6 +5,8 @@ import traceback
 class ErrorCodes:
     # 统一错误码：工具相关
     TOOL_NOT_FOUND = "TOOL_NOT_FOUND"
+    # 统一错误码：工具参数不合法
+    TOOL_INVALID_PARAMS = "TOOL_INVALID_PARAMS"
     # 统一错误码：工具执行失败
     TOOL_EXECUTION_ERROR = "TOOL_EXECUTION_ERROR"
     # 统一错误码：搜索实例失败

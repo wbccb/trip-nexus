@@ -18,14 +18,8 @@ from src.frontend.context.storage import get_conversation_storage
 from src.llm.llm_manager import LlmManager
 from src.map.map_renderer import TripMap
 from src.utils.console import console_log
-from src.agent.orchestrator import AgentOrchestrator
 from src.frontend.agent_ui import AgentUI
 from src.observability import ErrorCodes, normalize_exception, get_global_recorder
-
-@st.cache_resource(hash_funcs={LlmManager: lambda _: "llm_manager", TripMap: lambda _: "map_renderer"})
-def _get_agent_orchestrator(llm_manager: LlmManager, map_renderer: TripMap) -> AgentOrchestrator:
-    return AgentOrchestrator(llm_manager, map_renderer)
-
 
 class UIManager:
     def __init__(self, llm_manager: LlmManager, config: Config, map_renderer: TripMap | None = None):
@@ -33,8 +27,8 @@ class UIManager:
         UI 管理器（Streamlit 页面入口）。
 
         v0.0.3 新增能力：
-        - 注入 AgentOrchestrator，使侧边栏具备“可恢复的编排状态机”调试面板；
-        - 通过 EventBus/SnapshotStore 展示节点事件与快照时间线，方便定位 Planner/Checker/Optimizer/Map-RAG 的问题。
+        - 侧边栏提供 Planner + Executor 的新 Agent Loop 调试面板；
+        - 通过 EventBus/SnapshotStore 展示计划执行的事件与快照时间线。
         """
 
         try:
@@ -51,10 +45,8 @@ class UIManager:
         self.chat_stream_renderer = ChatStreamRenderer(llm_manager)
         # 初始化全局指标记录器，用于 UI 链路的观测打点
         self._metrics = get_global_recorder()
-        self.agent_orchestrator = _get_agent_orchestrator(llm_manager, self.map_renderer)
         self.agent_ui = AgentUI(
             llm_manager=self.llm_manager,
-            agent_orchestrator=self.agent_orchestrator,
             metrics=self._metrics,
             render_rag_evidence_panel=self.render_rag_evidence_panel,
         )
@@ -151,6 +143,15 @@ class UIManager:
                 "rag_top_k": 3,
                 "weather_days": 3,
             }
+        if st.session_state.get("agent_plan_preview") is None:
+            # 计划预览缓存
+            st.session_state.agent_plan_preview = None
+        if st.session_state.get("agent_plan_intent") is None:
+            # 计划对应的意图
+            st.session_state.agent_plan_intent = ""
+        if st.session_state.get("agent_plan_confirmed") is None:
+            # 是否确认计划
+            st.session_state.agent_plan_confirmed = False
 
         if st.session_state.get("rag_evidence_ui") is None:
             st.session_state.rag_evidence_ui = {}
@@ -588,7 +589,7 @@ class UIManager:
 
         说明：
         - 该面板用于配置“两次调用”模型：第 1 次做分析（抽取实体/意图），第 2 次做生成（行程生成/修改）；
-        - AgentOrchestrator 内部复用同一个 LlmManager，因此此处配置更新后，Agent 调试面板也会同步生效。
+        - Agent Loop 复用同一个 LlmManager，因此此处配置更新后，Agent 调试面板也会同步生效。
         """
 
         config = st.session_state.get("llm_config", {})
@@ -1371,6 +1372,7 @@ class UIManager:
             else:
                 print("[DEBUG] No map object available to render")
 
+        self.agent_ui.render_live_panel(floating=True)
         self.agent_ui.render_status_panel(floating=True)
 
     def render_session_list(self, user_id: str, device_id: str) -> None:
