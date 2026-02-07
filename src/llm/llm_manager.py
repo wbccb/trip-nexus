@@ -280,7 +280,18 @@ class LlmManager:
             "result": result,
             "fallback": False,
         }
-        print(f"[LLMManager] 执行工具并返回标准化结果 => {result}")
+        result_data = result.get("data") if isinstance(result, dict) else None
+        result_items = None
+        if isinstance(result_data, dict):
+            result_items = result_data.get("results")
+        result_size = len(result_items) if isinstance(result_items, list) else None
+        success_flag = result.get("success") if isinstance(result, dict) else None
+        error_message = result.get("error") if isinstance(result, dict) else None
+        print(
+            "[LLMManager] 工具执行结果 "
+            f"tool={tool_name} success={success_flag} "
+            f"size={result_size} error={error_message}"
+        )
         return res
 
     def _normalize_tool_context(self, context: Optional[List[Any]] = None) -> List[Dict[str, str]]:
@@ -927,17 +938,17 @@ class LlmManager:
         # 拼接 preference 文本，供提示词 format 使用
         preference_str = ", ".join([str(p) for p in preference if p])
         # 打印归一化后的 preference 结果，确认拼接是否正确
-        print(f"[{_ts()}][LlmManager] preference(normalized)={preference}")
-        print(f"[{_ts()}][LlmManager] preference_str={preference_str}")
+        # print(f"[{_ts()}][LlmManager] preference(normalized)={preference}")
+        # print(f"[{_ts()}][LlmManager] preference_str={preference_str}")
         # 预先组装上下文文本，避免 format 时隐藏错误
         context_text = "\n".join(context) if context else "无参考攻略"
         # 打印最终 format 输入的每一个属性，确保全部字段齐全
-        print(f"[{_ts()}][LlmManager] format.destination={user_input.get('destination')}")
-        print(f"[{_ts()}][LlmManager] format.days={user_input.get('days')}")
-        print(f"[{_ts()}][LlmManager] format.budget={user_input.get('budget')}")
-        print(f"[{_ts()}][LlmManager] format.preference={preference_str}")
-        print(f"[{_ts()}][LlmManager] format.context={context_text}")
-        print(f"[{_ts()}][LlmManager] format.edit_note={edit_note}")
+        # print(f"[{_ts()}][LlmManager] format.destination={user_input.get('destination')}")
+        # print(f"[{_ts()}][LlmManager] format.days={user_input.get('days')}")
+        # print(f"[{_ts()}][LlmManager] format.budget={user_input.get('budget')}")
+        # print(f"[{_ts()}][LlmManager] format.preference={preference_str}")
+        # print(f"[{_ts()}][LlmManager] format.context={context_text}")
+        # print(f"[{_ts()}][LlmManager] format.edit_note={edit_note}")
         # 执行提示词格式化，若字段缺失会在此处抛出异常，前面的日志可辅助定位
         res = prompt.format(
             destination=user_input["destination"],
@@ -947,7 +958,7 @@ class LlmManager:
             context=context_text,
             edit_note=edit_note
         )
-        print(f"[{_ts()}][LlmManager] 返回构建完成的提示词文本={res}")
+        # print(f"[{_ts()}][LlmManager] 返回构建完成的提示词文本={res}")
         # 返回构建完成的提示词文本
         return res
 

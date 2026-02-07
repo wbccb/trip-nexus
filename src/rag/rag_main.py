@@ -236,7 +236,10 @@ class AIRetrievalPipeline:
         # 3. 多源搜索 (获取搜索结果摘要)
         logger.info("准备开始SearchXNR搜索url列表")
         search_results = self.searcher.search(query, intent_info)
-        logger.info(f"SearchXNR得到: {search_results}")
+        if search_results:
+            logger.info(f"SearchXNR得到: 首条={search_results[0]}, 末条={search_results[-1]}")
+        else:
+            logger.info("SearchXNR得到: 无结果")
         print(f"【RAG】搜索完成，结果数：{len(search_results)}")
 
         logger.info("-------------准备质量过滤-------------------")
@@ -257,8 +260,10 @@ class AIRetrievalPipeline:
         logger.info(f"内容抓取 {len(crawled_contents)} pages")
         print(f"【RAG】内容抓取完成，页面数：{len(crawled_contents)}")
 
-        logger.info(f"\n内容抓取内容: \n {crawled_contents}\n")
-
+        if crawled_contents:
+            head = str(crawled_contents[0])[:200]
+            tail = str(crawled_contents[-1])[-200:]
+            logger.info(f"\n内容抓取（首/尾）: \n{head}\n...\n{tail}\n")
         
         logger.info("-------------准备向量化存储与检索-------------------")
 
