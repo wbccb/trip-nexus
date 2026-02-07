@@ -147,7 +147,7 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
     .trip-table thead th{background:#f7f7f7;}
     </style>
     """
-    body = ['<div class="chat-outer"><div class="chat-wrapper">']
+    body = ['<div class="chat-outer"><div id="chat-wrapper" class="chat-wrapper">']
     last_assistant_index = -1
     for idx, message in enumerate(messages):
         role = message.get("role")
@@ -207,6 +207,12 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
             body.append(f'<div class="bubble">{safe_content}</div>')
         body.append('</div>')
     body.append('</div></div>')
+    body.append(
+        '<script>'
+        'var chat=document.getElementById("chat-wrapper");'
+        'if(chat){chat.scrollTop=chat.scrollHeight;}'
+        '</script>'
+    )
 
     # print(f"body: {body}")
     return css + "".join(body)
