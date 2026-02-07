@@ -236,6 +236,7 @@ class LlmManager:
 """
         # 将工具绑定到云端模型，让模型自行产出 tool_calls
         bound_llm = self.analysis_llm.bind_tools(tools)
+        print("准备触发大模型调用: functionCall获取当前需要使用的工具名")
         response = bound_llm.invoke(prompt)
 
         # 兼容不同模型返回结构，优先读取 tool_calls
@@ -268,14 +269,19 @@ class LlmManager:
                 "fallback": False,
             }
 
+        print(f"[LLMManager] 使用云端模型的 FunctionCall 能力完成工具选择与执行，!!!LLM触发 => 得到工具名:{tool_name}, 参数:{params}")
+
+
         # 执行工具并返回标准化结果
         result = self.call_tool(tool_name, params)
-        return {
+        res =  {
             "needs_tool": True,
             "decision": {"needs_tool": True, "tool_name": tool_name, "params": params, "source": "function_call"},
             "result": result,
             "fallback": False,
         }
+        print(f"[LLMManager] 执行工具并返回标准化结果 => {result}")
+        return res
 
     def _normalize_tool_context(self, context: Optional[List[Any]] = None) -> List[Dict[str, str]]:
         """统一上下文结构，确保工具路由和 FunctionCall 输入一致。"""
@@ -685,7 +691,9 @@ class LlmManager:
         params = decision.get("params") or {}
         # 第二步：执行工具并返回统一结果结构
         result = self.call_tool(tool_name, params)
-        return {"needs_tool": True, "decision": decision, "result": result}
+        res = {"needs_tool": True, "decision": decision, "result": result}
+        print(f"[LLMManager] 使用云端模型的 FunctionCall 能力完成工具选择与执行=> 工具名:{tool_name}, 参数:{params}, 结果:{res}")
+        return res
 
     def _build_tool_query(self, user_input: Optional[Dict[str, Any]] = None, edit_cmd: Optional[Dict[str, Any]] = None, query: Optional[str] = None) -> str:
         # 将结构化输入与编辑指令拼成自然语言查询，便于路由模型理解

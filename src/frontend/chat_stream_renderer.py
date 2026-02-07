@@ -148,7 +148,12 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
     </style>
     """
     body = ['<div class="chat-outer"><div class="chat-wrapper">']
-    for message in messages:
+    last_assistant_index = -1
+    for idx, message in enumerate(messages):
+        role = message.get("role")
+        if role == MessageType.ASSISTANT or role == "assistant":
+            last_assistant_index = idx
+    for idx, message in enumerate(messages):
         role = message.get("role")
         role_str = "assistant" if role == MessageType.ASSISTANT or role == "assistant" else "user"
         content = message.get("content", "")
@@ -195,8 +200,8 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
                     safe_content = trip_table
                 else:
                     safe_content = html_lib.escape(safe_content).replace("\n", "<br/>") # 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
-            if think_text:
-                print("流式输出已经完全结束，在ui_manager获取think内容，然后隐藏think内容准备重新刷新一次界面UI")
+            if think_text and idx == last_assistant_index:
+                print(f"在ui_manager获取think内容，然后隐藏think内容准备重新刷新一次界面UI")
                 safe_think = html_lib.escape(str(think_text)).replace("\n", "<br/>") ## 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
                 safe_content = f'<details class="think-box"><summary>思考过程</summary><pre>{safe_think}</pre></details>{safe_content}'
             body.append(f'<div class="bubble">{safe_content}</div>')
