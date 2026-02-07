@@ -210,6 +210,7 @@ class AIRetrievalPipeline:
         执行完整的AI检索流程
         """
         start_time = time.time()
+        print(f"【RAG】开始检索：{query}")
         
         # 清除旧的向量存储上下文
         self.vector_store.clear()
@@ -217,9 +218,11 @@ class AIRetrievalPipeline:
         # 1. 意图识别
         intent_info = self.intent_recognizer.classify_intent(query)
         logger.info(f"Intent info: {intent_info}")
+        print(f"【RAG】意图识别完成，是否需要检索：{intent_info.get('needs_search', True)}")
 
         # 2. 判断是否需要检索
         if not intent_info.get('needs_search', True):
+            print("【RAG】无需检索，直接生成回答")
             return {
                 'query': query,
                 'intent_info': intent_info,
@@ -234,6 +237,7 @@ class AIRetrievalPipeline:
         logger.info("准备开始SearchXNR搜索url列表")
         search_results = self.searcher.search(query, intent_info)
         logger.info(f"SearchXNR得到: {search_results}")
+        print(f"【RAG】搜索完成，结果数：{len(search_results)}")
 
         logger.info("-------------准备质量过滤-------------------")
 
@@ -242,6 +246,7 @@ class AIRetrievalPipeline:
         # 4. 质量过滤 (基于摘要重排序)
         filtered_results = self.quality_filter.filter_and_rank(search_results, query)
         logger.info(f"质量过滤 {len(filtered_results)} 结果")
+        print(f"【RAG】质量过滤完成，保留数：{len(filtered_results)}")
 
         logger.info("-------------准备内容抓取-------------------")
 
@@ -250,6 +255,7 @@ class AIRetrievalPipeline:
         urls_to_fetch = [r['url'] for r in filtered_results[:self.config.DETAIL_FETCH_TOP_K]]
         crawled_contents = self.crawler.fetch_urls(urls_to_fetch)
         logger.info(f"内容抓取 {len(crawled_contents)} pages")
+        print(f"【RAG】内容抓取完成，页面数：{len(crawled_contents)}")
 
         logger.info(f"\n内容抓取内容: \n {crawled_contents}\n")
 
@@ -305,10 +311,15 @@ class AIRetrievalPipeline:
             context_text = self._build_context_text(summary_section, body_section)
 
         logger.info("-------------准备LLM生成回答-------------------")
+        print(
+            "【RAG】证据构建完成，摘要/正文条目数："
+            f"{len(summary_section.get('items', []))}/{len(body_section.get('items', []))}"
+        )
 
 
         # 7. 生成回答
         answer = self._generate_rag_answer(query, context_text)
+        print("【RAG】回答生成完成")
 
         processing_time = time.time() - start_time
 

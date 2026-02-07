@@ -541,16 +541,24 @@ class AgentOrchestrator:
         agent_config = state.get("agent_config") or {}
         trip_data = optimized or draft
         map_payload: Dict[str, Any] = {}
+        print(f"【Map/RAG】节点开始，启用RAG：{agent_config.get('enable_rag', True)}")
         if trip_data:
             map_obj = self.map_renderer.render_map(trip_data)
             map_payload["map_html"] = map_obj.get_root().render()
         if agent_config.get("enable_rag", True):
             destination = trip_data.get("destination") or state.get("user_input", {}).get("destination") or ""
             rag_query = agent_config.get("rag_query") or f"{destination} 行程 旅行 建议"
+            print(f"【Map/RAG】开始检索，查询：{rag_query}")
             rag_result = self.rag_pipeline.run(rag_query)
             map_payload["rag_query"] = rag_query
             map_payload["rag_answer"] = rag_result.get("answer")
             map_payload["rag_evidence"] = rag_result.get("evidence", {})
             map_payload["evidence_summary"] = rag_result.get("evidence", {}).get("summary", {})
             map_payload["rag_processing_time"] = rag_result.get("processing_time")
+            evidence = map_payload.get("rag_evidence") or {}
+            summary_items = (evidence.get("summary") or {}).get("items") or []
+            body_items = (evidence.get("body") or {}).get("items") or []
+            print(f"【Map/RAG】检索完成，摘要/正文条目数：{len(summary_items)}/{len(body_items)}")
+        else:
+            print("【Map/RAG】已关闭RAG，跳过检索")
         return {"map_payload": map_payload}

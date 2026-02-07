@@ -205,6 +205,7 @@ class UIManager:
         - 预算提示：展示当前 Evidence Budget 使用量，并在超限时预警。
         """
         if not isinstance(evidence, dict) or not evidence:
+            print("【RAG】界面无证据可展示")
             st.info("暂无 RAG 证据可展示。")
             return
 
@@ -213,6 +214,7 @@ class UIManager:
 
         summary_entries = self._get_rag_evidence_entries(evidence, "summary")
         body_entries = self._get_rag_evidence_entries(evidence, "body")
+        print(f"【RAG】界面准备展示证据，摘要/正文条目数：{len(summary_entries)}/{len(body_entries)}")
 
         summary_budget = int((evidence.get("summary") or {}).get("budget_chars") or 0)
         body_budget = int((evidence.get("body") or {}).get("budget_chars") or 0)
