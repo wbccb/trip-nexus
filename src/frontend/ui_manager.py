@@ -1033,23 +1033,40 @@ class UIManager:
                             "trip_data": None,
                         }
                 else:
-                    # 普通对话走聊天流式输出
-                    stream_start_ts = datetime.now()
-                    stream_request_id = f"chat-{stream_start_ts.strftime('%H%M%S%f')}"
-                    stream_stage = "chat_response_stream"
-                    print(
-                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 无法获取类型，直接走LLM调用，准备触发大模型 "
-                        f"stage={stream_stage} request_id={stream_request_id} prompt_len={len(prompt)}"
-                    )
-                    response_stream = self.llm_manager.stream_chat_response(
-                        prompt,
-                        st.session_state.chat_history,
-                        st.session_state.trip_data,
-                    )
-                    response_data = {
-                        "response": "",
-                        "trip_data": None,
-                    }
+                    print("当前不是【生成行程】，也不是【修改行程】，只是普通对话模式")
+                    tool_call = self.llm_manager.call_tool_by_llm(prompt, st.session_state.chat_history)
+                    if tool_call.get("needs_tool") and tool_call.get("result"):
+                        result_payload = tool_call.get("result")
+                        if isinstance(result_payload, dict) and result_payload.get("success"):
+                            response_data = {
+                                "response": f"工具结果：{json.dumps(result_payload.get('data'), ensure_ascii=False)}",
+                                "trip_data": None,
+                            }
+                            print("当前不是【生成行程】，也不是【修改行程】，也不是普通对话模式，直接返回工具结果")
+                        else:
+                            tool_call = {"needs_tool": False}
+                    if not tool_call.get("needs_tool"):
+                        decision_payload = tool_call.get("decision") or {}
+                        print(
+                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 工具路由未命中，准备走对话模型 "
+                            f"needs_tool={decision_payload.get('needs_tool')} tool_name={decision_payload.get('tool_name')} params={decision_payload.get('params')}"
+                        )
+                        stream_start_ts = datetime.now()
+                        stream_request_id = f"chat-{stream_start_ts.strftime('%H%M%S%f')}"
+                        stream_stage = "chat_response_stream"
+                        print(
+                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 无法获取类型，直接走LLM调用，准备触发大模型 "
+                            f"stage={stream_stage} request_id={stream_request_id} prompt_len={len(prompt)}"
+                        )
+                        response_stream = self.llm_manager.stream_chat_response(
+                            prompt,
+                            st.session_state.chat_history,
+                            st.session_state.trip_data,
+                        )
+                        response_data = {
+                            "response": "",
+                            "trip_data": None,
+                        }
                 # 统一提取回复文本
                 if isinstance(response_data, dict) and "response" in response_data:
                     chat_response = response_data["response"]
