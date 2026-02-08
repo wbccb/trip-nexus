@@ -10,6 +10,7 @@ import re
 from datetime import datetime
 from geopy.geocoders import Nominatim
 from src.rag.network.multi_source_search import MultiSourceSearcher
+from src.rag.rag_main import AIRetrievalPipeline
 from src.llm.tool_protocol import ToolSchema, ToolCallResult, ToolRegistry
 from src.llm.tools.weather_tool import get_daily_weather
 from src.llm.tools.geo_tool import geocode_address
@@ -80,7 +81,9 @@ class LlmManager:
             timeout=15,
             domain="nominatim.openstreetmap.org",
         )
-        self._poi_searcher = MultiSourceSearcher(self.analysis_llm)
+        # self._poi_searcher = MultiSourceSearcher(self.analysis_llm)
+        # 升级为 RAG Pipeline，支持 Evidence Budget 和日志
+        self._poi_searcher = AIRetrievalPipeline(self.analysis_llm)
         self._register_default_tools()
         # 初始化全局指标记录器，统一采集 LLM 相关的链路指标
         self._metrics = get_global_recorder()
