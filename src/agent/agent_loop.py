@@ -172,7 +172,7 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
             # 校验计划合法性
             plan.validate_plan(tool_whitelist=set(tool_whitelist))
 
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 大模型-任务规划完成并完成校验，返回计划\n")
+            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 大模型-任务规划完成并完成校验，返回计划： {plan.tasks}\n")
             return plan
         except Exception as e:
             # [LOG] 大模型调用或解析失败

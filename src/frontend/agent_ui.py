@@ -173,22 +173,15 @@ class AgentUI:
             return f"{ts} 执行失败：{error_text}"
         return f"{ts} 事件：{kind}"
 
-    def _resolve_intent(self, query: str) -> Tuple[Optional[Dict[str, Any]], List[str], Optional[str]]:
-        # [LOG] 意图识别前
+    def _resolve_intent(self, query: str) -> Tuple[Optional[Dict[str, Any]], List[str], Optional[str], Optional[str]]:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 开始意图识别: {self._truncate_text(query)}")
-        
-        # 调用 LLM 分析用户意图
         intent_data = self.llm_manager.analyze_user_message(
             query=query,
             context=[],
             current_trip=None,
         )
-        
-        # [LOG] 意图识别后
         intent_type = intent_data.get("intent")
         print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 意图识别完成: {intent_type} \n")
-        
-        # 根据意图准备行程请求参数
         trip_request = self.llm_manager.prepare_trip_request_from_intent(
             intent_data,
             context=[],
@@ -197,16 +190,17 @@ class AgentUI:
             missing_info = trip_request.get("missing_info") or []
             missing_text = "、".join([str(item) for item in missing_info if item])
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 信息缺失: {missing_text}")
-            return None, [], missing_text
-        return trip_request.get("user_input"), trip_request.get("context_texts") or [], None
+            return None, [], missing_text, intent_type
+        return trip_request.get("user_input"), trip_request.get("context_texts") or [], None, intent_type
 
     def _build_agent_input(
         self,
         input_text: str,
         trip_data: Optional[Dict[str, Any]],
-    ) -> Tuple[Optional[Dict[str, Any]], List[str], Optional[str]]:
+    ) -> Tuple[Optional[Dict[str, Any]], List[str], Optional[str], Optional[str]]:
         user_input: Dict[str, Any] = {}
         context_texts: List[str] = []
+        intent_type: Optional[str] = None
         if input_text:
             try:
                 parsed = json.loads(input_text)
@@ -215,29 +209,29 @@ class AgentUI:
             if isinstance(parsed, dict):
                 user_input = parsed
                 if not user_input.get("days") or not user_input.get("budget"):
-                    resolved_input, resolved_context, missing_text = self._resolve_intent(input_text)
+                    resolved_input, resolved_context, missing_text, intent_type = self._resolve_intent(input_text)
                     if missing_text:
-                        return None, [], missing_text
+                        return None, [], missing_text, intent_type
                     if isinstance(resolved_input, dict):
                         user_input = resolved_input or user_input
                     context_texts = resolved_context or []
             elif isinstance(parsed, str):
                 parsed_value = parsed.strip()
                 if parsed_value:
-                    resolved_input, resolved_context, missing_text = self._resolve_intent(parsed_value)
+                    resolved_input, resolved_context, missing_text, intent_type = self._resolve_intent(parsed_value)
                     if missing_text:
-                        return None, [], missing_text
+                        return None, [], missing_text, intent_type
                     if isinstance(resolved_input, dict):
                         user_input = resolved_input or {"destination": parsed_value}
                     else:
                         user_input = {"destination": parsed_value}
                     context_texts = resolved_context or []
             elif parsed is not None:
-                return None, [], "JSON 输入必须为对象或字符串"
+                return None, [], "JSON 输入必须为对象或字符串", None
             else:
-                resolved_input, resolved_context, missing_text = self._resolve_intent(input_text)
+                resolved_input, resolved_context, missing_text, intent_type = self._resolve_intent(input_text)
                 if missing_text:
-                    return None, [], missing_text
+                    return None, [], missing_text, intent_type
                 if isinstance(resolved_input, dict):
                     user_input = resolved_input or {"destination": input_text}
                 else:
@@ -250,10 +244,10 @@ class AgentUI:
                 "budget": trip_data.get("budget"),
             }
         if not user_input:
-            return None, [], "请输入目的地或提供包含 destination 的 JSON"
+            return None, [], "请输入目的地或提供包含 destination 的 JSON", intent_type
         if isinstance(user_input, dict) and not user_input.get("destination"):
-            return None, [], "JSON 输入缺少 destination 字段"
-        return user_input, context_texts, None
+            return None, [], "JSON 输入缺少 destination 字段", intent_type
+        return user_input, context_texts, None, intent_type
 
     def render_debug_panel(self) -> None:
         st.subheader("Agent 调试")
@@ -323,25 +317,14 @@ class AgentUI:
             event_bus.clear(thread_id)
             snapshot_store.clear(thread_id)
             trip_data = st.session_state.get("trip_data") or {}
-            user_input, context_texts, error_text = self._build_agent_input(input_text, trip_data)
+            user_input, context_texts, error_text, user_intent = self._build_agent_input(input_text, trip_data)
             if error_text:
                 st.error(error_text)
                 return
-            
-            # [LOG] 生成计划前
             print(f"\n\n[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 用户点击生成计划，开始处理...")
-            
-            # 再次调用意图分析，确认最新意图
-            intent_data = self.llm_manager.analyze_user_message(input_text, context=[], current_trip=None)
-            user_intent = intent_data.get("intent") or "generate_trip"
-            
-            # [LOG] 意图确认
+            user_intent = user_intent or "generate_trip"
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 确认用户意图: {user_intent}")
-            
             tool_whitelist = [schema.get("name") for schema in self.llm_manager.list_tools()]
-            
-            # 调用 PlannerAgent 生成计划
-            # plan() 内部会调用 LLM 生成 DAG 任务图
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 调用 PlannerAgent 生成计划...调用 LLM 生成 DAG 任务图")
             plan = self._planner_agent.plan(
                 user_intent=user_intent,
@@ -350,11 +333,10 @@ class AgentUI:
                 tool_whitelist=tool_whitelist,
                 force_sop=True,
             )
-            
-            # [LOG] 计划生成后
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] plan生成完成，任务数: {len(plan.tasks)} \n\n")
-            
             st.session_state.agent_plan_preview = plan.model_dump()
+            st.session_state.agent_user_input_resolved = user_input
+            st.session_state.agent_context_texts = context_texts
             st.session_state.agent_plan_intent = user_intent
             st.session_state.agent_plan_confirmed = False
 
@@ -363,11 +345,8 @@ class AgentUI:
             if not plan_payload:
                 st.warning("请先生成计划")
                 return
-            trip_data = st.session_state.get("trip_data") or {}
-            user_input, context_texts, error_text = self._build_agent_input(input_text, trip_data)
-            if error_text:
-                st.error(error_text)
-                return
+            user_input = st.session_state.get("agent_user_input_resolved") or {}
+            context_texts = st.session_state.get("agent_context_texts") or []
             plan_tasks = [Task(**item) for item in (plan_payload.get("tasks") or [])]
             plan = Plan(tasks=plan_tasks)
             try:
