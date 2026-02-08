@@ -47,6 +47,8 @@ class AIRetrievalPipeline:
             return ""
         if len(text) <= max_chars:
             return text
+            
+        print(f"【RAG】触发超长摘要: 原文长度={len(text)}, 目标长度={max_chars}")
         template = """请将下面内容压缩为不超过{max_chars}字，保留核心事实与关键数字。
 
 内容：
@@ -78,13 +80,19 @@ class AIRetrievalPipeline:
         - confidence/score：重排/相关度分数（0-1 之间时可视为置信度）
         - timestamp：搜索结果发布时间（如 searxng publishedDate），可能为空
         """
-        summary_items = []
-        summary_candidates = []
-        seen = set()
         budget = self.config.EVIDENCE_SUMMARY_MAX_CHARS
         max_item_chars = self.config.EVIDENCE_SUMMARY_ITEM_MAX_CHARS
         top_k = self.config.EVIDENCE_SUMMARY_TOP_K
+        
+        print(f"【RAG】构建Summary Evidence: Budget={budget}, MaxItem={max_item_chars}, TopK={top_k}")
+        
+        summary_items = []
+        summary_candidates = []
+        seen = set()
         used = 0
+        skipped_dup = 0
+        skipped_budget = 0
+        
         for r in filtered_results[: max(top_k * 2, top_k)]:
             title = (r.get("title") or "").strip()
             snippet = (r.get("content_snippet") or "").strip()
@@ -93,6 +101,8 @@ class AIRetrievalPipeline:
             combined = self._truncate_text(combined, max_item_chars)
             key = self._normalize_text(combined)
             if not combined or key in seen:
+                if key in seen:
+                    skipped_dup += 1
                 continue
             seen.add(key)
             confidence = r.get("score")
@@ -108,6 +118,7 @@ class AIRetrievalPipeline:
                 "timestamp": timestamp,
             })
             if used + len(combined) > budget or len(summary_items) >= top_k:
+                skipped_budget += 1
                 continue
             summary_items.append({
                 "source": r.get("url"),
@@ -119,6 +130,8 @@ class AIRetrievalPipeline:
                 "timestamp": timestamp,
             })
             used += len(combined)
+            
+        print(f"【RAG】Summary构建完成: Items={len(summary_items)}, Candidates={len(summary_candidates)}, UsedChars={used}/{budget}, Skipped(Dup={skipped_dup}, Budget={skipped_budget})")
         return {
             "items": summary_items,
             "candidates": summary_candidates,
@@ -141,13 +154,22 @@ class AIRetrievalPipeline:
         top_n = self.config.EVIDENCE_BODY_TOP_N
         max_chunk_chars = self.config.EVIDENCE_CHUNK_MAX_CHARS
         min_chunk_chars = self.config.EVIDENCE_CHUNK_MIN_CHARS
+        
+        print(f"【RAG】构建Body Evidence: Budget={budget}, TopN={top_n}, Chunk(Min={min_chunk_chars}, Max={max_chunk_chars})")
+        
         used = 0
+        skipped_short = 0
+        skipped_dup = 0
+        truncated_cnt = 0
+        
         for doc in relevant_docs:
             text = (doc.page_content or "").strip()
             if len(text) < min_chunk_chars:
+                skipped_short += 1
                 continue
             key = self._normalize_text(text[:400])
             if key in seen:
+                skipped_dup += 1
                 continue
             seen.add(key)
             meta = doc.metadata or {}
@@ -162,6 +184,9 @@ class AIRetrievalPipeline:
                 "confidence": confidence,
                 "timestamp": timestamp,
             })
+            
+        print(f"【RAG】Body候选集构建完成: Candidates={len(candidates)}, Skipped(Short={skipped_short}, Dup={skipped_dup})")
+        
         for cand in candidates:
             if len(selected) >= top_n:
                 # 如果选择数量超过了top_n，则break
@@ -173,10 +198,12 @@ class AIRetrievalPipeline:
             remaining = budget - used
             if remaining <= 0:
                 # 如果目前token已经用完，则break
+                truncated_cnt += 1
                 break
             if len(content) > remaining:
                 # 如果内容大于剩余容量，则进行压缩
                 content = self._summarize_text(content, remaining)
+                truncated_cnt += 1
             if not content:
                 continue
             selected.append({
@@ -188,6 +215,9 @@ class AIRetrievalPipeline:
                 "timestamp": cand.get("timestamp"),
             })
             used += len(content)
+            
+        print(f"【RAG】Body最终筛选完成: Selected={len(selected)}, UsedChars={used}/{budget}, Truncated/BudgetBreak={truncated_cnt}")
+        
         return {
             "items": selected,
             "candidates": candidates,
@@ -205,7 +235,7 @@ class AIRetrievalPipeline:
         body_text = "\n\n".join([item["text"] for item in body_items]) if body_items else "无"
         return f"【摘要证据】\n{summary_text}\n\n【正文证据】\n{body_text}"
 
-    def run(self, query: str) -> Dict[str, Any]:
+    def run(self, query: str, intent_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         执行完整的AI检索流程
         """
@@ -215,10 +245,13 @@ class AIRetrievalPipeline:
         # 清除旧的向量存储上下文
         self.vector_store.clear()
 
-        # 1. 意图识别
-        intent_info = self.intent_recognizer.classify_intent(query)
-        logger.info(f"Intent info: {intent_info}")
-        print(f"【RAG】意图识别完成，是否需要检索：{intent_info.get('needs_search', True)}")
+        # 1. 意图识别 (如果外部未传入，则进行识别)
+        if not intent_info:
+            intent_info = self.intent_recognizer.classify_intent(query)
+            logger.info(f"Intent info: {intent_info}")
+            print(f"【RAG】意图识别完成，是否需要检索：{intent_info.get('needs_search', True)}")
+        else:
+            print(f"【RAG】使用外部传入意图：{intent_info.get('primary_intent')} (Needs Search: {intent_info.get('needs_search')})")
 
         # 2. 判断是否需要检索
         if not intent_info.get('needs_search', True):
@@ -304,6 +337,8 @@ class AIRetrievalPipeline:
             
             # 将联网检索到的正文存入向量库后，检索相关片段作为 Body Evidence 候选（抓取正文的高相关段落）
             relevant_docs = self.vector_store.similarity_search(query, k=self.config.EVIDENCE_BODY_CANDIDATE_K)
+            print(f"【RAG】向量检索完成，候选片段数：{len(relevant_docs)}")
+            
             # 依据 Top N 与 token长度预算 => 两个都得满足 => 构建 Body Evidence
             body_section = self._build_body_section(relevant_docs)
 
@@ -317,8 +352,10 @@ class AIRetrievalPipeline:
 
         logger.info("-------------准备LLM生成回答-------------------")
         print(
-            "【RAG】证据构建完成，摘要/正文条目数："
-            f"{len(summary_section.get('items', []))}/{len(body_section.get('items', []))}"
+            "【RAG】证据构建完成\n"
+            f"- Summary: {len(summary_section.get('items', []))} items, {summary_section.get('used_chars', 0)}/{summary_section.get('budget_chars', 0)} chars\n"
+            f"- Body: {len(body_section.get('items', []))} items, {body_section.get('used_chars', 0)}/{body_section.get('budget_chars', 0)} chars\n"
+            f"- Total Context: {len(context_text)} chars"
         )
 
 
