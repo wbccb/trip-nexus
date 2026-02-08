@@ -333,7 +333,8 @@ class AgentUI:
                 tool_whitelist=tool_whitelist,
                 force_sop=True,
             )
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] plan生成完成，任务数: {len(plan.tasks)} \n\n")
+            tools = [t.tool for t in plan.tasks if t.type == "tool_call" and t.tool]
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] plan生成完成，工具序列: {', '.join(tools)} \n\n")
             st.session_state.agent_plan_preview = plan.model_dump()
             st.session_state.agent_user_input_resolved = user_input
             st.session_state.agent_context_texts = context_texts

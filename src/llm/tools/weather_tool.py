@@ -1,8 +1,8 @@
 from typing import Dict, Any, Optional
 import requests
 
-
-def get_daily_weather(city: str, date: Optional[str] = None) -> Dict[str, Any]:
+def get_daily_weather(city: str, date: Optional[str] = None, days: int = 7) -> Dict[str, Any]:
+    print("\n【请求】get_daily_weather", city, date, days)
     geo_resp = requests.get(
         "https://geocoding-api.open-meteo.com/v1/search",
         params={"name": city, "count": 1, "language": "zh", "format": "json"},
@@ -17,6 +17,10 @@ def get_daily_weather(city: str, date: Optional[str] = None) -> Dict[str, Any]:
     lon = results[0].get("longitude")
     if lat is None or lon is None:
         raise RuntimeError(f"weather geocode missing coordinates for city: {city}")
+    
+    # 限制预报天数在 1-16 天之间（Open-Meteo 限制）
+    forecast_days = max(1, min(int(days), 16))
+    
     forecast_resp = requests.get(
         "https://api.open-meteo.com/v1/forecast",
         params={
@@ -24,6 +28,7 @@ def get_daily_weather(city: str, date: Optional[str] = None) -> Dict[str, Any]:
             "longitude": lon,
             "daily": "weathercode,temperature_2m_max,temperature_2m_min",
             "timezone": "auto",
+            "forecast_days": forecast_days,
         },
         timeout=10,
     )
@@ -46,10 +51,12 @@ def get_daily_weather(city: str, date: Optional[str] = None) -> Dict[str, Any]:
                 "weathercode": codes[idx] if idx < len(codes) else None,
             }
         )
-    return {
+    result = {
         "city": city,
         "latitude": lat,
         "longitude": lon,
         "daily": daily_list,
         "source": "open-meteo",
     }
+    print("【返回】get_daily_weather\n", result)
+    return result

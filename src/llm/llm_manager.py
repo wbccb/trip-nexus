@@ -183,9 +183,9 @@ class LlmManager:
             return []
 
         @lc_tool("weather.get_daily")
-        def weather_get_daily(city: str, date: Optional[str] = None) -> Dict[str, Any]:
+        def weather_get_daily(city: str, date: Optional[str] = None, days: int = 7) -> Dict[str, Any]:
             """FunctionCall 天气工具：输入城市与日期，返回每日天气结构化结果。"""
-            return get_daily_weather(city, date)
+            return get_daily_weather(city, date, days)
 
         @lc_tool("geo.geocode")
         def geo_geocode(address: str, city: Optional[str] = None, attraction: Optional[str] = None) -> Dict[str, Any]:
@@ -736,6 +736,7 @@ class LlmManager:
                 "properties": {
                     "city": {"type": "string"},
                     "date": {"type": "string", "description": "YYYY-MM-DD", "optional": True},
+                    "days": {"type": "integer", "description": "预测天数，默认7天", "optional": True, "default": 7},
                 },
                 "required": ["city"],
             },
@@ -1030,14 +1031,8 @@ class LlmManager:
 
         return content
 
-    def generate_trip(self, user_input: Dict[str, Any], context: List[str],
-                      edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        print("-------------------------------一次性generate_trip（非流式）生成 触发-------------------------------")
-        """生成行程：通过可视化界面操作输入文字进行行程的生成"""
-        prompt = self.build_trip_prompt(user_input, context, edit_cmd)
-
-        print(f"[{_ts()}][LlmManager] generate_trip start, destination={user_input.get('destination')}, days={user_input.get('days')}, attempt_count=2")
-
+    def _execute_trip_generation(self, prompt: str) -> Optional[Dict[str, Any]]:
+        """执行行程生成的通用循环逻辑（重试、解析、指标记录）"""
         for attempt in range(2):
             try:
                 # 记录本次行程生成尝试的开始指标
@@ -1106,6 +1101,34 @@ class LlmManager:
                 )
                 if attempt == 1:
                     return None
+        return None
+
+    def generate_trip_pure(self, user_input: Dict[str, Any], context: List[str],
+                           edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        纯生成行程：不包含内置工具调用逻辑，仅基于传入的上下文和约束生成行程。
+        专供 Agent 模式使用，因为 Agent 已通过独立的 Task 完成了工具调用。
+        """
+        constraints_text = self._build_constraints_context(user_input)
+        merged_context: List[str] = []
+        if context:
+            merged_context.extend(context)
+        if constraints_text:
+            merged_context.append(constraints_text)
+            
+        prompt = self.build_prompt(user_input, merged_context, edit_cmd)
+        
+        print(f"[{_ts()}][LlmManager] generate_trip_pure start, destination={user_input.get('destination')}, days={user_input.get('days')}")
+        return self._execute_trip_generation(prompt)
+
+    def generate_trip(self, user_input: Dict[str, Any], context: List[str],
+                      edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        print("-------------------------------一次性generate_trip（非流式）生成 触发-------------------------------")
+        """生成行程：通过可视化界面操作输入文字进行行程的生成"""
+        prompt = self.build_trip_prompt(user_input, context, edit_cmd)
+
+        print(f"[{_ts()}][LlmManager] generate_trip start, destination={user_input.get('destination')}, days={user_input.get('days')}, attempt_count=2")
+        return self._execute_trip_generation(prompt)
 
     def analyze_user_message(
         self,

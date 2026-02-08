@@ -137,11 +137,12 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
     ) -> Plan:
         # 生成 SOP 计划
         sop_plan = self._build_sop_plan(user_input, agent_config)
-        print(f"\n[{time.strftime('%H:%M:%S')}] [PlannerAgent] 生成 SOP 计划")
+        # print(f"\n[{time.strftime('%H:%M:%S')}] [PlannerAgent] 生成 SOP 计划")
         # 判断是否需要 SOP
         if force_sop:
             sop_plan.validate_plan(tool_whitelist=set(tool_whitelist))
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 强制使用固定流程的 SOP 计划\n")
+            tools = [t.tool for t in sop_plan.tasks if t.type == "tool_call"]
+            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 使用 SOP 计划，工具序列: {', '.join(tools)}\n")
             return sop_plan
         # 读取工具清单
         tool_registry = self._llm_manager.list_tools()
@@ -154,7 +155,7 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
             print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 即将调用大模型......进行任务规划")
             print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 用户意图: {user_intent}")
             print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 用户输入: {json.dumps(user_input, ensure_ascii=False)}")
-            
+            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] prompt\n: {prompt}")
             # 调用分析模型
             # 这里使用 analysis_llm 进行意图理解和计划生成
             raw_response = self._llm_manager.get_analysis_llm().invoke(prompt)
@@ -172,7 +173,8 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
             # 校验计划合法性
             plan.validate_plan(tool_whitelist=set(tool_whitelist))
 
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 大模型-任务规划完成并完成校验，返回计划： {plan.tasks}\n")
+            tools = [t.tool for t in plan.tasks if t.type == "tool_call"]
+            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 规划完成，工具序列: {', '.join(tools)}\n")
             return plan
         except Exception as e:
             # [LOG] 大模型调用或解析失败
@@ -302,7 +304,7 @@ class AgentExecutor:
             
             # 调用行程生成
             # generate_trip 内部会构建 prompt 并调用 LLM 生成详细行程 JSON
-            draft = self._llm_manager.generate_trip(state.user_input, context_payload) or {}
+            draft = self._llm_manager.generate_trip_pure(state.user_input, context_payload) or {}
             
             # [LOG] 调用大模型生成行程后
             trip_days = draft.get("days") if isinstance(draft, dict) else "Unknown"
@@ -352,6 +354,7 @@ class AgentExecutor:
             asyncio.to_thread(self._execute_task, task, state, agent_config)
             for task in batch
         ]
+        print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 并发执行任务: {tasks}")
         # 并发执行并返回结果
         return await asyncio.gather(*tasks)
 
@@ -435,37 +438,32 @@ class AgentExecutor:
             for task, result in results:
                 # 缓存原始结果
                 state.task_results[task.id] = result
-                # 判定成功
                 success = bool(result.get("success"))
-                # 记录摘要
                 state.task_summaries[task.id] = self._summarize_task(task, success)
-                # 更新完成/失败集合
-                if success:
+                final_success = success
+                if not success:
+                    retry_count = state.retry_counts.get(task.id, 0)
+                    if retry_count < retry_limit:
+                        state.retry_counts[task.id] = retry_count + 1
+                        retry_task, retry_result = self._execute_task(task, state, agent_config)
+                        state.task_results[retry_task.id] = retry_result
+                        final_success = bool(retry_result.get("success"))
+                        state.task_summaries[retry_task.id] = self._summarize_task(retry_task, final_success)
+                if final_success:
                     state.completed_tasks.add(task.id)
                     scheduler.mark_done(task.id)
                 else:
                     state.failed_tasks.add(task.id)
-                    # 处理重试
-                    retry_count = state.retry_counts.get(task.id, 0)
-                    if retry_count < retry_limit:
-                        state.retry_counts[task.id] = retry_count + 1
-                        # 直接重试一次
-                        retry_task, retry_result = self._execute_task(task, state, agent_config)
-                        state.task_results[retry_task.id] = retry_result
-                        success = bool(retry_result.get("success"))
-                        state.task_summaries[retry_task.id] = self._summarize_task(retry_task, success)
-                        if success:
-                            state.completed_tasks.add(retry_task.id)
-                            scheduler.mark_done(retry_task.id)
-                        else:
-                            state.failed_tasks.add(retry_task.id)
+                    if task.type == "tool_call":
+                        output_key = task.output_key or "result"
+                        state.shared_context.write(task.id, output_key, {})
+                    scheduler.mark_done(task.id)
                 # 反思器判断是否触发重规划
                 if reflector.should_replan(task, result) and reflector.can_replan(state):
                     replan_triggered = True
                     error_context = {"task_id": task.id, "result": result}
                     print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 反思器判断触发重规划，任务 ID: {task.id}")
-                else:
-                    print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 反思器判断不触发重规划")
+                
             # 落快照
             snapshot_store.add(
                 thread_id,
@@ -489,17 +487,12 @@ class AgentExecutor:
                     force_sop=False,
                     error_context=error_context,
                 )
-                print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 重规划完成，新计划任务数: {new_plan.tasks}，重新初始化scheduler，重新回到循环中\n")
+                tools = [t.tool for t in new_plan.tasks if t.type == "tool_call"]
+                print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 重规划完成，工具序列: {', '.join(tools)}；已重置调度器并继续执行\n")
                 state.plan = new_plan.tasks
                 scheduler = Scheduler(new_plan.tasks)
                 event_bus.emit("replan", thread_id, "executor", {"depth": state.replan_depth})
                 continue
-            # 失败任务且无法重规划则终止
-            if state.failed_tasks:
-                state.status = "failed"
-                state.error = "task_failed"
-                state.stop_reason = "task_failed"
-                break
         # 生成最终聚合输出
         state.final_payload = {
             "draft_trip": state.shared_context.resolve("t4.draft_trip", default={}),
