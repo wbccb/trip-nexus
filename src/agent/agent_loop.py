@@ -137,9 +137,11 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
     ) -> Plan:
         # 生成 SOP 计划
         sop_plan = self._build_sop_plan(user_input, agent_config)
+        print(f"\n[{time.strftime('%H:%M:%S')}] [PlannerAgent] 生成 SOP 计划")
         # 判断是否需要 SOP
-        if force_sop or user_intent == "generate_trip":
+        if force_sop:
             sop_plan.validate_plan(tool_whitelist=set(tool_whitelist))
+            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 强制使用固定流程的 SOP 计划\n")
             return sop_plan
         # 读取工具清单
         tool_registry = self._llm_manager.list_tools()
@@ -149,7 +151,7 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
         prompt = self._build_plan_prompt(user_intent, user_input, tool_registry, sop_templates, error_context=error_context)
         try:
             # [LOG] 调用大模型前打印信息
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 即将调用大模型生成计划...")
+            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 即将调用大模型......进行任务规划")
             print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 用户意图: {user_intent}")
             print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 用户输入: {json.dumps(user_input, ensure_ascii=False)}")
             
@@ -161,14 +163,16 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
             response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
             
             # [LOG] 调用大模型后打印信息
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 大模型调用完成")
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 原始响应长度: {len(str(response_text))}")
+            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 大模型-任务规划完成")
+            # print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 原始响应长度: {len(str(response_text))}")
             # print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 原始响应内容: {response_text}") # 内容可能较长，按需开启
 
             # 解析计划
             plan = self._parse_plan_response(str(response_text))
             # 校验计划合法性
             plan.validate_plan(tool_whitelist=set(tool_whitelist))
+
+            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 大模型-任务规划完成并完成校验，返回计划\n")
             return plan
         except Exception as e:
             # [LOG] 大模型调用或解析失败
@@ -402,6 +406,7 @@ class AgentExecutor:
             rate_limit_per_min=agent_config.get("rate_limit_per_min"),
             max_total_tasks=agent_config.get("max_total_tasks"),
         )
+        print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 初始化调度器")
         # 主循环
         while True:
             # 获取就绪批次
@@ -415,6 +420,7 @@ class AgentExecutor:
             event_bus.emit("batch_start", thread_id, "executor", {"tasks": state.execution_queue})
             # 执行批次任务
             try:
+                print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 执行批次任务")
                 results = await self._execute_batch(batch, state, agent_config)
             except (RateLimitExceeded, BudgetExceeded) as e:
                 # 记录预算/速率错误并终止
@@ -457,6 +463,9 @@ class AgentExecutor:
                 if reflector.should_replan(task, result) and reflector.can_replan(state):
                     replan_triggered = True
                     error_context = {"task_id": task.id, "result": result}
+                    print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 反思器判断触发重规划，任务 ID: {task.id}")
+                else:
+                    print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 反思器判断不触发重规划")
             # 落快照
             snapshot_store.add(
                 thread_id,
@@ -469,6 +478,7 @@ class AgentExecutor:
             )
             # 触发重规划
             if replan_triggered:
+                print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 开始重规划")
                 state.plan_history.append(list(state.plan))
                 state.replan_depth = int(state.replan_depth) + 1
                 new_plan = self._planner.plan(
@@ -479,6 +489,7 @@ class AgentExecutor:
                     force_sop=False,
                     error_context=error_context,
                 )
+                print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 重规划完成，新计划任务数: {new_plan.tasks}，重新初始化scheduler，重新回到循环中\n")
                 state.plan = new_plan.tasks
                 scheduler = Scheduler(new_plan.tasks)
                 event_bus.emit("replan", thread_id, "executor", {"depth": state.replan_depth})

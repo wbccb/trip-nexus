@@ -234,7 +234,7 @@ class AIRetrievalPipeline:
             }
 
         # 3. 多源搜索 (获取搜索结果摘要)
-        logger.info("准备开始SearchXNR搜索url列表")
+        logger.info("【RAG】准备开始SearchXNR搜索url列表")
         search_results = self.searcher.search(query, intent_info)
         if search_results:
             logger.info(f"SearchXNR得到: 首条={search_results[0]}, 末条={search_results[-1]}")

@@ -186,7 +186,7 @@ class AgentUI:
         
         # [LOG] 意图识别后
         intent_type = intent_data.get("intent")
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 意图识别完成: {intent_type}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 意图识别完成: {intent_type} \n")
         
         # 根据意图准备行程请求参数
         trip_request = self.llm_manager.prepare_trip_request_from_intent(
@@ -309,12 +309,10 @@ class AgentUI:
             "max_total_tasks": None,
         }
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
-            build_plan = st.button("生成计划", use_container_width=True)
+            build_plan = st.button("生成计划 & 执行计划", use_container_width=True)
         with col2:
-            confirm_plan = st.button("确认执行", use_container_width=True)
-        with col3:
             clear_agent = st.button("清空事件", use_container_width=True)
 
         if clear_agent:
@@ -331,7 +329,7 @@ class AgentUI:
                 return
             
             # [LOG] 生成计划前
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 用户点击生成计划，开始处理...")
+            print(f"\n\n[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 用户点击生成计划，开始处理...")
             
             # 再次调用意图分析，确认最新意图
             intent_data = self.llm_manager.analyze_user_message(input_text, context=[], current_trip=None)
@@ -344,6 +342,7 @@ class AgentUI:
             
             # 调用 PlannerAgent 生成计划
             # plan() 内部会调用 LLM 生成 DAG 任务图
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 调用 PlannerAgent 生成计划...调用 LLM 生成 DAG 任务图")
             plan = self._planner_agent.plan(
                 user_intent=user_intent,
                 user_input=user_input,
@@ -353,13 +352,13 @@ class AgentUI:
             )
             
             # [LOG] 计划生成后
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 计划生成完成，任务数: {len(plan.tasks)}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] plan生成完成，任务数: {len(plan.tasks)} \n\n")
             
             st.session_state.agent_plan_preview = plan.model_dump()
             st.session_state.agent_plan_intent = user_intent
             st.session_state.agent_plan_confirmed = False
 
-        if confirm_plan:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 开始执行计划！")
             plan_payload = st.session_state.get("agent_plan_preview")
             if not plan_payload:
                 st.warning("请先生成计划")

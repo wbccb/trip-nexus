@@ -115,7 +115,7 @@ class MultiSourceSearcher:
                     if len(results) >= 5:
                         break
             
-            logger.info(f"DuckDuckGo fallback retrieved {len(results)} results")
+            logger.info(f"DuckDuckGo fallback 拿到 {len(results)} results")
             # 记录 fallback 成功指标
             self._metrics.record("search_fallback_success", {"engine": "duckduckgo_html", "results": len(results)})
             return results
