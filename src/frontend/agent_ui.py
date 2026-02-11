@@ -361,148 +361,6 @@ class AgentUI:
             "max_total_tasks": None,
         }
 
-        # 检查是否处于暂停状态
-        last_state_data = st.session_state.get("agent_last_state")
-        last_state = None
-        if last_state_data:
-            if isinstance(last_state_data, dict):
-                try:
-                    last_state = TripState(**last_state_data)
-                except Exception as e:
-                    print(f"[AgentUI] Failed to restore TripState: {e}")
-            else:
-                last_state = last_state_data
-
-        is_paused = last_state and last_state.status == "paused"
-
-        if is_paused:
-            st.info(f"⚠️ Agent 已暂停，原因: {last_state.stop_reason}")
-            if last_state.stop_reason == "rag_review":
-                st.markdown("### RAG 结果人工复核")
-                tasks_to_review = []
-                # print(f"[AgentUI] 进入 RAG 复核流程，Completed: {last_state.completed_tasks}")
-                # print(f"[AgentUI] task_results keys: {list(last_state.task_results.keys())}")
-                # print(f"[AgentUI] shared_context keys: {list((last_state.shared_context.data or {}).keys())}")
-                for task_id in last_state.completed_tasks:
-                    res = last_state.task_results.get(task_id, {})
-                    # print(f"[AgentUI] 任务 {task_id} 原始结果类型: {type(res)}")
-                    if hasattr(res, "data"):
-                        data = res.data
-                    else:
-                        data = res.get("data", {})
-                    # print(f"[AgentUI] 任务 {task_id} data 类型: {type(data)}")
-                    if hasattr(data, "model_dump"):
-                        data = data.model_dump()
-                    # if isinstance(data, dict):
-                        # print(f"[AgentUI] 任务 {task_id} data keys: {list(data.keys())}")
-                    evidence = data.get("evidence") if isinstance(data, dict) else None
-                    query = data.get("query") if isinstance(data, dict) else None
-                    results = data.get("results") if isinstance(data, dict) else None
-                    if not evidence:
-                        target_task = next((t for t in last_state.plan if t.id == task_id), None)
-                        output_key = target_task.output_key if target_task else "result"
-                        ctx = last_state.shared_context.read(task_id, output_key)
-                        # print(f"[AgentUI] 任务 {task_id} shared_context({output_key}) 类型: {type(ctx)}")
-                        if isinstance(ctx, dict):
-                            # print(f"[AgentUI] 任务 {task_id} shared_context keys: {list(ctx.keys())}")
-                            evidence = ctx.get("evidence")
-                            query = query or ctx.get("query")
-                            results = results or ctx.get("results")
-                    if isinstance(evidence, dict) and evidence:
-                        # print(f"[AgentUI] 任务 {task_id} Evidence keys: {list(evidence.keys())}")
-                        # print(f"[AgentUI] 任务 {task_id} 发现 Evidence")
-                        tasks_to_review.append(
-                            {
-                                "task_id": task_id,
-                                "evidence": evidence,
-                                "query": query,
-                                "results": results,
-                            }
-                        )
-                    # else:
-                    #     print(f"[AgentUI] 任务 {task_id} 无 Evidence")
-                
-                if not tasks_to_review:
-                     st.warning("触发了 RAG 复核暂停，但未找到包含 Evidence 的任务。")
-
-                for task_info in tasks_to_review:
-                    task_id = task_info.get("task_id")
-                    evidence = task_info.get("evidence") or {}
-                    query = task_info.get("query")
-                    st.markdown(f"**任务 {task_id} 的 RAG 证据**")
-                    evidence_view = dict(evidence)
-                    if query:
-                        evidence_view["_query"] = query
-                    #print(f"[AgentUI] 渲染 Evidence 面板 task={task_id} keys={list(evidence_view.keys())}")
-                    # 渲染交互面板 (状态保存在 session_state.rag_evidence_ui)
-                    self._render_rag_evidence_panel(evidence_view, f"review_{task_id}")
-
-                if tasks_to_review and st.button("确认复核并继续执行", type="primary"):
-                    with st.spinner("正在应用修改并恢复执行..."):
-                        # 更新 SharedContext 中的 evidence
-                        for task_info in tasks_to_review:
-                            task_id = task_info.get("task_id")
-                            res = last_state.task_results.get(task_id, {})
-                            # 兼容提取
-                            if hasattr(res, "data"):
-                                data = res.data
-                            else:
-                                data = res.get("data", {})
-                            if hasattr(data, "model_dump"):
-                                data = data.model_dump()
-
-                            original_evidence = task_info.get("evidence") or data.get("evidence")
-                            
-                            # 重建 evidence
-                            new_evidence = self._reconstruct_evidence(original_evidence, f"review_{task_id}")
-
-                            # 更新 state.task_results (用于历史记录)
-                            # 注意：如果是 dict 直接更新，如果是对象则无法直接 setitem?
-                            # 假设 task_results 存储的是 dict (因为 _execute_task 返回的是 dict)
-                            if isinstance(last_state.task_results.get(task_id), dict):
-                                if not isinstance(last_state.task_results[task_id].get("data"), dict):
-                                    last_state.task_results[task_id]["data"] = {}
-                                last_state.task_results[task_id]["data"]["evidence"] = new_evidence
-                            elif hasattr(last_state.task_results[task_id], "data"):
-                                # 如果是对象，尝试修改属性（可能不可变）
-                                # 但 _execute_task 返回的是 dict，所以应该是 dict。
-                                pass
-                            
-                            # 更新 SharedContext (用于下游任务)
-                            # poi.search 写入的是 {"query": ..., "results": ..., "evidence": ...}
-                            # 我们需要读取 context 中现有的值并更新
-                            target_task = next((t for t in last_state.plan if t.id == task_id), None)
-                            output_key = target_task.output_key if target_task else "result"
-                            current_ctx = last_state.shared_context.read(task_id, output_key)
-                            
-                            # 更新 Context
-                            if current_ctx:
-                                current_ctx["evidence"] = new_evidence
-                                last_state.shared_context.write(task_id, output_key, current_ctx)
-                            else:
-                                # 如果 Context 中没有，可能是写入失败或者 key 不对。
-                                # 尝试直接覆盖
-                                update_data = {
-                                    "evidence": new_evidence,
-                                    "results": task_info.get("results") or data.get("results"),
-                                    "query": task_info.get("query") or data.get("query"),
-                                }
-                                last_state.shared_context.write(task_id, output_key, update_data)
-
-                        # 恢复执行
-                        final_state = run_agent_loop_sync(
-                            llm_manager=self.llm_manager,
-                            user_input=st.session_state.get("agent_user_input_resolved") or {},
-                            thread_id=thread_id,
-                            agent_config=st.session_state.agent_config,
-                            user_intent=st.session_state.get("agent_plan_intent", ""),
-                            context=st.session_state.get("agent_context_texts"),
-                            plan_override=None,
-                            initial_state=last_state
-                        )
-                        st.session_state.agent_last_state = final_state
-                        st.rerun()
-
         col1, col2 = st.columns(2)
         with col1:
             build_plan = st.button("生成计划 & 执行计划", use_container_width=True)
@@ -578,121 +436,6 @@ class AgentUI:
                 st.session_state.agent_last_state = {"status": "failed", "error": error_payload}
                 return
 
-        last_state_raw = st.session_state.agent_last_state or {}
-        if hasattr(last_state_raw, "model_dump"):
-            last_state = last_state_raw.model_dump()
-        elif isinstance(last_state_raw, dict):
-            last_state = last_state_raw
-        else:
-            last_state = {}
-        plan_preview = st.session_state.get("agent_plan_preview")
-        plan_payload_for_map = plan_preview
-        if isinstance(last_state, dict) and last_state.get("plan"):
-            plan_payload_for_map = {"tasks": last_state.get("plan")}
-        task_title_map = self._build_task_title_map(plan_payload_for_map)
-        if plan_preview:
-            try:
-                preview_plan = Plan(tasks=[Task(**item) for item in (plan_preview.get("tasks") or [])])
-                self._render_plan_preview(preview_plan)
-            except Exception:
-                st.warning("计划预览解析失败")
-        if isinstance(last_state, dict):
-            map_payload = last_state.get("map_payload") or {}
-            final_payload = last_state.get("final_payload") or {}
-            plan_items = last_state.get("plan") or []
-            shared_context = last_state.get("shared_context") or {}
-            shared_data = shared_context.get("data") if isinstance(shared_context, dict) else {}
-            map_task_id = None
-            map_output_key = None
-            summary_task_id = None
-            summary_output_key = None
-            if isinstance(plan_items, list):
-                for item in plan_items:
-                    if not isinstance(item, dict):
-                        continue
-                    task_type = item.get("type")
-                    if task_type == "map_render" and not map_task_id:
-                        map_task_id = item.get("id")
-                        map_output_key = item.get("output_key") or "map_payload"
-                    if task_type == "trip_summarize" and not summary_task_id:
-                        summary_task_id = item.get("id")
-                        summary_output_key = item.get("output_key") or "summary"
-            map_payload_from_final = final_payload.get("map_payload") if isinstance(final_payload, dict) else {}
-            summary_payload_from_final = final_payload.get("summary") if isinstance(final_payload, dict) else {}
-            if not map_payload:
-                if isinstance(map_payload_from_final, dict):
-                    map_payload = map_payload_from_final
-                elif map_task_id and isinstance(shared_data, dict):
-                    map_payload = (shared_data.get(map_task_id) or {}).get(map_output_key or "map_payload") or {}
-            summary_payload = summary_payload_from_final if isinstance(summary_payload_from_final, dict) else {}
-            if not summary_payload:
-                if summary_task_id and isinstance(shared_data, dict):
-                    summary_payload = (shared_data.get(summary_task_id) or {}).get(summary_output_key or "summary") or {}
-            if isinstance(map_payload, dict):
-                rag_answer = map_payload.get("rag_answer")
-                if rag_answer:
-                    st.markdown("#### RAG 回答")
-                    st.markdown(str(rag_answer))
-
-                rag_query = map_payload.get("rag_query")
-                rag_evidence = (
-                    map_payload.get("rag_evidence")
-                    or map_payload.get("evidence")
-                    or map_payload.get("rag_result", {}).get("evidence")
-                )
-                if isinstance(rag_evidence, dict) and rag_evidence:
-                    evidence_view = dict(rag_evidence)
-                    if rag_query:
-                        evidence_view["_query"] = rag_query
-                    self._render_rag_evidence_panel(evidence_view, panel_key=f"agent::{thread_id}")
-                map_html = map_payload.get("map_html")
-                if map_html:
-                    st.markdown("#### 行程地图")
-                    st.components.v1.html(map_html, height=520, width=1000, scrolling=True)
-
-            # [Added] 渲染任务中的 RAG 回答 (e.g. POI)
-            task_results = last_state.get("task_results") or {}
-            for task_id, res in task_results.items():
-                if not isinstance(res, dict): continue
-                data = res.get("data")
-                if isinstance(data, dict) and data.get("rag_answer"):
-                    st.markdown(f"#### RAG 回答 ({task_id})")
-                    st.markdown(str(data.get("rag_answer")))
-
-            if summary_payload:
-                summary_text = summary_payload.get("summary") if isinstance(summary_payload, dict) else summary_payload
-                if summary_text:
-                    st.markdown("#### 行程摘要")
-                    st.markdown(str(summary_text))
-
-            self._render_task_summaries(
-                last_state.get("task_summaries") or {},
-                task_title_map,
-                last_state.get("task_results") or {},
-            )
-
-        events = event_bus.list(thread_id)
-        if events:
-            st.markdown("#### 事件流")
-            for event in sorted(events, key=lambda e: e["ts"]):
-                st.markdown(f"- {self._format_event_line(event, task_title_map, last_state.get('task_summaries') or {})}")
-
-        snapshots = snapshot_store.list(thread_id)
-        if snapshots:
-            st.markdown("#### 快照面板")
-            for snap in snapshots:
-                ts_value = snap.get("ts")
-                ts = datetime.fromtimestamp(ts_value).strftime("%H:%M:%S") if ts_value else "-"
-                step = snap.get("step")
-                duration_ms = snap.get("duration_ms")
-                payload_keys = ", ".join(list((snap.get("payload") or {}).keys()))
-                st.markdown(f"- {ts} | {step} | {duration_ms}ms | {payload_keys}")
-
-        agent_status = last_state.get("status") if isinstance(last_state, dict) else getattr(last_state, "status", None)
-        autorefresh = getattr(st, "autorefresh", None)
-        if callable(autorefresh) and agent_status in ("running", "paused"):
-            autorefresh(interval=1000, key="agent_debug_autorefresh")
-
     def _build_task_status_from_plan(
         self,
         plan: List[Dict[str, Any]],
@@ -725,11 +468,101 @@ class AgentUI:
         # 返回状态结果
         return status_map, activity_map, node_order
 
+    def _collect_rag_review_tasks(self, state: TripState) -> List[Dict[str, Any]]:
+        # 统一收集需要 RAG 人工复核的任务信息
+        tasks_to_review: List[Dict[str, Any]] = []
+        # 遍历已完成任务，筛选包含 Evidence 的任务
+        for task_id in state.completed_tasks:
+            # 读取任务结果
+            res = state.task_results.get(task_id, {})
+            # 兼容对象/字典两种结果结构
+            if hasattr(res, "data"):
+                data = res.data
+            else:
+                data = res.get("data", {})
+            # 兼容 Pydantic 的 model_dump
+            if hasattr(data, "model_dump"):
+                data = data.model_dump()
+            # 初始化 Evidence/Query/Results
+            evidence = data.get("evidence") if isinstance(data, dict) else None
+            query = data.get("query") if isinstance(data, dict) else None
+            results = data.get("results") if isinstance(data, dict) else None
+            # 结果里未带 Evidence 时，尝试从 SharedContext 读取
+            if not evidence:
+                target_task = next((t for t in state.plan if t.id == task_id), None)
+                output_key = target_task.output_key if target_task else "result"
+                ctx = state.shared_context.read(task_id, output_key)
+                if isinstance(ctx, dict):
+                    evidence = ctx.get("evidence")
+                    query = query or ctx.get("query")
+                    results = results or ctx.get("results")
+            # 仅收集包含 Evidence 的任务
+            if isinstance(evidence, dict) and evidence:
+                tasks_to_review.append(
+                    {
+                        "task_id": task_id,
+                        "evidence": evidence,
+                        "query": query,
+                        "results": results,
+                    }
+                )
+        # 返回复核任务列表
+        return tasks_to_review
+
+    def _resolve_map_and_summary_payload(self, last_state: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:
+        map_payload = last_state.get("map_payload") or {}
+        final_payload = last_state.get("final_payload") or {}
+        plan_items = last_state.get("plan") or []
+        shared_context = last_state.get("shared_context") or {}
+        shared_data = shared_context.get("data") if isinstance(shared_context, dict) else {}
+        map_task_id = None
+        map_output_key = None
+        summary_task_id = None
+        summary_output_key = None
+        if isinstance(plan_items, list):
+            for item in plan_items:
+                if not isinstance(item, dict):
+                    continue
+                task_type = item.get("type")
+                if task_type == "map_render" and not map_task_id:
+                    map_task_id = item.get("id")
+                    map_output_key = item.get("output_key") or "map_payload"
+                if task_type == "trip_summarize" and not summary_task_id:
+                    summary_task_id = item.get("id")
+                    summary_output_key = item.get("output_key") or "summary"
+        map_payload_from_final = final_payload.get("map_payload") if isinstance(final_payload, dict) else {}
+        summary_payload_from_final = final_payload.get("summary") if isinstance(final_payload, dict) else {}
+        if not map_payload:
+            if isinstance(map_payload_from_final, dict):
+                map_payload = map_payload_from_final
+            elif map_task_id and isinstance(shared_data, dict):
+                map_payload = (shared_data.get(map_task_id) or {}).get(map_output_key or "map_payload") or {}
+        summary_payload = summary_payload_from_final if isinstance(summary_payload_from_final, dict) else {}
+        if not summary_payload:
+            if summary_task_id and isinstance(shared_data, dict):
+                summary_payload = (shared_data.get(summary_task_id) or {}).get(summary_output_key or "summary") or {}
+        return map_payload, summary_payload
+
     def render_status_panel(self, thread_id: Optional[str] = None, floating: bool = True) -> None:
         active_thread_id = thread_id or st.session_state.get("agent_thread_id") or ""
         if not active_thread_id:
             return
-        last_state = st.session_state.get("agent_last_state") or {}
+        thread_id = active_thread_id
+        last_state_raw = st.session_state.get("agent_last_state") or {}
+        if hasattr(last_state_raw, "model_dump"):
+            last_state = last_state_raw.model_dump()
+        elif isinstance(last_state_raw, dict):
+            last_state = last_state_raw
+        else:
+            last_state = {}
+        last_state_obj = None
+        if isinstance(last_state_raw, TripState):
+            last_state_obj = last_state_raw
+        elif isinstance(last_state_raw, dict):
+            try:
+                last_state_obj = TripState(**last_state_raw)
+            except Exception as e:
+                print(f"[AgentUI] Failed to restore TripState: {e}")
         plan = last_state.get("plan") if isinstance(last_state, dict) else None
         if plan:
             status_map, activity_map, node_order = self._build_task_status_from_plan(
@@ -738,7 +571,17 @@ class AgentUI:
                 failed_tasks=list(last_state.get("failed_tasks") or []),
             )
         else:
-            return
+            status_map, activity_map, node_order = {}, {}, []
+        # 预先收集 RAG 复核任务，便于同步更新状态图
+        tasks_to_review: List[Dict[str, Any]] = []
+        # 仅在暂停且为 RAG 复核时收集任务
+        if last_state_obj and last_state_obj.status == "paused" and last_state_obj.stop_reason == "rag_review":
+            tasks_to_review = self._collect_rag_review_tasks(last_state_obj)
+            # 将复核任务状态标记为暂停，避免显示为 Done
+            for task_info in tasks_to_review:
+                task_id = task_info.get("task_id")
+                if task_id and task_id in status_map:
+                    status_map[task_id] = "paused"
         status_color = {
             "pending": "#9aa0a6",
             "running": "#1a73e8",
@@ -864,6 +707,189 @@ class AgentUI:
                 unsafe_allow_html=True,
             )
         st.markdown(panel_html, unsafe_allow_html=True)
+        # 判断是否处于暂停态
+        is_paused = last_state_obj and last_state_obj.status == "paused"
+        if is_paused:
+            st.info(f"⚠️ Agent 已暂停，原因: {last_state_obj.stop_reason}")
+            if last_state_obj.stop_reason == "rag_review":
+                st.markdown("### RAG 结果人工复核")
+                # 若前置未收集到任务，补一次收集
+                if not tasks_to_review:
+                    tasks_to_review = self._collect_rag_review_tasks(last_state_obj)
+                # 无 Evidence 任务时给出提示
+                if not tasks_to_review:
+                    st.warning("触发了 RAG 复核暂停，但未找到包含 Evidence 的任务。")
+
+                for task_info in tasks_to_review:
+                    task_id = task_info.get("task_id")
+                    evidence = task_info.get("evidence") or {}
+                    query = task_info.get("query")
+                    st.markdown(f"**任务 {task_id} 的 RAG 证据**")
+                    evidence_view = dict(evidence)
+                    if query:
+                        evidence_view["_query"] = query
+                    #print(f"[AgentUI] 渲染 Evidence 面板 task={task_id} keys={list(evidence_view.keys())}")
+                    # 渲染交互面板 (状态保存在 session_state.rag_evidence_ui)
+                    self._render_rag_evidence_panel(evidence_view, f"review_{task_id}")
+
+                if tasks_to_review and st.button("确认复核并继续执行", type="primary"):
+                    with st.spinner("正在应用修改并恢复执行..."):
+                        # 更新 SharedContext 中的 evidence
+                        for task_info in tasks_to_review:
+                            task_id = task_info.get("task_id")
+                            res = last_state_obj.task_results.get(task_id, {})
+                            # 兼容提取
+                            if hasattr(res, "data"):
+                                data = res.data
+                            else:
+                                data = res.get("data", {})
+                            if hasattr(data, "model_dump"):
+                                data = data.model_dump()
+
+                            original_evidence = task_info.get("evidence") or data.get("evidence")
+                            
+                            # 重建 evidence
+                            new_evidence = self._reconstruct_evidence(original_evidence, f"review_{task_id}")
+
+                            # 更新 state.task_results (用于历史记录)
+                            # 注意：如果是 dict 直接更新，如果是对象则无法直接 setitem?
+                            # 假设 task_results 存储的是 dict (因为 _execute_task 返回的是 dict)
+                            if isinstance(last_state_obj.task_results.get(task_id), dict):
+                                if not isinstance(last_state_obj.task_results[task_id].get("data"), dict):
+                                    last_state_obj.task_results[task_id]["data"] = {}
+                                last_state_obj.task_results[task_id]["data"]["evidence"] = new_evidence
+                            elif hasattr(last_state_obj.task_results[task_id], "data"):
+                                # 如果是对象，尝试修改属性（可能不可变）
+                                # 但 _execute_task 返回的是 dict，所以应该是 dict。
+                                pass
+                            
+                            # 更新 SharedContext (用于下游任务)
+                            # poi.search 写入的是 {"query": ..., "results": ..., "evidence": ...}
+                            # 我们需要读取 context 中现有的值并更新
+                            target_task = next((t for t in last_state_obj.plan if t.id == task_id), None)
+                            output_key = target_task.output_key if target_task else "result"
+                            current_ctx = last_state_obj.shared_context.read(task_id, output_key)
+                            
+                            # 更新 Context
+                            if current_ctx:
+                                current_ctx["evidence"] = new_evidence
+                                last_state_obj.shared_context.write(task_id, output_key, current_ctx)
+                            else:
+                                # 如果 Context 中没有，可能是写入失败或者 key 不对。
+                                # 尝试直接覆盖
+                                update_data = {
+                                    "evidence": new_evidence,
+                                    "results": task_info.get("results") or data.get("results"),
+                                    "query": task_info.get("query") or data.get("query"),
+                                }
+                                last_state_obj.shared_context.write(task_id, output_key, update_data)
+
+                        # 恢复执行
+                        final_state = run_agent_loop_sync(
+                            llm_manager=self.llm_manager,
+                            user_input=st.session_state.get("agent_user_input_resolved") or {},
+                            thread_id=thread_id,
+                            agent_config=st.session_state.agent_config,
+                            user_intent=st.session_state.get("agent_plan_intent", ""),
+                            context=st.session_state.get("agent_context_texts"),
+                            plan_override=None,
+                            initial_state=last_state_obj
+                        )
+                        st.session_state.agent_last_state = final_state
+                        st.rerun()
+
+        plan_preview = st.session_state.get("agent_plan_preview")
+        plan_payload_for_map = plan_preview
+        if isinstance(last_state, dict) and last_state.get("plan"):
+            plan_payload_for_map = {"tasks": last_state.get("plan")}
+        task_title_map = self._build_task_title_map(plan_payload_for_map)
+        if plan_preview:
+            try:
+                preview_plan = Plan(tasks=[Task(**item) for item in (plan_preview.get("tasks") or [])])
+                self._render_plan_preview(preview_plan)
+            except Exception:
+                st.warning("计划预览解析失败")
+        if isinstance(last_state, dict):
+            map_payload, _ = self._resolve_map_and_summary_payload(last_state)
+            if isinstance(map_payload, dict):
+                rag_answer = map_payload.get("rag_answer")
+                if rag_answer:
+                    st.markdown("#### RAG 回答")
+                    st.markdown(str(rag_answer))
+
+                rag_query = map_payload.get("rag_query")
+                rag_evidence = (
+                    map_payload.get("rag_evidence")
+                    or map_payload.get("evidence")
+                    or map_payload.get("rag_result", {}).get("evidence")
+                )
+                if isinstance(rag_evidence, dict) and rag_evidence:
+                    evidence_view = dict(rag_evidence)
+                    if rag_query:
+                        evidence_view["_query"] = rag_query
+                    self._render_rag_evidence_panel(evidence_view, panel_key=f"agent::{thread_id}")
+
+            task_results = last_state.get("task_results") or {}
+            for task_id, res in task_results.items():
+                if not isinstance(res, dict):
+                    continue
+                data = res.get("data")
+                if isinstance(data, dict) and data.get("rag_answer"):
+                    st.markdown(f"#### RAG 回答 ({task_id})")
+                    st.markdown(str(data.get("rag_answer")))
+
+            self._render_task_summaries(
+                last_state.get("task_summaries") or {},
+                task_title_map,
+                last_state.get("task_results") or {},
+            )
+
+        events = event_bus.list(thread_id)
+        if events:
+            st.markdown("#### 事件流")
+            for event in sorted(events, key=lambda e: e["ts"]):
+                st.markdown(f"- {self._format_event_line(event, task_title_map, last_state.get('task_summaries') or {})}")
+
+        snapshots = snapshot_store.list(thread_id)
+        if snapshots:
+            st.markdown("#### 快照面板")
+            for snap in snapshots:
+                ts_value = snap.get("ts")
+                ts = datetime.fromtimestamp(ts_value).strftime("%H:%M:%S") if ts_value else "-"
+                step = snap.get("step")
+                duration_ms = snap.get("duration_ms")
+                payload_keys = ", ".join(list((snap.get("payload") or {}).keys()))
+                st.markdown(f"- {ts} | {step} | {duration_ms}ms | {payload_keys}")
+
+        agent_status = last_state.get("status") if isinstance(last_state, dict) else getattr(last_state, "status", None)
+        autorefresh = getattr(st, "autorefresh", None)
+        if callable(autorefresh) and agent_status in ("running", "paused"):
+            autorefresh(interval=1000, key="agent_debug_autorefresh")
+
+    def render_trip_panel(self, thread_id: Optional[str] = None) -> None:
+        active_thread_id = thread_id or st.session_state.get("agent_thread_id") or ""
+        if not active_thread_id:
+            return
+        last_state_raw = st.session_state.get("agent_last_state") or {}
+        if hasattr(last_state_raw, "model_dump"):
+            last_state = last_state_raw.model_dump()
+        elif isinstance(last_state_raw, dict):
+            last_state = last_state_raw
+        else:
+            last_state = {}
+        if not isinstance(last_state, dict):
+            return
+        map_payload, summary_payload = self._resolve_map_and_summary_payload(last_state)
+        if isinstance(map_payload, dict):
+            map_html = map_payload.get("map_html")
+            if map_html:
+                st.markdown("#### 行程地图")
+                st.components.v1.html(map_html, height=520, width=1000, scrolling=True)
+        if summary_payload:
+            summary_text = summary_payload.get("summary") if isinstance(summary_payload, dict) else summary_payload
+            if summary_text:
+                st.markdown("#### 行程摘要")
+                st.markdown(str(summary_text))
 
     def render_live_panel(self, floating: bool = True) -> None:
         thread_id = st.session_state.get("agent_thread_id") or ""

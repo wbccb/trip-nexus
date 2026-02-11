@@ -64,13 +64,16 @@ def main() -> None:
         st.subheader("LLM 设置")
         ui_manager.render_llm_settings()
 
-    left_col, right_col = st.columns([0.48, 0.52])
+    left_col, middle_col, right_col = st.columns([0.34, 0.33, 0.33])
 
     with left_col:
         ui_manager.agent_ui.render_debug_panel()
 
-    with right_col:
+    with middle_col:
         ui_manager.agent_ui.render_status_panel(floating=False)
+
+    with right_col:
+        ui_manager.agent_ui.render_trip_panel()
 
 
 if __name__ == "__main__":
