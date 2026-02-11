@@ -1,13 +1,14 @@
 import json
 import uuid
 import textwrap
+import hashlib
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import streamlit as st
 
 from src.agent.event_bus import event_bus, snapshot_store
-from src.agent.agent_loop import PlannerAgent, run_agent_loop_sync
+from src.agent.agent_loop import PlannerAgent, run_agent_loop_sync, TripState
 from src.agent.plan_models import Plan, Task
 from src.llm.llm_manager import LlmManager
 from src.observability import ErrorCodes, normalize_exception
@@ -98,9 +99,9 @@ class AgentUI:
         return title_map
 
     def _truncate_text(self, text: str, max_len: int = 40) -> str:
-        if len(text) <= max_len:
-            return text
-        return text[: max_len - 1] + "…"
+        if not text:
+            return ""
+        return text[:max_len] + "..." if len(text) > max_len else text
 
     def _render_task_summaries(
         self,
@@ -160,7 +161,7 @@ class AgentUI:
             return f"{ts} 重新规划（{depth_text}），原因：上一步工具结果为空或失败{result_text}"
         if kind == "loop_end":
             status = detail.get("status") or ""
-            status_text = {"done": "完成", "failed": "失败"}.get(status, status or "结束")
+            status_text = {"done": "完成", "failed": "失败", "paused": "暂停"}.get(status, status or "结束")
             return f"{ts} 执行结束：{status_text}"
         if kind == "error":
             error_text = ""
@@ -192,6 +193,60 @@ class AgentUI:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 信息缺失: {missing_text}")
             return None, [], missing_text, intent_type
         return trip_request.get("user_input"), trip_request.get("context_texts") or [], None, intent_type
+
+    def _build_evidence_item_id(self, section: str, item: Dict[str, Any]) -> str:
+        source = str(item.get("source") or "")
+        title = str(item.get("title") or "")
+        text = str(item.get("text") or "")
+        raw = f"{section}||{source}||{title}||{text}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _reconstruct_evidence(self, original_evidence: Dict[str, Any], panel_key: str) -> Dict[str, Any]:
+        """
+        根据 UI 交互状态（rag_evidence_ui）重建 evidence 对象。
+        """
+        ui_state = st.session_state.get("rag_evidence_ui", {}).get(panel_key, {})
+        # 如果没有 UI 状态，直接返回原始数据
+        if not ui_state:
+            return original_evidence
+
+        new_evidence = original_evidence.copy()
+        
+        for section in ["summary", "body"]:
+            section_data = new_evidence.get(section, {})
+            # 获取原始列表（优先 candidates，其次 items）
+            candidates = section_data.get("candidates") or []
+            items = section_data.get("items") or []
+            base_list = candidates if candidates else items
+            
+            if not base_list:
+                continue
+
+            new_items = []
+            for item in base_list:
+                item_id = self._build_evidence_item_id(section, item)
+                item_state = ui_state.get(item_id, {})
+                
+                # 检查是否保留
+                # 注意：如果 item_state 为空（未交互且未渲染？），则默认不保留？
+                # 不，render_rag_evidence_panel 会初始化所有 items。
+                keep = item_state.get("keep", False)
+                
+                if keep:
+                    new_item = item.copy()
+                    if item_state.get("edited_text"):
+                        new_item["text"] = item_state["edited_text"]
+                    new_items.append(new_item)
+            
+            # 更新 section items
+            # 只有当确实有选中项时才更新，防止误操作清空
+            # 或者如果用户全不选，那就是空。
+            section_data["items"] = new_items
+            # 清空 candidates，表示已确认
+            section_data["candidates"] = []
+            new_evidence[section] = section_data
+        
+        return new_evidence
 
     def _build_agent_input(
         self,
@@ -250,6 +305,7 @@ class AgentUI:
         return user_input, context_texts, None, intent_type
 
     def render_debug_panel(self) -> None:
+        print(f"[AgentUI] render_debug_panel rerun_ts={datetime.now().strftime('%H:%M:%S')}")
         st.subheader("Agent 调试")
         thread_id = self.ensure_thread_id()
         st.text_input("Thread ID", value=thread_id, key="agent_thread_display", disabled=True)
@@ -289,6 +345,7 @@ class AgentUI:
             value=int(st.session_state.agent_config.get("rag_top_k") or 3),
         )
         poi_query = st.text_input("POI 查询关键词", value=st.session_state.agent_config.get("poi_query") or "热门景点")
+        manual_rag_review = st.checkbox("启用 RAG 人工复核", value=st.session_state.agent_config.get("manual_rag_review", False))
 
         st.session_state.agent_config = {
             "budget_cap": None if budget_cap_value == 0 else budget_cap_value,
@@ -297,11 +354,154 @@ class AgentUI:
             "poi_top_k": poi_top_k,
             "poi_query": poi_query,
             "rag_top_k": rag_top_k,
+            "manual_rag_review": manual_rag_review,
             "weather_days": weather_days,
             "max_concurrency": 4,
             "rate_limit_per_min": 60,
             "max_total_tasks": None,
         }
+
+        # 检查是否处于暂停状态
+        last_state_data = st.session_state.get("agent_last_state")
+        last_state = None
+        if last_state_data:
+            if isinstance(last_state_data, dict):
+                try:
+                    last_state = TripState(**last_state_data)
+                except Exception as e:
+                    print(f"[AgentUI] Failed to restore TripState: {e}")
+            else:
+                last_state = last_state_data
+
+        is_paused = last_state and last_state.status == "paused"
+
+        if is_paused:
+            st.info(f"⚠️ Agent 已暂停，原因: {last_state.stop_reason}")
+            if last_state.stop_reason == "rag_review":
+                st.markdown("### RAG 结果人工复核")
+                tasks_to_review = []
+                # print(f"[AgentUI] 进入 RAG 复核流程，Completed: {last_state.completed_tasks}")
+                # print(f"[AgentUI] task_results keys: {list(last_state.task_results.keys())}")
+                # print(f"[AgentUI] shared_context keys: {list((last_state.shared_context.data or {}).keys())}")
+                for task_id in last_state.completed_tasks:
+                    res = last_state.task_results.get(task_id, {})
+                    # print(f"[AgentUI] 任务 {task_id} 原始结果类型: {type(res)}")
+                    if hasattr(res, "data"):
+                        data = res.data
+                    else:
+                        data = res.get("data", {})
+                    # print(f"[AgentUI] 任务 {task_id} data 类型: {type(data)}")
+                    if hasattr(data, "model_dump"):
+                        data = data.model_dump()
+                    # if isinstance(data, dict):
+                        # print(f"[AgentUI] 任务 {task_id} data keys: {list(data.keys())}")
+                    evidence = data.get("evidence") if isinstance(data, dict) else None
+                    query = data.get("query") if isinstance(data, dict) else None
+                    results = data.get("results") if isinstance(data, dict) else None
+                    if not evidence:
+                        target_task = next((t for t in last_state.plan if t.id == task_id), None)
+                        output_key = target_task.output_key if target_task else "result"
+                        ctx = last_state.shared_context.read(task_id, output_key)
+                        # print(f"[AgentUI] 任务 {task_id} shared_context({output_key}) 类型: {type(ctx)}")
+                        if isinstance(ctx, dict):
+                            # print(f"[AgentUI] 任务 {task_id} shared_context keys: {list(ctx.keys())}")
+                            evidence = ctx.get("evidence")
+                            query = query or ctx.get("query")
+                            results = results or ctx.get("results")
+                    if isinstance(evidence, dict) and evidence:
+                        # print(f"[AgentUI] 任务 {task_id} Evidence keys: {list(evidence.keys())}")
+                        # print(f"[AgentUI] 任务 {task_id} 发现 Evidence")
+                        tasks_to_review.append(
+                            {
+                                "task_id": task_id,
+                                "evidence": evidence,
+                                "query": query,
+                                "results": results,
+                            }
+                        )
+                    # else:
+                    #     print(f"[AgentUI] 任务 {task_id} 无 Evidence")
+                
+                if not tasks_to_review:
+                     st.warning("触发了 RAG 复核暂停，但未找到包含 Evidence 的任务。")
+
+                for task_info in tasks_to_review:
+                    task_id = task_info.get("task_id")
+                    evidence = task_info.get("evidence") or {}
+                    query = task_info.get("query")
+                    st.markdown(f"**任务 {task_id} 的 RAG 证据**")
+                    evidence_view = dict(evidence)
+                    if query:
+                        evidence_view["_query"] = query
+                    #print(f"[AgentUI] 渲染 Evidence 面板 task={task_id} keys={list(evidence_view.keys())}")
+                    # 渲染交互面板 (状态保存在 session_state.rag_evidence_ui)
+                    self._render_rag_evidence_panel(evidence_view, f"review_{task_id}")
+
+                if tasks_to_review and st.button("确认复核并继续执行", type="primary"):
+                    with st.spinner("正在应用修改并恢复执行..."):
+                        # 更新 SharedContext 中的 evidence
+                        for task_info in tasks_to_review:
+                            task_id = task_info.get("task_id")
+                            res = last_state.task_results.get(task_id, {})
+                            # 兼容提取
+                            if hasattr(res, "data"):
+                                data = res.data
+                            else:
+                                data = res.get("data", {})
+                            if hasattr(data, "model_dump"):
+                                data = data.model_dump()
+
+                            original_evidence = task_info.get("evidence") or data.get("evidence")
+                            
+                            # 重建 evidence
+                            new_evidence = self._reconstruct_evidence(original_evidence, f"review_{task_id}")
+
+                            # 更新 state.task_results (用于历史记录)
+                            # 注意：如果是 dict 直接更新，如果是对象则无法直接 setitem?
+                            # 假设 task_results 存储的是 dict (因为 _execute_task 返回的是 dict)
+                            if isinstance(last_state.task_results.get(task_id), dict):
+                                if not isinstance(last_state.task_results[task_id].get("data"), dict):
+                                    last_state.task_results[task_id]["data"] = {}
+                                last_state.task_results[task_id]["data"]["evidence"] = new_evidence
+                            elif hasattr(last_state.task_results[task_id], "data"):
+                                # 如果是对象，尝试修改属性（可能不可变）
+                                # 但 _execute_task 返回的是 dict，所以应该是 dict。
+                                pass
+                            
+                            # 更新 SharedContext (用于下游任务)
+                            # poi.search 写入的是 {"query": ..., "results": ..., "evidence": ...}
+                            # 我们需要读取 context 中现有的值并更新
+                            target_task = next((t for t in last_state.plan if t.id == task_id), None)
+                            output_key = target_task.output_key if target_task else "result"
+                            current_ctx = last_state.shared_context.read(task_id, output_key)
+                            
+                            # 更新 Context
+                            if current_ctx:
+                                current_ctx["evidence"] = new_evidence
+                                last_state.shared_context.write(task_id, output_key, current_ctx)
+                            else:
+                                # 如果 Context 中没有，可能是写入失败或者 key 不对。
+                                # 尝试直接覆盖
+                                update_data = {
+                                    "evidence": new_evidence,
+                                    "results": task_info.get("results") or data.get("results"),
+                                    "query": task_info.get("query") or data.get("query"),
+                                }
+                                last_state.shared_context.write(task_id, output_key, update_data)
+
+                        # 恢复执行
+                        final_state = run_agent_loop_sync(
+                            llm_manager=self.llm_manager,
+                            user_input=st.session_state.get("agent_user_input_resolved") or {},
+                            thread_id=thread_id,
+                            agent_config=st.session_state.agent_config,
+                            user_intent=st.session_state.get("agent_plan_intent", ""),
+                            context=st.session_state.get("agent_context_texts"),
+                            plan_override=None,
+                            initial_state=last_state
+                        )
+                        st.session_state.agent_last_state = final_state
+                        st.rerun()
 
         col1, col2 = st.columns(2)
         with col1:
@@ -364,6 +564,9 @@ class AgentUI:
                 )
                 st.session_state.agent_last_state = state.model_dump()
                 st.session_state.agent_plan_confirmed = True
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] Agent 执行结束，status={state.status}")
+                if getattr(state, "status", "") == "paused":
+                    st.rerun()
             except Exception as error:
                 error_payload = normalize_exception(
                     error,
@@ -375,7 +578,13 @@ class AgentUI:
                 st.session_state.agent_last_state = {"status": "failed", "error": error_payload}
                 return
 
-        last_state = st.session_state.agent_last_state or {}
+        last_state_raw = st.session_state.agent_last_state or {}
+        if hasattr(last_state_raw, "model_dump"):
+            last_state = last_state_raw.model_dump()
+        elif isinstance(last_state_raw, dict):
+            last_state = last_state_raw
+        else:
+            last_state = {}
         plan_preview = st.session_state.get("agent_plan_preview")
         plan_payload_for_map = plan_preview
         if isinstance(last_state, dict) and last_state.get("plan"):
@@ -389,6 +598,36 @@ class AgentUI:
                 st.warning("计划预览解析失败")
         if isinstance(last_state, dict):
             map_payload = last_state.get("map_payload") or {}
+            final_payload = last_state.get("final_payload") or {}
+            plan_items = last_state.get("plan") or []
+            shared_context = last_state.get("shared_context") or {}
+            shared_data = shared_context.get("data") if isinstance(shared_context, dict) else {}
+            map_task_id = None
+            map_output_key = None
+            summary_task_id = None
+            summary_output_key = None
+            if isinstance(plan_items, list):
+                for item in plan_items:
+                    if not isinstance(item, dict):
+                        continue
+                    task_type = item.get("type")
+                    if task_type == "map_render" and not map_task_id:
+                        map_task_id = item.get("id")
+                        map_output_key = item.get("output_key") or "map_payload"
+                    if task_type == "trip_summarize" and not summary_task_id:
+                        summary_task_id = item.get("id")
+                        summary_output_key = item.get("output_key") or "summary"
+            map_payload_from_final = final_payload.get("map_payload") if isinstance(final_payload, dict) else {}
+            summary_payload_from_final = final_payload.get("summary") if isinstance(final_payload, dict) else {}
+            if not map_payload:
+                if isinstance(map_payload_from_final, dict):
+                    map_payload = map_payload_from_final
+                elif map_task_id and isinstance(shared_data, dict):
+                    map_payload = (shared_data.get(map_task_id) or {}).get(map_output_key or "map_payload") or {}
+            summary_payload = summary_payload_from_final if isinstance(summary_payload_from_final, dict) else {}
+            if not summary_payload:
+                if summary_task_id and isinstance(shared_data, dict):
+                    summary_payload = (shared_data.get(summary_task_id) or {}).get(summary_output_key or "summary") or {}
             if isinstance(map_payload, dict):
                 rag_answer = map_payload.get("rag_answer")
                 if rag_answer:
@@ -406,6 +645,26 @@ class AgentUI:
                     if rag_query:
                         evidence_view["_query"] = rag_query
                     self._render_rag_evidence_panel(evidence_view, panel_key=f"agent::{thread_id}")
+                map_html = map_payload.get("map_html")
+                if map_html:
+                    st.markdown("#### 行程地图")
+                    st.components.v1.html(map_html, height=520, width=1000, scrolling=True)
+
+            # [Added] 渲染任务中的 RAG 回答 (e.g. POI)
+            task_results = last_state.get("task_results") or {}
+            for task_id, res in task_results.items():
+                if not isinstance(res, dict): continue
+                data = res.get("data")
+                if isinstance(data, dict) and data.get("rag_answer"):
+                    st.markdown(f"#### RAG 回答 ({task_id})")
+                    st.markdown(str(data.get("rag_answer")))
+
+            if summary_payload:
+                summary_text = summary_payload.get("summary") if isinstance(summary_payload, dict) else summary_payload
+                if summary_text:
+                    st.markdown("#### 行程摘要")
+                    st.markdown(str(summary_text))
+
             self._render_task_summaries(
                 last_state.get("task_summaries") or {},
                 task_title_map,
@@ -428,6 +687,11 @@ class AgentUI:
                 duration_ms = snap.get("duration_ms")
                 payload_keys = ", ".join(list((snap.get("payload") or {}).keys()))
                 st.markdown(f"- {ts} | {step} | {duration_ms}ms | {payload_keys}")
+
+        agent_status = last_state.get("status") if isinstance(last_state, dict) else getattr(last_state, "status", None)
+        autorefresh = getattr(st, "autorefresh", None)
+        if callable(autorefresh) and agent_status in ("running", "paused"):
+            autorefresh(interval=1000, key="agent_debug_autorefresh")
 
     def _build_task_status_from_plan(
         self,
@@ -508,10 +772,16 @@ class AgentUI:
             rows_html.append(row_content)
 
         # 构建面板头部 HTML，使用 textwrap.dedent 确保无缩进
+        overall_status = last_state.get("status") if isinstance(last_state, dict) else getattr(last_state, "status", "")
+        overall_status_text = {"done": "完成", "failed": "失败", "paused": "暂停", "running": "运行中"}.get(
+            overall_status,
+            overall_status or "未知",
+        )
         panel_header = textwrap.dedent(
-            """
+            f"""
             <div id="agent-status-panel">
                 <div class="agent-panel-title">Agent 运行状态</div>
+                <div class="agent-panel-overall">总状态：{overall_status_text}</div>
             """
         ).strip()
 
@@ -534,6 +804,11 @@ class AgentUI:
                 font-weight: 600;
                 margin-bottom: 8px;
                 color: #202124;
+            }
+            .agent-panel-overall {
+                font-size: 12px;
+                color: #5f6368;
+                margin-bottom: 8px;
             }
             .agent-node-row {
                 padding: 6px 0;

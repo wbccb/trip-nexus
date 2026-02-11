@@ -201,13 +201,14 @@ class LlmManager:
             )
 
         @lc_tool("poi.search")
-        def poi_search(query: str, city: Optional[str] = None, top_k: int = 5) -> Dict[str, Any]:
+        def poi_search(query: str, city: Optional[str] = None, top_k: int = 5, defer_answer: bool = False) -> Dict[str, Any]:
             """FunctionCall POI 工具：输入关键词与城市，返回搜索结果列表。"""
             return search_poi(
                 query,
                 self._poi_searcher,
                 city=city,
                 top_k=top_k,
+                defer_answer=defer_answer,
             )
 
         return [weather_get_daily, geo_geocode, poi_search]
@@ -794,6 +795,7 @@ class LlmManager:
                     "query": {"type": "string"},
                     "city": {"type": "string", "optional": True},
                     "top_k": {"type": "integer", "optional": True},
+                    "defer_answer": {"type": "boolean", "optional": True},
                 },
                 "required": ["query"],
             },
@@ -822,11 +824,12 @@ class LlmManager:
         )
         self.tool_registry.register(
             poi_schema,
-            lambda query, city=None, top_k=5: search_poi(
+            lambda query, city=None, top_k=5, defer_answer=False: search_poi(
                 query,
                 self._poi_searcher,
                 city=city,
                 top_k=top_k,
+                defer_answer=defer_answer,
             ),
             kind="local",
         )
@@ -928,9 +931,11 @@ class LlmManager:
         print(f"[{_ts()}][LlmManager] user_input.budget={user_input.get('budget')}")
         print(f"[{_ts()}][LlmManager] user_input.preference(raw)={user_input.get('preference')}")
         print(f"[{_ts()}][LlmManager] user_input.keys={list(user_input.keys())}")
+        print("\n")
         # 打印上下文细节，逐条展示，便于确认是否存在空值或异常格式
         for idx, ctx in enumerate(context or []):
             print(f"[{_ts()}][LlmManager] context[{idx}]={ctx}")
+            print("\n")
         # 安全处理 preference，保证后续 join 不报错
         preference = user_input.get("preference", [])
         # 如果 preference 是单字符串，转换为列表，保证统一处理逻辑

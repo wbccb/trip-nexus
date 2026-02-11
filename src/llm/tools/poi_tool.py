@@ -7,6 +7,7 @@ def search_poi(
     searcher: Any,
     city: Optional[str] = None,
     top_k: int = 5,
+    defer_answer: bool = False,
 ) -> Dict[str, Any]:
     print("\n 调用 search_poi 工具，查询：", query)
     search_query = f"{city} {query}".strip() if city else query
@@ -22,12 +23,13 @@ def search_poi(
             "confidence": 1.0,
             "source": "agent_tool_call"
         }
-        rag_result = searcher.run(search_query, intent_info=intent_info)
+        rag_result = searcher.run(search_query, intent_info=intent_info, generate_answer=not defer_answer)
         
         # 提取搜索结果，优先使用 filtered_results (质量更高)，其次 search_results
         # 注意：Agent 可能期望 results 是 list[dict]，包含 title, url, content_snippet 等字段
         results = rag_result.get('filtered_results') or rag_result.get('search_results') or []
         evidence = rag_result.get('evidence')
+        rag_answer = rag_result.get('answer')
         
         # 日志已经在 rag_main.py 中打印
     else:
@@ -36,6 +38,11 @@ def search_poi(
         intent_info = {"primary_intent": "travel", "needs_search": True}
         results = searcher.search(search_query, intent_info)
         evidence = None
+        rag_answer = None
         
-    print(f"【POI】搜索完成，拿到 {len(results)} 个结果 \n")
-    return {"query": search_query, "results": results[:max(1, int(top_k))], "evidence": evidence}
+    return {
+        "query": search_query,
+        "results": results[:max(1, int(top_k))],
+        "evidence": evidence,
+        "rag_answer": rag_answer
+    }

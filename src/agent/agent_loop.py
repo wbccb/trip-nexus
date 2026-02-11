@@ -29,6 +29,7 @@ class PlannerAgent:
         # 获取天气天数
         weather_days = int(agent_config.get("weather_days") or 3)
         # 组装任务列表
+        defer_answer = bool(agent_config.get("manual_rag_review"))
         tasks: List[Task] = [
             Task(
                 id="t1",
@@ -42,7 +43,7 @@ class PlannerAgent:
                 id="t2",
                 type="tool_call",
                 tool="poi.search",
-                params={"query": poi_query, "city": destination, "top_k": poi_top_k},
+                params={"query": poi_query, "city": destination, "top_k": poi_top_k, "defer_answer": defer_answer},
                 output_key="poi",
                 description="查询目的地 POI",
             ),
@@ -251,7 +252,12 @@ class AgentExecutor:
             return {"city": data.get("city"), "daily": data.get("daily")}
         # POI 结果提取
         if tool_name == "poi.search":
-            return {"query": data.get("query"), "results": data.get("results")}
+            return {
+                "query": data.get("query"),
+                "results": data.get("results"),
+                "evidence": data.get("evidence"),
+                "rag_answer": data.get("rag_answer"),
+            }
         # 地理编码结果提取
         if tool_name == "geo.geocode":
             return {
@@ -331,6 +337,7 @@ class AgentExecutor:
             return task, {"success": True, "data": map_payload}
         # 行程摘要任务
         if task.type == "trip_summarize":
+            print("\n")
             # 读取行程数据
             trip_data = state.shared_context.resolve(task.input_mapping.get("trip", ""), default={})
             # 构造简要摘要
@@ -338,6 +345,8 @@ class AgentExecutor:
             # 写入共享上下文
             output_key = task.output_key or "summary"
             state.shared_context.write(task.id, output_key, {"summary": summary})
+            print(f"生成摘要完成:{summary}")
+            print("\n")
             # 返回结果
             return task, {"success": True, "data": {"summary": summary}}
         # 默认未知任务类型
@@ -368,40 +377,52 @@ class AgentExecutor:
         plan_override: Optional[Plan] = None,
         retry_limit: int = 1,
         max_replan_depth: int = 2,
+        initial_state: Optional[TripState] = None,
     ) -> TripState:
-        # 初始化状态
-        state = TripState(
-            user_intent=user_intent or "",
-            user_input=user_input or {},
-            plan=[],
-            plan_history=[],
-            execution_queue=[],
-            completed_tasks=set(),
-            failed_tasks=set(),
-            task_summaries={},
-            shared_context=SharedContext(),
-            task_results={},
-            context_revisions=[],
-            final_payload={},
-            status="running",
-            error=None,
-            stop_reason=None,
-            retry_counts={},
-            replan_depth=0,
-            max_replan_depth=max_replan_depth,
-        )
+        # 初始化或恢复状态
+        if initial_state:
+            state = initial_state
+            if state.status == "paused":
+                state.status = "running"
+                state.stop_reason = None
+            
+            # 恢复 Plan 对象（State 中只存了 Task 列表）
+            plan = Plan(tasks=state.plan)
+        else:
+            state = TripState(
+                user_intent=user_intent or "",
+                user_input=user_input or {},
+                plan=[],
+                plan_history=[],
+                execution_queue=[],
+                completed_tasks=set(),
+                failed_tasks=set(),
+                task_summaries={},
+                shared_context=SharedContext(),
+                task_results={},
+                context_revisions=[],
+                final_payload={},
+                status="running",
+                error=None,
+                stop_reason=None,
+                retry_counts={},
+                replan_depth=0,
+                max_replan_depth=max_replan_depth,
+            )
+            # 初始化反思器 (reflector is stateless here, but created below)
+            # 生成计划
+            if plan_override:
+                plan = plan_override
+                plan.validate_plan(tool_whitelist=set(self._tool_whitelist()))
+            else:
+                tool_whitelist = self._tool_whitelist()
+                plan = self._planner.plan(user_intent, user_input, agent_config, tool_whitelist)
+            # 写入计划
+            state.plan = plan.tasks
+
         # 初始化反思器
         reflector = Reflector(max_replan_depth=max_replan_depth)
-        # 读取工具白名单
-        tool_whitelist = self._tool_whitelist()
-        # 生成计划
-        if plan_override:
-            plan = plan_override
-            plan.validate_plan(tool_whitelist=set(tool_whitelist))
-        else:
-            plan = self._planner.plan(user_intent, user_input, agent_config, tool_whitelist)
-        # 写入计划
-        state.plan = plan.tasks
+        
         # 初始化调度器
         scheduler = Scheduler(
             plan.tasks,
@@ -409,9 +430,23 @@ class AgentExecutor:
             rate_limit_per_min=agent_config.get("rate_limit_per_min"),
             max_total_tasks=agent_config.get("max_total_tasks"),
         )
+        
+        # 如果是恢复执行，需要重放已完成的任务状态给调度器
+        if initial_state:
+            print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 恢复执行，已完成任务: {len(state.completed_tasks)}")
+            for task_id in state.completed_tasks:
+                scheduler.mark_done(task_id)
+            # 同时标记失败但已跳过的任务
+            for task_id in state.failed_tasks:
+                scheduler.mark_done(task_id)
+
         print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 初始化调度器")
         # 主循环
         while True:
+            # 检查是否处于暂停状态 (例如在循环中被置为 paused)
+            if state.status == "paused":
+                print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 暂停执行: {state.stop_reason}")
+                break
             # 获取就绪批次
             batch = scheduler.next_batch()
             # 无就绪任务则结束
@@ -464,6 +499,16 @@ class AgentExecutor:
                     error_context = {"task_id": task.id, "result": result}
                     print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 反思器判断触发重规划，任务 ID: {task.id}")
                 
+            # 检查是否需要人工复核 RAG 结果
+            if agent_config.get("manual_rag_review"):
+                for task, result in results:
+                    data = result.get("data", {})
+                    if task.id in state.completed_tasks and isinstance(data, dict) and data.get("evidence"):
+                        print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 任务 {task.id} 产生 RAG 证据，触发人工复核暂停")
+                        state.status = "paused"
+                        state.stop_reason = "rag_review"
+                        break
+            
             # 落快照
             snapshot_store.add(
                 thread_id,
@@ -474,6 +519,10 @@ class AgentExecutor:
                     "duration_ms": 0,
                 },
             )
+
+            if state.status == "paused":
+                break
+
             # 触发重规划
             if replan_triggered:
                 print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 开始重规划")
@@ -518,6 +567,7 @@ def run_agent_loop_sync(
     plan_override: Optional[Plan] = None,
     retry_limit: int = 1,
     max_replan_depth: int = 2,
+    initial_state: Optional[TripState] = None,
 ) -> TripState:
     # 初始化执行器
     executor = AgentExecutor(llm_manager)
@@ -531,6 +581,7 @@ def run_agent_loop_sync(
         plan_override=plan_override,
         retry_limit=retry_limit,
         max_replan_depth=max_replan_depth,
+        initial_state=initial_state,
     )
     # 尝试获取当前事件循环
     try:

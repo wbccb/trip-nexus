@@ -249,6 +249,7 @@ class TripMap:
                 print(f"[{ts}][MapRenderer] fit_bounds failed: {e}")
 
         folium.LayerControl().add_to(m)
+        logger.info("\n\n------------------!!渲染地图结束!!------------------\n\n")
         return m
 
     def render_map_batches(self, trip_data: Dict[str, Any], batch_size: int = 4) -> Iterable[Dict[str, Any]]:

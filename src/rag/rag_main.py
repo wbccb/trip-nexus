@@ -3,9 +3,11 @@ from src.rag.network.multi_source_search import MultiSourceSearcher
 from src.rag.module.quality_filter import QualityFilter
 from src.rag.network.crawler import ContentCrawler
 from src.rag.store.vector_store import VectorStore
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import time
 from src.config import Config
+import copy
+import tiktoken
 from langchain_core.prompts import PromptTemplate
 import logging
 import re
@@ -22,6 +24,7 @@ class AIRetrievalPipeline:
         self.crawler = ContentCrawler()
         # 使用 ephemeral_collection 或者每次清除
         self.vector_store = VectorStore(collection_name="current_search_context")
+        self._token_encoder = tiktoken.get_encoding("cl100k_base")
 
     def _normalize_text(self, text: str) -> str:
         """
@@ -36,6 +39,81 @@ class AIRetrievalPipeline:
         if max_chars <= 0:
             return ""
         return (text or "")[:max_chars]
+
+    def _count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(self._token_encoder.encode(text))
+
+    def _truncate_text_by_tokens(self, text: str, max_tokens: int) -> str:
+        if not text:
+            return ""
+        if max_tokens <= 0:
+            return ""
+        tokens = self._token_encoder.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        return self._token_encoder.decode(tokens[:max_tokens])
+
+    def _context_token_budget(self, query: str, max_tokens: int) -> int:
+        reserve = max(128, int(max_tokens * 0.2))
+        query_tokens = self._count_tokens(query or "")
+        return max(256, int(max_tokens - reserve - query_tokens))
+
+    def _shrink_evidence_to_token_budget(self, evidence: Dict[str, Any], query: str, max_tokens: int) -> Dict[str, Any]:
+        if not isinstance(evidence, dict) or not evidence:
+            return evidence
+        new_evidence = copy.deepcopy(evidence)
+        summary_section = new_evidence.get("summary") or {}
+        body_section = new_evidence.get("body") or {}
+        summary_items = list(summary_section.get("items") or [])
+        body_items = list(body_section.get("items") or [])
+        budget = self._context_token_budget(query, max_tokens)
+        context_text = self._build_context_text(summary_section, body_section)
+        current_tokens = self._count_tokens(context_text)
+        if current_tokens <= budget:
+            return new_evidence
+        min_body_tokens = 80
+        min_summary_tokens = 40
+        while current_tokens > budget and (body_items or summary_items):
+            if body_items:
+                last = body_items[-1]
+                text = str(last.get("text") or "")
+                text_tokens = self._count_tokens(text)
+                if text_tokens > min_body_tokens:
+                    new_max = max(min_body_tokens, int(text_tokens * 0.7))
+                    new_text = self._truncate_text_by_tokens(text, new_max)
+                    if new_text == text:
+                        body_items.pop()
+                    else:
+                        last["text"] = new_text
+                else:
+                    body_items.pop()
+            else:
+                last = summary_items[-1]
+                text = str(last.get("text") or "")
+                text_tokens = self._count_tokens(text)
+                if text_tokens > min_summary_tokens:
+                    new_max = max(min_summary_tokens, int(text_tokens * 0.7))
+                    new_text = self._truncate_text_by_tokens(text, new_max)
+                    if new_text == text:
+                        summary_items.pop()
+                    else:
+                        last["text"] = new_text
+                else:
+                    summary_items.pop()
+            summary_section["items"] = summary_items
+            body_section["items"] = body_items
+            summary_section["candidates"] = []
+            body_section["candidates"] = []
+            context_text = self._build_context_text(summary_section, body_section)
+            current_tokens = self._count_tokens(context_text)
+        summary_section["used_chars"] = sum(len(str(it.get("text") or "")) for it in summary_items)
+        body_section["used_chars"] = sum(len(str(it.get("text") or "")) for it in body_items)
+        new_evidence["summary"] = summary_section
+        new_evidence["body"] = body_section
+        print(f"【RAG】Token压缩后Context tokens={current_tokens}, budget={budget}")
+        return new_evidence
 
     def _summarize_text(self, text: str, max_chars: int) -> str:
         """
@@ -84,7 +162,7 @@ class AIRetrievalPipeline:
         max_item_chars = self.config.EVIDENCE_SUMMARY_ITEM_MAX_CHARS
         top_k = self.config.EVIDENCE_SUMMARY_TOP_K
         
-        print(f"【RAG】构建Summary Evidence: Budget={budget}, MaxItem={max_item_chars}, TopK={top_k}")
+        print(f"【RAG】构建Summary Evidence，拿到的配置信息为: Budget={budget}, MaxItem={max_item_chars}, TopK={top_k}")
         
         summary_items = []
         summary_candidates = []
@@ -131,7 +209,7 @@ class AIRetrievalPipeline:
             })
             used += len(combined)
             
-        print(f"【RAG】Summary构建完成: Items={len(summary_items)}, Candidates={len(summary_candidates)}, UsedChars={used}/{budget}, Skipped(Dup={skipped_dup}, Budget={skipped_budget})")
+        print(f"【RAG】用标题 + 摘要去组装combined，然后进行截断 => 构建出Summary: 数量(真正)={len(summary_items)}, Candidates(原始，部分可能要跳过)={len(summary_candidates)}, UsedChars={used}/{budget}, Skipped(Dup={skipped_dup}, Budget={skipped_budget})")
         return {
             "items": summary_items,
             "candidates": summary_candidates,
@@ -155,7 +233,7 @@ class AIRetrievalPipeline:
         max_chunk_chars = self.config.EVIDENCE_CHUNK_MAX_CHARS
         min_chunk_chars = self.config.EVIDENCE_CHUNK_MIN_CHARS
         
-        print(f"【RAG】构建Body Evidence: Budget={budget}, TopN={top_n}, Chunk(Min={min_chunk_chars}, Max={max_chunk_chars})")
+        print(f"【RAG】获取Body Evidence配置: token数量限制={budget}, 个数限制={top_n}, Chunk(Min={min_chunk_chars}, Max={max_chunk_chars})")
         
         used = 0
         skipped_short = 0
@@ -185,7 +263,7 @@ class AIRetrievalPipeline:
                 "timestamp": timestamp,
             })
             
-        print(f"【RAG】Body候选集构建完成: Candidates={len(candidates)}, Skipped(Short={skipped_short}, Dup={skipped_dup})")
+        print(f"【RAG】正文构建（还没进行llm压缩) => Body候选集构建完成: Candidates={len(candidates)}, Skipped(Short={skipped_short}, Dup={skipped_dup})")
         
         for cand in candidates:
             if len(selected) >= top_n:
@@ -216,7 +294,7 @@ class AIRetrievalPipeline:
             })
             used += len(content)
             
-        print(f"【RAG】Body最终筛选完成: Selected={len(selected)}, UsedChars={used}/{budget}, Truncated/BudgetBreak={truncated_cnt}")
+        print(f"【RAG】Body最终筛选完成（token+top_n限制）: Selected={len(selected)}, UsedChars={used}/{budget}, Truncated/BudgetBreak={truncated_cnt}")
         
         return {
             "items": selected,
@@ -235,7 +313,7 @@ class AIRetrievalPipeline:
         body_text = "\n\n".join([item["text"] for item in body_items]) if body_items else "无"
         return f"【摘要证据】\n{summary_text}\n\n【正文证据】\n{body_text}"
 
-    def run(self, query: str, intent_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def run(self, query: str, intent_info: Optional[Dict[str, Any]] = None, generate_answer: bool = True) -> Dict[str, Any]:
         """
         执行完整的AI检索流程
         """
@@ -256,12 +334,15 @@ class AIRetrievalPipeline:
         # 2. 判断是否需要检索
         if not intent_info.get('needs_search', True):
             print("【RAG】无需检索，直接生成回答")
+            answer = None
+            if generate_answer:
+                answer = self._generate_direct_answer(query, intent_info)
             return {
                 'query': query,
                 'intent_info': intent_info,
                 'search_results': [],
                 'filtered_results': [],
-                'answer': self._generate_direct_answer(query, intent_info),
+                'answer': answer,
                 'processing_time': time.time() - start_time,
                 'needs_search': False
             }
@@ -337,7 +418,7 @@ class AIRetrievalPipeline:
             
             # 将联网检索到的正文存入向量库后，检索相关片段作为 Body Evidence 候选（抓取正文的高相关段落）
             relevant_docs = self.vector_store.similarity_search(query, k=self.config.EVIDENCE_BODY_CANDIDATE_K)
-            print(f"【RAG】向量检索完成，候选片段数：{len(relevant_docs)}")
+            print(f"【RAG】Summary 向量检索完成，候选片段数：{len(relevant_docs)} \n")
             
             # 依据 Top N 与 token长度预算 => 两个都得满足 => 构建 Body Evidence
             body_section = self._build_body_section(relevant_docs)
@@ -350,18 +431,19 @@ class AIRetrievalPipeline:
             logger.warning("Crawling failed or empty, falling back to snippets")
             context_text = self._build_context_text(summary_section, body_section)
 
-        logger.info("-------------准备LLM生成回答-------------------")
         print(
             "【RAG】证据构建完成\n"
             f"- Summary: {len(summary_section.get('items', []))} items, {summary_section.get('used_chars', 0)}/{summary_section.get('budget_chars', 0)} chars\n"
             f"- Body: {len(body_section.get('items', []))} items, {body_section.get('used_chars', 0)}/{body_section.get('budget_chars', 0)} chars\n"
             f"- Total Context: {len(context_text)} chars"
         )
-
-
-        # 7. 生成回答
-        answer = self._generate_rag_answer(query, context_text)
-        print("【RAG】回答生成完成")
+        answer = None
+        if generate_answer:
+            logger.info("\n\n\n-------------准备LLM生成回答-------------------")
+            answer = self._generate_rag_answer(query, context_text)
+            print(f"【RAG】回答生成完成: {answer} \n")
+        else:
+            print("【RAG】已构建证据，等待人工复核后再生成回答")
 
         processing_time = time.time() - start_time
 
@@ -383,6 +465,26 @@ class AIRetrievalPipeline:
             'processing_time': processing_time,
             'needs_search': True
         }
+
+    def generate_answer_from_evidence(self, query: str, evidence: Dict[str, Any]) -> str:
+        """
+        基于外部传入的证据（如用户人工筛选后的证据）生成回答。
+        """
+        max_tokens = int(self.config.MAX_CONTEXT_TOKENS or 4096)
+        context_budget = self._context_token_budget(query, max_tokens)
+        summary_section = evidence.get("summary", {})
+        body_section = evidence.get("body", {})
+        context_text = self._build_context_text(summary_section, body_section)
+        context_tokens = self._count_tokens(context_text)
+        print(f"【RAG】人工复核证据Context tokens={context_tokens}, budget={context_budget}")
+        if context_tokens > context_budget:
+            evidence = self._shrink_evidence_to_token_budget(evidence, query, max_tokens)
+            summary_section = evidence.get("summary", {})
+            body_section = evidence.get("body", {})
+            context_text = self._build_context_text(summary_section, body_section)
+            context_tokens = self._count_tokens(context_text)
+            print(f"【RAG】压缩后Context tokens={context_tokens}, budget={context_budget}")
+        return self._generate_rag_answer(query, context_text)
 
     def _generate_direct_answer(self, query: str, intent_info: Dict[str, Any]) -> str:
         """
@@ -411,7 +513,7 @@ class AIRetrievalPipeline:
         )
 
 
-        print(f"""\n\n\n=========检索完成，组装的prompt:\n{prompt.format(context=context, query=query)}\n\n=========""")
+        print(f"""\n\n\n=================================检索组装的prompt:\n{prompt.format(context=context, query=query)}\n===========================""")
 
 
         chain = prompt | self.llm

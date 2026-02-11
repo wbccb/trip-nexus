@@ -205,7 +205,7 @@ class UIManager:
             )
         return normalized
 
-    def render_rag_evidence_panel(self, evidence: Dict[str, Any], panel_key: str) -> None:
+    def render_rag_evidence_panel(self, evidence: Dict[str, Any], panel_key: str, show_answer_block: bool = False) -> None:
         """
         渲染可交互的 RAG 证据面板（Summary/Body 分区 + 筛选/编辑/预算预警）。
 
@@ -379,63 +379,64 @@ class UIManager:
             with tab_body:
                 _render_entries(body_entries, body_budget)
 
-            st.divider()
-            st.markdown("#### 基于用户选择生成回答")
-            default_question = str(evidence.get("_query") or ui_state.get("question") or "").strip()
-            question = st.text_area(
-                "问题（将使用你勾选/编辑后的证据作为参考信息）",
-                value=default_question,
-                height=80,
-                key=f"{panel_key}__user_question",
-            )
-            ui_state["question"] = question
-
-            def _build_selected_context_text() -> str:
-                selected_summary: List[str] = []
-                for entry in summary_entries:
-                    item_state = ui_state.get(entry["id"], {})
-                    if not item_state.get("keep"):
-                        continue
-                    text = str(item_state.get("edited_text") or "").strip()
-                    if text:
-                        selected_summary.append(text)
-
-                selected_body: List[str] = []
-                for entry in body_entries:
-                    item_state = ui_state.get(entry["id"], {})
-                    if not item_state.get("keep"):
-                        continue
-                    text = str(item_state.get("edited_text") or "").strip()
-                    if text:
-                        selected_body.append(text)
-
-                summary_text = "\n".join([f"- {t}" for t in selected_summary]) if selected_summary else "无"
-                body_text = "\n\n".join(selected_body) if selected_body else "无"
-                return f"【摘要证据】\n{summary_text}\n\n【正文证据】\n{body_text}"
-
-            col_x, col_y = st.columns([1, 2])
-            with col_x:
-                regenerate = st.button("用已选证据生成回答", use_container_width=True, key=f"{panel_key}__regen_answer")
-            with col_y:
-                st.caption("说明：勾选/编辑会影响这里的回答；不会回写到检索/抓取阶段。")
-
-            if regenerate:
-                context_text = _build_selected_context_text()
-                q = (question or "").strip() or "请基于参考信息给出结论。"
-                prompt_text = (
-                    "基于以下参考信息回答用户的问题。如果参考信息不足以回答问题，请说明。\n\n"
-                    f"参考信息：\n{context_text}\n\n"
-                    f"用户问题：\n{q}\n\n"
-                    "回答："
+            if show_answer_block:
+                st.divider()
+                st.markdown("#### 基于用户选择生成回答")
+                default_question = str(evidence.get("_query") or ui_state.get("question") or "").strip()
+                question = st.text_area(
+                    "问题（将使用你勾选/编辑后的证据作为参考信息）",
+                    value=default_question,
+                    height=80,
+                    key=f"{panel_key}__user_question",
                 )
-                llm = self.llm_manager.get_llm()
-                response = llm.invoke(prompt_text)
-                answer_text = response.content if hasattr(response, "content") else response
-                ui_state["user_selected_answer"] = str(answer_text).strip()
+                ui_state["question"] = question
 
-            if ui_state.get("user_selected_answer"):
-                st.markdown("**回答（基于用户选择证据生成）**")
-                st.markdown(str(ui_state.get("user_selected_answer")))
+                def _build_selected_context_text() -> str:
+                    selected_summary: List[str] = []
+                    for entry in summary_entries:
+                        item_state = ui_state.get(entry["id"], {})
+                        if not item_state.get("keep"):
+                            continue
+                        text = str(item_state.get("edited_text") or "").strip()
+                        if text:
+                            selected_summary.append(text)
+
+                    selected_body: List[str] = []
+                    for entry in body_entries:
+                        item_state = ui_state.get(entry["id"], {})
+                        if not item_state.get("keep"):
+                            continue
+                        text = str(item_state.get("edited_text") or "").strip()
+                        if text:
+                            selected_body.append(text)
+
+                    summary_text = "\n".join([f"- {t}" for t in selected_summary]) if selected_summary else "无"
+                    body_text = "\n\n".join(selected_body) if selected_body else "无"
+                    return f"【摘要证据】\n{summary_text}\n\n【正文证据】\n{body_text}"
+
+                col_x, col_y = st.columns([1, 2])
+                with col_x:
+                    regenerate = st.button("用已选证据生成回答", use_container_width=True, key=f"{panel_key}__regen_answer")
+                with col_y:
+                    st.caption("说明：勾选/编辑会影响这里的回答；不会回写到检索/抓取阶段。")
+
+                if regenerate:
+                    context_text = _build_selected_context_text()
+                    q = (question or "").strip() or "请基于参考信息给出结论。"
+                    prompt_text = (
+                        "基于以下参考信息回答用户的问题。如果参考信息不足以回答问题，请说明。\n\n"
+                        f"参考信息：\n{context_text}\n\n"
+                        f"用户问题：\n{q}\n\n"
+                        "回答："
+                    )
+                    llm = self.llm_manager.get_llm()
+                    response = llm.invoke(prompt_text)
+                    answer_text = response.content if hasattr(response, "content") else response
+                    ui_state["user_selected_answer"] = str(answer_text).strip()
+
+                if ui_state.get("user_selected_answer"):
+                    st.markdown("**回答（基于用户选择证据生成）**")
+                    st.markdown(str(ui_state.get("user_selected_answer")))
 
     def render_input_form(self) -> Optional[Dict[str, Any]]:
         """渲染输入表单，返回结构化参数"""
@@ -1372,8 +1373,23 @@ class UIManager:
             else:
                 print("[DEBUG] No map object available to render")
 
-        self.agent_ui.render_live_panel(floating=True)
-        self.agent_ui.render_status_panel(floating=True)
+        agent_last_state = st.session_state.get("agent_last_state")
+        if isinstance(agent_last_state, dict):
+            agent_status = agent_last_state.get("status")
+        else:
+            agent_status = getattr(agent_last_state, "status", None)
+        autorefresh = getattr(st, "autorefresh", None)
+        if callable(autorefresh) and agent_status in ("running", "paused"):
+            autorefresh(interval=1000, key="agent_panels_autorefresh")
+
+        panels_container = st.container()
+        with panels_container:
+            live_placeholder = st.empty()
+            status_placeholder = st.empty()
+            with live_placeholder.container():
+                self.agent_ui.render_live_panel(floating=False)
+            with status_placeholder.container():
+                self.agent_ui.render_status_panel(floating=False)
 
     def render_session_list(self, user_id: str, device_id: str) -> None:
         """绘制左侧的会话列表（侧边栏内）"""
