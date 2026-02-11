@@ -1,6 +1,9 @@
 from typing import Any, Dict, List, Optional
 import threading
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class MetricsRecorder:
@@ -19,6 +22,7 @@ class MetricsRecorder:
             "name": name,
             "payload": payload or {},
         }
+        logger.info(f"[Metrics] {name} {event.get('payload')}")
         # 加锁后追加事件
         with self._lock:
             self._events.append(event)
