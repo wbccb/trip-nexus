@@ -75,7 +75,7 @@ streamlit run main.py
 运行命令（与主页面一致）：
 
 ```shell
-streamlit run main.py
+streamlit run main.py --server.headless true
 ```
 
 访问地址：
