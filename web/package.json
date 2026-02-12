@@ -1,0 +1,21 @@
+{
+  "name": "tripnexus-web",
+  "private": true,
+  "version": "0.0.4",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "antd": "^6.3.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.4",
+    "vite": "^7.3.1"
+  },
+  "packageManager": "pnpm@10.2.1+sha1.48adf39a4ab751eda7b73b99447d1f0b6d227e02"
+}

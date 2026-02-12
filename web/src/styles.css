@@ -1,0 +1,128 @@
+/* 全局布局样式 */
+body {
+  margin: 0;
+  background: #f5f7fb;
+  font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+.app-root {
+  min-height: 100vh;
+}
+
+.app-sider {
+  background: #ffffff;
+  padding: 16px;
+  border-right: 1px solid #f0f0f0;
+}
+
+.sider-title {
+  font-weight: 600;
+  font-size: 16px;
+  margin-bottom: 12px;
+}
+
+.new-session-button {
+  width: 100%;
+  margin-bottom: 16px;
+}
+
+.session-list {
+  max-height: calc(100vh - 140px);
+  overflow-y: auto;
+}
+
+.session-item {
+  cursor: pointer;
+  padding: 12px;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  background: #fafafa;
+}
+
+.session-item.active {
+  background: #e6f4ff;
+  border: 1px solid #91caff;
+}
+
+.session-name {
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+.session-time {
+  font-size: 12px;
+  color: #8c8c8c;
+}
+
+.app-header {
+  background: #ffffff;
+  border-bottom: 1px solid #f0f0f0;
+  display: flex;
+  align-items: center;
+  padding: 0 24px;
+}
+
+.app-title {
+  margin: 0;
+}
+
+.app-content {
+  padding: 24px;
+}
+
+.tab-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.panel-card {
+  border-radius: 12px;
+}
+
+.full-width {
+  width: 100%;
+}
+
+.trip-summary {
+  font-weight: 500;
+}
+
+.day-item {
+  width: 100%;
+}
+
+.day-card {
+  width: 100%;
+}
+
+.poi-item {
+  display: block;
+  width: 100%;
+}
+
+.poi-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.poi-meta {
+  color: #595959;
+  font-size: 12px;
+  margin-bottom: 2px;
+}
+
+.map-placeholder {
+  height: 260px;
+  border: 1px dashed #d9d9d9;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #8c8c8c;
+  background: #fafafa;
+}
+
+.empty-tip {
+  color: #8c8c8c;
+}
