@@ -1,8 +1,21 @@
-import React, { useMemo, useState } from "react"
-import { Button, Card, Drawer, Form, Input, InputNumber, Layout, Modal, Tabs, Typography } from "antd"
+import React, { useCallback, useEffect, useMemo, useState } from "react"
+import {
+  Button,
+  Card,
+  Drawer,
+  Form,
+  Input,
+  InputNumber,
+  Layout,
+  Modal,
+  Tabs,
+  Typography,
+  message,
+} from "antd"
 import KnowledgeTab from "./components/KnowledgeTab.jsx"
 import SessionSider from "./components/SessionSider.jsx"
 import TripTab from "./components/TripTab.jsx"
+import { getSessionHistory } from "./api/index.js"
 import { useKnowledge } from "./hooks/useKnowledge.js"
 import { useSessions } from "./hooks/useSessions.js"
 import { useTrip } from "./hooks/useTrip.js"
@@ -33,6 +46,7 @@ export default function App() {
   } = useKnowledge()
   const [chatMessages, setChatMessages] = useState([])
   const [chatInput, setChatInput] = useState("")
+  const [loadingChatHistory, setLoadingChatHistory] = useState(false)
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false)
   const [isTripModalOpen, setIsTripModalOpen] = useState(false)
   const [tripForm] = Form.useForm()
@@ -45,6 +59,34 @@ export default function App() {
       "请根据以下信息生成行程：目的地 {destination}，天数 {days} 天，预算 {budget}，偏好 {preference}。请给出每天安排、交通方式、停留时长与地址。",
     []
   )
+
+  const loadChatHistory = useCallback(async (sessionId) => {
+    if (!sessionId) {
+      setChatMessages([])
+      return
+    }
+    try {
+      setLoadingChatHistory(true)
+      const data = await getSessionHistory(sessionId)
+      const normalized = Array.isArray(data)
+        ? data.map((item, index) => ({
+            id: `${sessionId}-${item.timestamp || Date.now()}-${index}`,
+            role: item.role,
+            content: item.content,
+          }))
+        : []
+      setChatMessages(normalized)
+    } catch (error) {
+      message.error(`聊天记录加载失败：${error.message}`)
+      setChatMessages([])
+    } finally {
+      setLoadingChatHistory(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadChatHistory(activeSessionId)
+  }, [activeSessionId, loadChatHistory])
 
   const handleSendChat = () => {
     const value = chatInput.trim()
@@ -122,7 +164,10 @@ export default function App() {
                 </div>
               </div>
               <div className="chat-history">
-                {chatMessages.length === 0 && (
+                {loadingChatHistory && chatMessages.length === 0 && (
+                  <div className="empty-tip">聊天记录加载中...</div>
+                )}
+                {!loadingChatHistory && chatMessages.length === 0 && (
                   <div className="empty-tip">暂无聊天记录</div>
                 )}
                 {chatMessages.map((item) => (
