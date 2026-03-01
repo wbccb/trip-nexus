@@ -8,6 +8,9 @@ export function useTrip({ activeSessionId, refreshSessions, setActiveSessionId }
   const [tripResult, setTripResult] = useState(null)
   const [loadingTrip, setLoadingTrip] = useState(false)
   const tripDays = useMemo(() => normalizeTripDays(tripResult), [tripResult])
+  const updateTripResult = useCallback((data) => {
+    setTripResult(data || null)
+  }, [])
 
   const handleTripSubmit = useCallback(
     async (values) => {
@@ -46,5 +49,6 @@ export function useTrip({ activeSessionId, refreshSessions, setActiveSessionId }
     loadingTrip,
     tripDays,
     tripResult,
+    updateTripResult,
   }
 }

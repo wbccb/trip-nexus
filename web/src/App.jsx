@@ -15,7 +15,8 @@ import {
 import KnowledgeTab from "./components/KnowledgeTab.jsx"
 import SessionSider from "./components/SessionSider.jsx"
 import TripTab from "./components/TripTab.jsx"
-import { getSessionHistory } from "./api/index.js"
+import { getSessionHistory, sendChatMessage } from "./api/index.js"
+import { DEFAULT_DEVICE_ID, DEFAULT_USER_ID, SESSION_STORAGE_KEY } from "./constants/appConfig.js"
 import { useKnowledge } from "./hooks/useKnowledge.js"
 import { useSessions } from "./hooks/useSessions.js"
 import { useTrip } from "./hooks/useTrip.js"
@@ -32,7 +33,7 @@ export default function App() {
     setActiveSessionId,
     startNewSession,
   } = useSessions()
-  const { handleTripSubmit, loadingTrip, tripDays, tripResult } = useTrip({
+  const { handleTripSubmit, loadingTrip, tripDays, tripResult, updateTripResult } = useTrip({
     activeSessionId,
     refreshSessions: loadSessions,
     setActiveSessionId,
@@ -47,6 +48,7 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState([])
   const [chatInput, setChatInput] = useState("")
   const [loadingChatHistory, setLoadingChatHistory] = useState(false)
+  const [sendingChat, setSendingChat] = useState(false)
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false)
   const [isTripModalOpen, setIsTripModalOpen] = useState(false)
   const [tripForm] = Form.useForm()
@@ -88,20 +90,59 @@ export default function App() {
     loadChatHistory(activeSessionId)
   }, [activeSessionId, loadChatHistory])
 
-  const handleSendChat = () => {
+  // 聊天消息点击发送
+  const handleSendChat = async () => {
     const value = chatInput.trim()
-    if (!value) {
+    if (!value || sendingChat) {
       return
     }
+    const userMessageId = `${Date.now()}-user`
     setChatMessages((prev) => [
       ...prev,
       {
-        id: `${Date.now()}-user`,
+        id: userMessageId,
         role: "user",
         content: value,
       },
     ])
     setChatInput("")
+    try {
+      setSendingChat(true)
+      const payload = {
+        user_id: DEFAULT_USER_ID,
+        device_id: DEFAULT_DEVICE_ID,
+        session_id: activeSessionId,
+        message: value,
+      }
+      const data = await sendChatMessage(payload)
+      if (data?.session_id && data.session_id !== activeSessionId) {
+        setActiveSessionId(data.session_id)
+        localStorage.setItem(SESSION_STORAGE_KEY, data.session_id)
+      }
+      // 更新AI返回的消息到聊天框中
+      if (data?.response) {
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-assistant`,
+            role: "assistant",
+            content: data.response,
+          },
+        ])
+      }
+      // 更新中间布局的行程详情
+      if (data?.trip_data) {
+        updateTripResult(data.trip_data)
+      }
+      // 重新加载会话列表
+      if (loadSessions) {
+        await loadSessions()
+      }
+    } catch (error) {
+      message.error(`消息发送失败：${error.message}`)
+    } finally {
+      setSendingChat(false)
+    }
   }
 
   const handleTripFormSubmit = async (values) => {
@@ -183,7 +224,7 @@ export default function App() {
                   placeholder="输入要咨询的问题或想法"
                   autoSize={{ minRows: 1, maxRows: 3 }}
                 />
-                <Button type="primary" onClick={handleSendChat}>
+                <Button type="primary" onClick={handleSendChat} loading={sendingChat}>
                   发送
                 </Button>
               </div>
@@ -222,9 +263,21 @@ export default function App() {
           </div>
           <div className="app-right">
             <Card title="地图概览" className="panel-card map-card">
-              <div className="map-placeholder map-large">
-                地图占位（后续可替换为地图 iframe/图片）
-              </div>
+              {!tripResult && (
+                <div className="map-placeholder map-large">
+                  地图占位（后续可替换为地图 iframe/图片）
+                </div>
+              )}
+              {tripResult && (
+                <div className="map-placeholder map-large">
+                  <div className="trip-summary">
+                    目的地：{tripResult.destination} · 天数：{tripResult.days}
+                  </div>
+                  <div className="poi-meta">
+                    已规划天数：{tripDays.length} · 行程项：{tripDays.reduce((sum, day) => sum + day.items.length, 0)}
+                  </div>
+                </div>
+              )}
             </Card>
           </div>
         </div>

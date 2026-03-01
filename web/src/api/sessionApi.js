@@ -19,3 +19,7 @@ export async function getSessionHistory(sessionId) {
   const safeSessionId = encodeURIComponent(sessionId || "");
   return apiGet(`/api/sessions/history?session_id=${safeSessionId}`);
 }
+
+export async function sendChatMessage(payload) {
+  return apiPost("/api/chat/send", payload || {});
+}

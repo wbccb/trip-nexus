@@ -1,4 +1,5 @@
 # API 服务入口，提供行程生成、会话列表、知识库检索的 HTTP 接口
+from datetime import datetime
 from functools import lru_cache  # 用于缓存全局单例对象，减少重复初始化
 from typing import Any, Dict, List, Optional  # 提供类型注解，便于接口契约清晰
 
@@ -7,7 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware  # 允许前端跨域访问
 from pydantic import BaseModel, Field  # 数据模型与字段校验
 
 from src.config import Config  # 读取项目配置
-from src.frontend.context.entity import Message
+from src.frontend.context.conversation_manager import ConversationManager
+from src.frontend.context.entity import Message, MessageType
 from src.frontend.context.storage import get_conversation_storage  # 获取会话存储实现
 from src.llm.llm_manager import LlmManager  # 行程生成核心管理器
 from src.rag.rag_main import AIRetrievalPipeline  # 知识库检索流水线
@@ -71,6 +73,21 @@ class ChatHistoryItem(BaseModel):
     is_redundant: bool = Field(False, description="是否为冗余消息")
 
 
+class ChatSendRequest(BaseModel):
+    user_id: str = Field(..., description="用户唯一ID")
+    device_id: str = Field(..., description="设备唯一ID")
+    session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
+    message: str = Field(..., description="用户输入消息")
+
+
+class ChatSendResponse(BaseModel):
+    session_id: str = Field(..., description="会话ID")
+    response: str = Field(..., description="助手回复")
+    trip_data: Optional[Dict[str, Any]] = Field(None, description="结构化行程数据")
+    intent: Optional[str] = Field(None, description="意图类型")
+    needs_more_info: bool = Field(False, description="是否需要补充信息")
+
+
 @lru_cache(maxsize=1)
 def _get_config() -> Config:
     """缓存 Config 实例，避免重复读取环境变量"""
@@ -119,6 +136,13 @@ def _get_llm_manager() -> LlmManager:
 
 
 @lru_cache(maxsize=1)
+def _get_conversation_manager() -> ConversationManager:
+    storage = _get_storage()
+    llm_manager = _get_llm_manager()
+    return ConversationManager(storage, llm_manager)
+
+
+@lru_cache(maxsize=1)
 def _get_rag_pipeline() -> AIRetrievalPipeline:
     """缓存 RAG Pipeline 实例，提供知识库检索能力"""
     llm_manager = _get_llm_manager()
@@ -151,11 +175,34 @@ def _normalize_message_payload(message: Message) -> Dict[str, Any]:
     return payload
 
 
+def _get_context_messages(storage, session_id: str) -> List[Dict[str, Any]]:
+    short_term_context = storage.get_short_term_context(session_id)
+    if isinstance(short_term_context, dict):
+        messages = short_term_context.get("messages") or []
+        if messages:
+            return messages[-10:]
+    history_messages = storage.get_session_chat_list(session_id)
+    normalized_messages: List[Dict[str, Any]] = []
+    if history_messages:
+        for message_json in history_messages[-10:]:
+            try:
+                message_obj = Message.model_validate_json(message_json)
+                normalized_messages.append(_normalize_message_payload(message_obj))
+            except Exception:
+                continue
+    return normalized_messages
+
+
+CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 app = FastAPI(title="TripNexus API", version="0.0.4")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源，便于前端本地开发调试
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],  # 允许所有方法
     allow_headers=["*"],  # 允许所有请求头
@@ -203,6 +250,84 @@ def session_history(session_id: str = Query(..., description="会话ID")) -> Lis
         messages = short_term_context.get("messages") or []
         return [ChatHistoryItem(**item) for item in messages if isinstance(item, dict)]
     return []
+
+
+@app.post("/api/chat/send", response_model=ChatSendResponse)
+def send_chat(payload: ChatSendRequest) -> ChatSendResponse:
+    if not payload.message:
+        raise HTTPException(status_code=400, detail="message 不能为空")
+    session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
+    storage = _get_storage()
+    llm_manager = _get_llm_manager()
+    conversation_manager = _get_conversation_manager()
+    context_messages = _get_context_messages(storage, session_id)
+    current_trip = storage.get_trip_data(session_id)
+    intent_data = llm_manager.analyze_user_message(payload.message, context_messages, current_trip)
+    user_message = Message(
+        role=MessageType.USER,
+        content=payload.message,
+        timestamp=datetime.now(),
+        metadata={},
+    )
+    conversation_manager.process_new_message(
+        payload.user_id,
+        payload.device_id,
+        user_message,
+        session_id,
+        intent_data=intent_data,
+    )
+    intent = intent_data.get("intent")
+    response_text = ""
+    trip_data = None
+    needs_more_info = False
+    if intent == "general_conversation":
+        tool_call = llm_manager.call_tool_by_llm(payload.message, context_messages)
+        if tool_call.get("needs_tool") and tool_call.get("result"):
+            result_payload = tool_call.get("result")
+            if isinstance(result_payload, dict) and result_payload.get("success"):
+                response_text = f"工具结果：{result_payload.get('data')}"
+        if not response_text:
+            response_stream = llm_manager.stream_chat_response(payload.message, context_messages, current_trip)
+            response_text = "".join([str(delta) for delta in response_stream])
+    elif intent == "generate_trip":
+        result = llm_manager._handle_trip_generation(intent_data, context_messages)
+        response_text = result.get("response") or ""
+        trip_data = result.get("trip_data")
+        needs_more_info = bool(result.get("needs_more_info"))
+    elif intent in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
+        if current_trip:
+            result = llm_manager._handle_trip_modification(intent_data, current_trip, context_messages)
+            response_text = result.get("response") or ""
+            trip_data = result.get("trip_data")
+        else:
+            response_text = "我需要先为您生成一个基础行程，然后才能进行调整。请先提供目的地、天数和预算信息。"
+    else:
+        response_text = f"我理解您想{intent_data.get('summary', '进一步讨论行程')}. 请告诉我更多细节，比如目的地、旅行天数和您的偏好，我可以为您规划具体的行程。"
+    if trip_data:
+        storage.store_trip_data(session_id, trip_data)
+    assistant_message = Message(
+        role=MessageType.ASSISTANT,
+        content=response_text,
+        timestamp=datetime.now(),
+        metadata={
+            "intent": intent,
+            "needs_more_info": needs_more_info,
+            "has_trip_data": bool(trip_data),
+        },
+    )
+    conversation_manager.process_new_message(
+        payload.user_id,
+        payload.device_id,
+        assistant_message,
+        session_id,
+    )
+    return ChatSendResponse(
+        session_id=session_id,
+        response=response_text,
+        trip_data=trip_data,
+        intent=intent,
+        needs_more_info=needs_more_info,
+    )
 
 
 @app.post("/api/trip/generate", response_model=TripGenerateResponse)

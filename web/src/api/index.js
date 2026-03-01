@@ -1,4 +1,9 @@
 // API 统一出口
-export { getSessionHistory, listSessions, startSession } from "./sessionApi.js"
-export { generateTrip } from "./tripApi.js"
-export { searchKnowledge } from "./knowledgeApi.js"
+export {
+  getSessionHistory,
+  listSessions,
+  sendChatMessage,
+  startSession,
+} from "./sessionApi.js";
+export { generateTrip } from "./tripApi.js";
+export { searchKnowledge } from "./knowledgeApi.js";
