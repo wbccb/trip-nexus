@@ -298,7 +298,8 @@ class TestConversationStorage(BaseConversationStorage):
 
     def get_session_list(self, user_id: str):
         cursor = self.sqlite_conn.cursor()
-        cursor.execute("SELECT * FROM session_list WHERE user_id = ?", (user_id,))
+        # 根据更新时间倒序排列，更新时间较新的排在最上面
+        cursor.execute("SELECT * FROM session_list WHERE user_id = ? ORDER BY update_time DESC", (user_id,))
         return cursor.fetchall()
 
     def delete_session(self, session_id: str):

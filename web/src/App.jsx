@@ -38,7 +38,7 @@ export default function App() {
   const [tripForm] = Form.useForm()
   const sessionTitle = useMemo(() => {
     const activeSession = sessions.find((item) => item.session_id === activeSessionId)
-    return activeSession?.name || activeSessionId || "未选择会话"
+    return "当前选择的会话：" + (activeSession?.name || activeSessionId || "未选择会话")
   }, [activeSessionId, sessions])
   const promptTemplate = useMemo(
     () =>
@@ -100,9 +100,6 @@ export default function App() {
             目的地规划 · 生成行程 · 地图概览
           </Typography.Text>
         </div>
-        <div className="header-right">
-          <Typography.Text className="header-meta">TripNexus · React + Vite</Typography.Text>
-        </div>
       </Header>
       <Content className="app-content">
         <div className="app-body">
@@ -110,16 +107,18 @@ export default function App() {
             <div className="chat-panel">
               <div className="chat-header">
                 <div className="chat-title">
-                  <div className="chat-title-main">AI 助手</div>
-                  <div className="chat-title-sub">{sessionTitle}</div>
-                </div>
-                <div className="chat-actions">
+                  <div className="chat-title-main">
+                    <div>AI 助手</div>
+                    <div className="chat-actions">
                   <Button size="small" onClick={() => setIsTripModalOpen(true)}>
                     行程输入
                   </Button>
                   <Button size="small" onClick={() => setIsSessionDrawerOpen(true)}>
                     会话列表
                   </Button>
+                </div>
+                    </div>
+                  <div className="chat-title-sub">{sessionTitle}</div>
                 </div>
               </div>
               <div className="chat-history">

@@ -1,5 +1,5 @@
 import React from "react"
-import { Button, List, Spin } from "antd"
+import { Button, List, Spin, Tooltip } from "antd"
 
 export default function SessionSider({
   sessions,
@@ -11,12 +11,15 @@ export default function SessionSider({
 }) {
   return (
     <div className={`app-sider ${className || ""}`.trim()}>
-      <div className="sider-header">
-        <div className="sider-title">会话列表</div>
-        <Button size="small" className="new-session-button" onClick={onCreateSession}>
-          新建会话
-        </Button>
-      </div>
+      <Button
+        size="large"
+        className="new-session-button"
+        onClick={onCreateSession}
+        type="primary"
+        style={{ width: "100%", marginBottom: "20px"}}
+      >
+        新建会话
+      </Button>
       <Spin spinning={loadingSessions}>
         <List
           className="session-list"
@@ -28,10 +31,21 @@ export default function SessionSider({
               }
               onClick={() => onSelectSession(item.session_id)}
             >
-              <div className="session-day">DAY {String(index + 1).padStart(2, "0")}</div>
               <div className="session-content">
-                <div className="session-name">{item.name || item.session_id}</div>
-                <div className="session-time">{item.update_time}</div>
+                <Tooltip title={item.name || item.session_id}>
+                  <div className="session-name">{item.name || item.session_id}</div>
+                </Tooltip>
+                <div className="session-time">
+                  {new Date(item.update_time).toLocaleString("zh-CN", {
+                    year: "numeric",
+                    month: "2-digit",
+                    day: "2-digit",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit",
+                    hour12: false,
+                  })}
+                </div>
               </div>
             </List.Item>
           )}
