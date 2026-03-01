@@ -1,58 +1,13 @@
 /* 全局布局样式 */
 body {
   margin: 0;
-  background: #f5f7fb;
+  background: #f4f6f9;
   font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
 .app-root {
   min-height: 100vh;
-}
-
-.app-sider {
-  background: #ffffff;
-  padding: 16px;
-  border-right: 1px solid #f0f0f0;
-}
-
-.sider-title {
-  font-weight: 600;
-  font-size: 16px;
-  margin-bottom: 12px;
-}
-
-.new-session-button {
-  width: 100%;
-  margin-bottom: 16px;
-}
-
-.session-list {
-  max-height: calc(100vh - 140px);
-  overflow-y: auto;
-}
-
-.session-item {
-  cursor: pointer;
-  padding: 12px;
-  border-radius: 8px;
-  margin-bottom: 8px;
-  background: #fafafa;
-}
-
-.session-item.active {
-  background: #e6f4ff;
-  border: 1px solid #91caff;
-}
-
-.session-name {
-  font-weight: 600;
-  font-size: 14px;
-  margin-bottom: 4px;
-}
-
-.session-time {
-  font-size: 12px;
-  color: #8c8c8c;
+  height: 100vh;
 }
 
 .app-header {
@@ -60,20 +15,163 @@ body {
   border-bottom: 1px solid #f0f0f0;
   display: flex;
   align-items: center;
+  justify-content: space-between;
   padding: 0 24px;
+  height: 64px;
 }
 
 .app-title {
   margin: 0;
 }
 
-.app-content {
-  padding: 24px;
+.app-subtitle {
+  color: #8c8c8c;
+  font-size: 12px;
 }
 
-.tab-panel {
-  display: grid;
+.header-left {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.header-right {
+  color: #8c8c8c;
+  font-size: 12px;
+}
+
+.header-meta {
+  color: #8c8c8c;
+}
+
+.app-content {
+  padding: 16px 20px 24px;
+  height: calc(100vh - 64px);
+}
+
+.app-body {
+  display: flex;
   gap: 16px;
+  height: 100%;
+}
+
+.app-left {
+  width: 320px;
+  flex-shrink: 0;
+  height: 100%;
+}
+
+.app-main {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-right {
+  width: 360px;
+  flex-shrink: 0;
+  height: 100%;
+}
+
+.app-right .panel-card {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-right .panel-card .ant-card-body {
+  flex: 1;
+  display: flex;
+}
+
+.app-right .map-placeholder {
+  height: 100%;
+  flex: 1;
+}
+
+.app-main .ant-tabs {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-main .ant-tabs-content-holder {
+  flex: 1;
+  overflow: auto;
+}
+
+.app-sider {
+  background: #ffffff;
+  border: 1px solid #eef1f6;
+  border-radius: 12px;
+  padding: 16px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.sider-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.sider-title {
+  font-weight: 600;
+  font-size: 16px;
+}
+
+.new-session-button {
+  border-radius: 999px;
+}
+
+.session-list {
+  flex: 1;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.session-item {
+  cursor: pointer;
+  padding: 12px;
+  border-radius: 12px;
+  margin-bottom: 10px;
+  background: #f7f8fb;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  border: 1px solid transparent;
+}
+
+.session-item.active {
+  background: #e8f1ff;
+  border: 1px solid #b6d4ff;
+}
+
+.session-day {
+  font-size: 12px;
+  color: #7d8798;
+  font-weight: 600;
+  min-width: 44px;
+}
+
+.session-content {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.session-name {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.session-time {
+  font-size: 12px;
+  color: #8c8c8c;
 }
 
 .panel-card {
@@ -82,6 +180,103 @@ body {
 
 .full-width {
   width: 100%;
+}
+
+.chat-panel {
+  background: #ffffff;
+  border: 1px solid #eef1f6;
+  border-radius: 12px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+}
+
+.chat-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid #eef1f6;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.chat-title {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-title-main {
+  font-weight: 600;
+}
+
+.chat-title-sub {
+  font-size: 12px;
+  color: #8c8c8c;
+}
+
+.chat-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.chat-history {
+  flex: 1;
+  padding: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.chat-message {
+  display: flex;
+}
+
+.chat-message.user {
+  justify-content: flex-end;
+}
+
+.chat-message.assistant {
+  justify-content: flex-start;
+}
+
+.chat-bubble {
+  max-width: 80%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #f4f6fb;
+  color: #1f1f1f;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.chat-message.user .chat-bubble {
+  background: #e8f1ff;
+}
+
+.chat-input-floating {
+  position: sticky;
+  bottom: 0;
+  padding: 12px 16px;
+  border-top: 1px solid #eef1f6;
+  background: #ffffff;
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.session-drawer {
+  border: none;
+  padding: 0;
+  height: 100%;
+}
+
+.trip-layout {
+  display: grid;
+  gap: 16px;
 }
 
 .trip-summary {
@@ -121,6 +316,15 @@ body {
   justify-content: center;
   color: #8c8c8c;
   background: #fafafa;
+}
+
+.map-large {
+  height: 100%;
+}
+
+.knowledge-layout {
+  display: grid;
+  gap: 16px;
 }
 
 .empty-tip {

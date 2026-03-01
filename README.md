@@ -70,6 +70,13 @@ ls -la ./model_cache
 streamlit run main.py
 ```
 
+
+```shell
+cd web
+
+pnpm run dev
+```
+
 ## Agent 调试页面
 
 运行命令（与主页面一致）：

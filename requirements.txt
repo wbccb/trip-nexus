@@ -184,3 +184,4 @@ mysql-connector-python==8.4.0
 tiktoken==0.7.0
 fastapi==0.109.0
 loguru==0.7.2
+uvicorn==0.30.6

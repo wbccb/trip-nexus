@@ -38,3 +38,8 @@ model_cache
 核心交互
 Claude.md
 Agents.md
+
+node_modules
+.idea
+
+dist

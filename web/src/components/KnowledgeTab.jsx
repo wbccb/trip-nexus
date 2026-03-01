@@ -9,8 +9,8 @@ export default function KnowledgeTab({
   onSearch,
 }) {
   return (
-    <div className="tab-panel">
-      <Card title="检索输入" className="panel-card">
+    <div className="knowledge-layout">
+      <Card title="旅行灵感检索" className="panel-card">
         <Space direction="vertical" className="full-width">
           <Input
             placeholder="输入要检索的问题或主题"
