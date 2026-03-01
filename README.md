@@ -77,6 +77,31 @@ cd web
 pnpm run dev
 ```
 
+## 后端运行（FastAPI）
+
+```shell
+PYTHONPATH=. uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### 检查运行状态
+```shell
+lsof -n -iTCP:8000 -sTCP:LISTEN
+# 拿到pid端口：检查端口健康状态
+ps -p 32792,32808 -o pid,ppid,command
+```
+
+```shell
+# 测试后端健康状态
+curl -s -v http://127.0.0.1:8000/api/health
+```
+
+### 前端请求说明
+前端默认请求 `http://127.0.0.1:8000`，如需修改可设置：
+
+```shell
+export VITE_API_BASE="http://127.0.0.1:1234"
+```
+
 ## Agent 调试页面
 
 运行命令（与主页面一致）：
