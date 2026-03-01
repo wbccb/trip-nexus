@@ -8,6 +8,7 @@ import {
   InputNumber,
   Layout,
   Modal,
+  Spin,
   Tabs,
   Typography,
   message,
@@ -15,7 +16,7 @@ import {
 import KnowledgeTab from "./components/KnowledgeTab.jsx"
 import SessionSider from "./components/SessionSider.jsx"
 import TripTab from "./components/TripTab.jsx"
-import { getSessionHistory, getSessionTrip, sendChatMessage } from "./api/index.js"
+import { getSessionHistory, getSessionTrip, renderTripMap, sendChatMessage } from "./api/index.js"
 import { DEFAULT_DEVICE_ID, DEFAULT_USER_ID, SESSION_STORAGE_KEY } from "./constants/appConfig.js"
 import { useKnowledge } from "./hooks/useKnowledge.js"
 import { useSessions } from "./hooks/useSessions.js"
@@ -52,6 +53,9 @@ export default function App() {
   const [sendingChat, setSendingChat] = useState(false)
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false)
   const [isTripModalOpen, setIsTripModalOpen] = useState(false)
+  const [mapHtml, setMapHtml] = useState("")
+  const [loadingMap, setLoadingMap] = useState(false)
+  const [mapError, setMapError] = useState("")
   const [tripForm] = Form.useForm()
   const sessionTitle = useMemo(() => {
     const activeSession = sessions.find((item) => item.session_id === activeSessionId)
@@ -100,6 +104,34 @@ export default function App() {
   useEffect(() => {
     loadChatHistory(activeSessionId)
   }, [activeSessionId, loadChatHistory])
+
+  const loadMapHtml = useCallback(async (currentTrip) => {
+    if (!currentTrip) {
+      setMapHtml("")
+      setMapError("")
+      return
+    }
+    try {
+      setLoadingMap(true)
+      setMapError("")
+      const data = await renderTripMap({ trip_data: currentTrip })
+      if (data?.map_html) {
+        setMapHtml(data.map_html)
+      } else {
+        setMapHtml("")
+        setMapError("地图生成失败，请稍后重试")
+      }
+    } catch (error) {
+      setMapHtml("")
+      setMapError(`地图加载失败：${error.message}`)
+    } finally {
+      setLoadingMap(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadMapHtml(tripResult)
+  }, [tripResult, loadMapHtml])
 
   // 聊天消息点击发送
   const handleSendChat = async () => {
@@ -280,12 +312,25 @@ export default function App() {
                 </div>
               )}
               {tripResult && (
-                <div className="map-placeholder map-large">
-                  <div className="trip-summary">
-                    目的地：{tripResult.destination} · 天数：{tripResult.days}
+                <div className="map-frame">
+                  <div className="map-meta">
+                    <div className="trip-summary">
+                      目的地：{tripResult.destination} · 天数：{tripResult.days}
+                    </div>
+                    <div className="poi-meta">
+                      已规划天数：{tripDays.length} · 行程项：{tripDays.reduce((sum, day) => sum + day.items.length, 0)}
+                    </div>
                   </div>
-                  <div className="poi-meta">
-                    已规划天数：{tripDays.length} · 行程项：{tripDays.reduce((sum, day) => sum + day.items.length, 0)}
+                  <div className="map-view">
+                    <Spin spinning={loadingMap}>
+                      {mapError && <div className="map-placeholder map-large">{mapError}</div>}
+                      {!mapError && mapHtml && (
+                        <iframe title="trip-map" className="map-iframe" srcDoc={mapHtml} />
+                      )}
+                      {!mapError && !mapHtml && !loadingMap && (
+                        <div className="map-placeholder map-large">地图生成失败，请稍后重试</div>
+                      )}
+                    </Spin>
                   </div>
                 </div>
               )}

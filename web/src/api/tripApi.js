@@ -5,3 +5,7 @@ import { apiPost } from "./httpClient.js"
 export async function generateTrip(payload) {
   return apiPost("/api/trip/generate", payload)
 }
+
+export async function renderTripMap(payload) {
+  return apiPost("/api/map/render", payload)
+}

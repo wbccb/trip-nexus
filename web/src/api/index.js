@@ -7,5 +7,5 @@ export {
   sendChatMessage,
   startSession,
 } from "./sessionApi.js";
-export { generateTrip } from "./tripApi.js";
+export { generateTrip, renderTripMap } from "./tripApi.js";
 export { searchKnowledge } from "./knowledgeApi.js";

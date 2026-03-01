@@ -12,6 +12,7 @@ from src.frontend.context.conversation_manager import ConversationManager
 from src.frontend.context.entity import Message, MessageType
 from src.frontend.context.storage import get_conversation_storage  # 获取会话存储实现
 from src.llm.llm_manager import LlmManager  # 行程生成核心管理器
+from src.map.map_renderer import TripMap
 from src.rag.rag_main import AIRetrievalPipeline  # 知识库检索流水线
 
 
@@ -98,6 +99,14 @@ class ChatSendResponse(BaseModel):
     needs_more_info: bool = Field(False, description="是否需要补充信息")
 
 
+class MapRenderRequest(BaseModel):
+    trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
+
+
+class MapRenderResponse(BaseModel):
+    map_html: str = Field(..., description="地图 HTML 字符串")
+
+
 @lru_cache(maxsize=1)
 def _get_config() -> Config:
     """缓存 Config 实例，避免重复读取环境变量"""
@@ -157,6 +166,11 @@ def _get_rag_pipeline() -> AIRetrievalPipeline:
     """缓存 RAG Pipeline 实例，提供知识库检索能力"""
     llm_manager = _get_llm_manager()
     return AIRetrievalPipeline(llm_manager.get_analysis_llm())
+
+
+@lru_cache(maxsize=1)
+def _get_map_renderer() -> TripMap:
+    return TripMap()
 
 
 def _ensure_session_id(user_id: str, device_id: str, session_id: Optional[str]) -> str:
@@ -375,6 +389,15 @@ def generate_trip(payload: TripGenerateRequest) -> TripGenerateResponse:
         storage = _get_storage()
         storage.store_trip_data(session_id, trip_data)
     return TripGenerateResponse(session_id=session_id, trip_data=trip_data)
+
+
+@app.post("/api/map/render", response_model=MapRenderResponse)
+def render_map(payload: MapRenderRequest) -> MapRenderResponse:
+    trip_data = payload.trip_data or {}
+    map_renderer = _get_map_renderer()
+    map_obj = map_renderer.render_map(trip_data)
+    map_html = map_obj.get_root().render() if map_obj else ""
+    return MapRenderResponse(map_html=map_html)
 
 
 @app.post("/api/knowledge/search", response_model=KnowledgeSearchResponse)
