@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Button,
   Card,
@@ -56,6 +56,7 @@ export default function App() {
   const [mapHtml, setMapHtml] = useState("")
   const [loadingMap, setLoadingMap] = useState(false)
   const [mapError, setMapError] = useState("")
+  const mapRequestTokenRef = useRef(0)
   const [tripForm] = Form.useForm()
   const sessionTitle = useMemo(() => {
     const activeSession = sessions.find((item) => item.session_id === activeSessionId)
@@ -107,30 +108,52 @@ export default function App() {
 
   const loadMapHtml = useCallback(async (currentTrip) => {
     if (!currentTrip) {
+      mapRequestTokenRef.current += 1
       setMapHtml("")
       setMapError("")
+      setLoadingMap(false)
       return
     }
+    const token = Date.now()
+    mapRequestTokenRef.current = token
     try {
       setLoadingMap(true)
       setMapError("")
-      const data = await renderTripMap({ trip_data: currentTrip })
-      if (data?.map_html) {
-        setMapHtml(data.map_html)
-      } else {
-        setMapHtml("")
-        setMapError("地图生成失败，请稍后重试")
+      setMapHtml("")
+      let batchIndex = 0
+      while (mapRequestTokenRef.current === token) {
+        const data = await renderTripMap({
+          trip_data: currentTrip,
+          batch_index: batchIndex,
+          batch_size: 4,
+        })
+        if (mapRequestTokenRef.current !== token) {
+          return
+        }
+        const nextHtml = data?.map_html || ""
+        if (nextHtml) {
+          setMapHtml(nextHtml)
+        }
+        if (data?.is_final) {
+          setLoadingMap(false)
+          return
+        }
+        const nextSequence = Number.isFinite(data?.sequence) ? data.sequence : batchIndex
+        batchIndex = Math.max(nextSequence + 1, batchIndex + 1)
+        await new Promise((resolve) => setTimeout(resolve, 250))
       }
     } catch (error) {
       setMapHtml("")
       setMapError(`地图加载失败：${error.message}`)
-    } finally {
       setLoadingMap(false)
     }
   }, [])
 
   useEffect(() => {
     loadMapHtml(tripResult)
+    return () => {
+      mapRequestTokenRef.current += 1
+    }
   }, [tripResult, loadMapHtml])
 
   // 聊天消息点击发送

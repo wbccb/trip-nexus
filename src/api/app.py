@@ -101,10 +101,15 @@ class ChatSendResponse(BaseModel):
 
 class MapRenderRequest(BaseModel):
     trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
+    batch_index: Optional[int] = Field(0, description="批次序号，从 0 开始")
+    batch_size: Optional[int] = Field(4, description="每批 POI 数量")
 
 
 class MapRenderResponse(BaseModel):
     map_html: str = Field(..., description="地图 HTML 字符串")
+    sequence: int = Field(..., description="当前批次序号")
+    day: Optional[str] = Field(None, description="当前批次所属天数")
+    is_final: bool = Field(False, description="是否最终批次")
 
 
 @lru_cache(maxsize=1)
@@ -395,9 +400,27 @@ def generate_trip(payload: TripGenerateRequest) -> TripGenerateResponse:
 def render_map(payload: MapRenderRequest) -> MapRenderResponse:
     trip_data = payload.trip_data or {}
     map_renderer = _get_map_renderer()
-    map_obj = map_renderer.render_map(trip_data)
-    map_html = map_obj.get_root().render() if map_obj else ""
-    return MapRenderResponse(map_html=map_html)
+    batch_index = payload.batch_index or 0
+    batch_size = payload.batch_size or 4
+    selected_event = None
+    last_event = None
+    for idx, event in enumerate(map_renderer.render_map_batches(trip_data, batch_size=batch_size)):
+        last_event = event
+        if idx == batch_index:
+            selected_event = event
+            break
+    if selected_event is None:
+        selected_event = last_event or {}
+    map_html = selected_event.get("html") or ""
+    sequence = selected_event.get("sequence")
+    day = selected_event.get("day")
+    is_final = bool(selected_event.get("is_final"))
+    return MapRenderResponse(
+        map_html=map_html,
+        sequence=sequence if isinstance(sequence, int) else max(batch_index, 0),
+        day=day if isinstance(day, str) or day is None else str(day),
+        is_final=is_final,
+    )
 
 
 @app.post("/api/knowledge/search", response_model=KnowledgeSearchResponse)

@@ -25,6 +25,11 @@
 - 地图渲染：行程生成/切换后调用后端地图渲染接口，返回 HTML 并在右栏展示
 
 ## 地图渲染实现
+
+> 在folium中使用OpenStreetMap作为基础（默认）底图，然后加载高德地图（Gaode/Amap）替换 OpenStreetMap 
+> 
+> 然后python这个库folium会根据你传入的数据（Marker、每个Marker之间的连线等等数据）自动构建出能够显示正确地图样式的html数据，然后在iframe（本质就是一个h5页面）中显示出来这个html数据，这就是python这个库的厉害之处
+
 - 后端渲染模式（两种）
   - 旧模式：`TripMap.render_map`
     - 一次性渲染完整地图（POI 标注 + 每日路线折线 + 多底图切换）
