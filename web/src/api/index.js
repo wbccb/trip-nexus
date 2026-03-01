@@ -1,6 +1,7 @@
 // API 统一出口
 export {
   getSessionHistory,
+  getSessionTrip,
   listSessions,
   sendChatMessage,
   startSession,

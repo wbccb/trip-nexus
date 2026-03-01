@@ -52,6 +52,11 @@ class TripGenerateResponse(BaseModel):
     trip_data: Optional[Dict[str, Any]] = Field(None, description="结构化行程数据")
 
 
+class TripDataResponse(BaseModel):
+    session_id: str = Field(..., description="会话ID")
+    trip_data: Optional[Dict[str, Any]] = Field(None, description="结构化行程数据")
+
+
 class KnowledgeSearchRequest(BaseModel):
     """知识库检索请求体"""
     query: str = Field(..., description="检索问题或主题")
@@ -250,6 +255,13 @@ def session_history(session_id: str = Query(..., description="会话ID")) -> Lis
         messages = short_term_context.get("messages") or []
         return [ChatHistoryItem(**item) for item in messages if isinstance(item, dict)]
     return []
+
+
+@app.get("/api/sessions/trip", response_model=TripDataResponse)
+def session_trip(session_id: str = Query(..., description="会话ID")) -> TripDataResponse:
+    storage = _get_storage()
+    trip_data = storage.get_trip_data(session_id)
+    return TripDataResponse(session_id=session_id, trip_data=trip_data)
 
 
 @app.post("/api/chat/send", response_model=ChatSendResponse)

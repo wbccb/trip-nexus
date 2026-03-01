@@ -20,6 +20,11 @@ export async function getSessionHistory(sessionId) {
   return apiGet(`/api/sessions/history?session_id=${safeSessionId}`);
 }
 
+export async function getSessionTrip(sessionId) {
+  const safeSessionId = encodeURIComponent(sessionId || "");
+  return apiGet(`/api/sessions/trip?session_id=${safeSessionId}`);
+}
+
 export async function sendChatMessage(payload) {
   return apiPost("/api/chat/send", payload || {});
 }

@@ -15,7 +15,7 @@ import {
 import KnowledgeTab from "./components/KnowledgeTab.jsx"
 import SessionSider from "./components/SessionSider.jsx"
 import TripTab from "./components/TripTab.jsx"
-import { getSessionHistory, sendChatMessage } from "./api/index.js"
+import { getSessionHistory, getSessionTrip, sendChatMessage } from "./api/index.js"
 import { DEFAULT_DEVICE_ID, DEFAULT_USER_ID, SESSION_STORAGE_KEY } from "./constants/appConfig.js"
 import { useKnowledge } from "./hooks/useKnowledge.js"
 import { useSessions } from "./hooks/useSessions.js"
@@ -65,26 +65,36 @@ export default function App() {
   const loadChatHistory = useCallback(async (sessionId) => {
     if (!sessionId) {
       setChatMessages([])
+      updateTripResult(null)
       return
     }
     try {
       setLoadingChatHistory(true)
-      const data = await getSessionHistory(sessionId)
-      const normalized = Array.isArray(data)
-        ? data.map((item, index) => ({
+      const [historyData, tripData] = await Promise.all([
+        getSessionHistory(sessionId),
+        getSessionTrip(sessionId),
+      ])
+      const normalized = Array.isArray(historyData)
+        ? historyData.map((item, index) => ({
             id: `${sessionId}-${item.timestamp || Date.now()}-${index}`,
             role: item.role,
             content: item.content,
           }))
         : []
       setChatMessages(normalized)
+      if (tripData?.trip_data) {
+        updateTripResult(tripData.trip_data)
+      } else {
+        updateTripResult(null)
+      }
     } catch (error) {
       message.error(`聊天记录加载失败：${error.message}`)
       setChatMessages([])
+      updateTripResult(null)
     } finally {
       setLoadingChatHistory(false)
     }
-  }, [])
+  }, [updateTripResult])
 
   useEffect(() => {
     loadChatHistory(activeSessionId)
