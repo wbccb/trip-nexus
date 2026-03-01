@@ -2,6 +2,7 @@ import hashlib
 import json
 import sqlite3
 import datetime
+import time
 from typing import Optional, Dict, List
 from pydantic import ValidationError
 from src.frontend.context.entity import SessionContext, CoreEntity
@@ -21,6 +22,7 @@ class TestConversationStorage(BaseConversationStorage):
         self.sqlite_conn = sqlite3.connect(
             "trip_test.db",
             check_same_thread=False,
+            timeout=5,
         )
         self.sqlite_conn.row_factory = sqlite3.Row
         self.sqlite_conn.execute("PRAGMA journal_mode=WAL")
@@ -339,14 +341,21 @@ class TestConversationStorage(BaseConversationStorage):
 
     def get_session_chat_list(self, session_id: str) -> List[str]:
         """获取会话的所有聊天记录（按时间正序排列）"""
-        cursor = self.sqlite_conn.cursor()
-        cursor.execute("""
-            SELECT message
-            FROM session_chat
-            WHERE session_id = ?
-            ORDER BY update_time ASC
-        """, (session_id,))
-        return [row[0] for row in cursor.fetchall()]
+        last_error = None
+        for _ in range(3):
+            try:
+                cursor = self.sqlite_conn.cursor()
+                cursor.execute("""
+                    SELECT message
+                    FROM session_chat
+                    WHERE session_id = ?
+                    ORDER BY update_time ASC
+                """, (session_id,))
+                return [row[0] for row in cursor.fetchall()]
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                time.sleep(0.1)
+        raise last_error
 
     def delete_session_chat_by_id(self, chat_id: int):
         cursor = self.sqlite_conn.cursor()

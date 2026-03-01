@@ -245,21 +245,24 @@ def list_sessions(user_id: str = Query(..., description="用户ID")) -> List[Ses
 @app.get("/api/sessions/history", response_model=List[ChatHistoryItem])
 def session_history(session_id: str = Query(..., description="会话ID")) -> List[ChatHistoryItem]:
     storage = _get_storage()
-    history_messages = storage.get_session_chat_list(session_id)
-    if history_messages:
-        parsed_messages = []
-        for message_json in history_messages:
-            try:
-                message_obj = Message.model_validate_json(message_json)
-                parsed_messages.append(ChatHistoryItem(**_normalize_message_payload(message_obj)))
-            except Exception:
-                continue
-        return parsed_messages
-    short_term_context = storage.get_short_term_context(session_id)
-    if isinstance(short_term_context, dict):
-        messages = short_term_context.get("messages") or []
-        return [ChatHistoryItem(**item) for item in messages if isinstance(item, dict)]
-    return []
+    try:
+        history_messages = storage.get_session_chat_list(session_id)
+        if history_messages:
+            parsed_messages = []
+            for message_json in history_messages:
+                try:
+                    message_obj = Message.model_validate_json(message_json)
+                    parsed_messages.append(ChatHistoryItem(**_normalize_message_payload(message_obj)))
+                except Exception:
+                    continue
+            return parsed_messages
+        short_term_context = storage.get_short_term_context(session_id)
+        if isinstance(short_term_context, dict):
+            messages = short_term_context.get("messages") or []
+            return [ChatHistoryItem(**item) for item in messages if isinstance(item, dict)]
+        return []
+    except Exception:
+        return []
 
 
 @app.get("/api/sessions/trip", response_model=TripDataResponse)
