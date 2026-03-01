@@ -1,7 +1,62 @@
-import React from "react"
-import { Card, Divider, List, Space, Spin } from "antd"
+import { Card, Divider, Space, Spin, Table } from "antd"
 
 export default function TripTab({ loadingTrip, tripDays, tripResult }) {
+  const tableData = Array.isArray(tripDays)
+    ? tripDays.flatMap((day) =>
+        (day.items || []).map((item, index) => ({
+          key: `${day.day}-${index}`,
+          day: day.day,
+          time: item.time,
+          attraction: item.attraction,
+          address: item.address,
+          transport: item.transport,
+          duration: item.duration,
+          intro: item.description || item.introduction || item.note || item.summary || "",
+        }))
+      )
+    : []
+
+  const columns = [
+    {
+      title: "时间",
+      dataIndex: "time",
+      key: "time",
+      render: (value, record) => (
+        <Space direction="vertical" size={0}>
+          <div>{`第 ${record.day} 天`}</div>
+          <div>{value || "未提供"}</div>
+        </Space>
+      ),
+    },
+    {
+      title: "地点",
+      dataIndex: "attraction",
+      key: "attraction",
+      render: (value, record) => (
+        <Space direction="vertical" size={0}>
+          <div>{value || "未提供"}</div>
+          <div>{record.address || "未提供"}</div>
+        </Space>
+      ),
+    },
+    {
+      title: "交通",
+      dataIndex: "transport",
+      key: "transport",
+      render: (value) => value || "未提供",
+    },
+    {
+      title: "停留时间与介绍",
+      dataIndex: "duration",
+      key: "duration",
+      render: (value, record) => (
+        <div>
+          {record.intro ? `${value || "未提供"} · ${record.intro}` : value || "未提供"}
+        </div>
+      ),
+    },
+  ]
+
   return (
     <div className="trip-layout">
       <Card title="行程详情" className="panel-card">
@@ -13,30 +68,12 @@ export default function TripTab({ loadingTrip, tripDays, tripResult }) {
                 目的地：{tripResult.destination} · 天数：{tripResult.days}
               </div>
               <Divider />
-              <List
-                dataSource={tripDays}
-                renderItem={(day) => (
-                  <List.Item className="day-item">
-                    <Card title={`第 ${day.day} 天`} size="small" className="day-card">
-                      <List
-                        dataSource={day.items}
-                        renderItem={(item, index) => (
-                          <List.Item className="poi-item">
-                            <div className="poi-title">
-                              {index + 1}. {item.attraction}
-                            </div>
-                            <div className="poi-meta">
-                              时间：{item.time} · 地址：{item.address}
-                            </div>
-                            <div className="poi-meta">
-                              交通：{item.transport} · 停留：{item.duration}
-                            </div>
-                          </List.Item>
-                        )}
-                      />
-                    </Card>
-                  </List.Item>
-                )}
+              <Table
+                dataSource={tableData}
+                columns={columns}
+                pagination={false}
+                size="small"
+                locale={{ emptyText: "暂无行程安排" }}
               />
             </Space>
           )}
