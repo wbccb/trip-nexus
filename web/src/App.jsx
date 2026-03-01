@@ -26,6 +26,7 @@ const { Header, Content } = Layout
 export default function App() {
   const {
     activeSessionId,
+    deleteSessionById,
     loadSessions,
     loadingSessions,
     selectSession,
@@ -305,6 +306,7 @@ export default function App() {
           activeSessionId={activeSessionId}
           loadingSessions={loadingSessions}
           onCreateSession={startNewSession}
+          onDeleteSession={deleteSessionById}
           onSelectSession={(sessionId) => {
             selectSession(sessionId)
             setIsSessionDrawerOpen(false)

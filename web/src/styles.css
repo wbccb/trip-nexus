@@ -142,7 +142,7 @@ body {
   background: #f7f8fb;
   display: flex;
   gap: 12px;
-  align-items: flex-start;
+  align-items: center;
   border: 1px solid transparent;
   overflow: hidden; /* 溢出隐藏 */
 }
@@ -163,10 +163,45 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
-
   width: 100%;
   overflow: hidden;
-  padding: 0px 10px;
+  padding-left: 10px;
+  padding-right: 10px;
+}
+
+.session-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+}
+
+.session-actions {
+  margin-left: auto;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease;
+
+  position: absolute;
+  right: 5px;
+  top: auto;
+  bototm: auto;
+}
+
+.session-item:hover .session-content {
+  padding-right: 50px;
+}
+
+.session-item:hover .session-actions {
+  opacity: 1;
+  visibility: visible;
+}
+
+
+
+.session-delete-btn {
+  padding: 0 6px;
+  height: 24px;
 }
 .session-name {
   font-weight: 600;

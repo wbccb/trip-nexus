@@ -3,6 +3,7 @@ export {
   getSessionHistory,
   getSessionTrip,
   listSessions,
+  deleteSession,
   sendChatMessage,
   startSession,
 } from "./sessionApi.js";

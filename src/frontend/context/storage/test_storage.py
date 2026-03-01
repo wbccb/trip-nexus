@@ -23,6 +23,8 @@ class TestConversationStorage(BaseConversationStorage):
             check_same_thread=False,
         )
         self.sqlite_conn.row_factory = sqlite3.Row
+        self.sqlite_conn.execute("PRAGMA journal_mode=WAL")
+        self.sqlite_conn.execute("PRAGMA busy_timeout = 5000")
         # 初始化SQLite表结构
         self._init_sqlite_tables()
 
@@ -304,8 +306,27 @@ class TestConversationStorage(BaseConversationStorage):
 
     def delete_session(self, session_id: str):
         cursor = self.sqlite_conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trip_data_store (
+            session_id TEXT PRIMARY KEY,
+            data_json TEXT NOT NULL,
+            last_updated TIMESTAMP NOT NULL
+        )
+        """)
+        cursor.execute("DELETE FROM session_chat WHERE session_id = ?", (session_id,))
+        cursor.execute("DELETE FROM core_entities WHERE session_id = ?", (session_id,))
+        cursor.execute("DELETE FROM long_term_summaries WHERE session_id = ?", (session_id,))
+        cursor.execute("DELETE FROM trip_data_store WHERE session_id = ?", (session_id,))
         cursor.execute("DELETE FROM session_list WHERE session_id = ?", (session_id,))
         self.sqlite_conn.commit()
+        redis_keys = [
+            f"session:{session_id}:short_term",
+            f"session:{session_id}:core_entities",
+            f"session:{session_id}:trip_data",
+        ]
+        for key in redis_keys:
+            if key in self.redis_mock:
+                del self.redis_mock[key]
 
     def store_session_chat(self, session_id: str, message: str):
         update_time = datetime.datetime.now().isoformat()

@@ -1,5 +1,5 @@
 // 会话相关接口封装
-import { apiGet, apiPost } from "./httpClient.js";
+import { apiDelete, apiGet, apiPost } from "./httpClient.js";
 
 // 获取会话列表
 export async function listSessions(userId) {
@@ -27,4 +27,9 @@ export async function getSessionTrip(sessionId) {
 
 export async function sendChatMessage(payload) {
   return apiPost("/api/chat/send", payload || {});
+}
+
+export async function deleteSession(sessionId) {
+  const safeSessionId = encodeURIComponent(sessionId || "");
+  return apiDelete(`/api/sessions/delete?session_id=${safeSessionId}`);
 }

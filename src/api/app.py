@@ -57,6 +57,11 @@ class TripDataResponse(BaseModel):
     trip_data: Optional[Dict[str, Any]] = Field(None, description="结构化行程数据")
 
 
+class DeleteSessionResponse(BaseModel):
+    session_id: str = Field(..., description="会话ID")
+    success: bool = Field(..., description="是否删除成功")
+
+
 class KnowledgeSearchRequest(BaseModel):
     """知识库检索请求体"""
     query: str = Field(..., description="检索问题或主题")
@@ -262,6 +267,13 @@ def session_trip(session_id: str = Query(..., description="会话ID")) -> TripDa
     storage = _get_storage()
     trip_data = storage.get_trip_data(session_id)
     return TripDataResponse(session_id=session_id, trip_data=trip_data)
+
+
+@app.delete("/api/sessions/delete", response_model=DeleteSessionResponse)
+def delete_session(session_id: str = Query(..., description="会话ID")) -> DeleteSessionResponse:
+    storage = _get_storage()
+    storage.delete_session(session_id)
+    return DeleteSessionResponse(session_id=session_id, success=True)
 
 
 @app.post("/api/chat/send", response_model=ChatSendResponse)

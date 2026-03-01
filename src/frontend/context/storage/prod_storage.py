@@ -173,3 +173,30 @@ class ProdConversationStorage(BaseConversationStorage):
                 cursor.close()
                 conn.close()
         return ""
+
+    def delete_session(self, session_id: str):
+        redis_keys = [
+            f"session:{session_id}:short_term",
+            f"session:{session_id}:core_entities",
+            f"session:{session_id}:trip_data",
+        ]
+        for key in redis_keys:
+            try:
+                self.redis.delete(key)
+            except Exception as e:
+                print(f"Redis删除会话缓存失败: {e}")
+        try:
+            conn = self._get_mysql_connection()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM session_chat WHERE session_id = %s", (session_id,))
+            cursor.execute("DELETE FROM core_entities WHERE session_id = %s", (session_id,))
+            cursor.execute("DELETE FROM long_term_summaries WHERE session_id = %s", (session_id,))
+            cursor.execute("DELETE FROM trip_data_store WHERE session_id = %s", (session_id,))
+            cursor.execute("DELETE FROM session_list WHERE session_id = %s", (session_id,))
+            conn.commit()
+        except Exception as e:
+            print(f"MySQL删除会话数据失败: {e}")
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()

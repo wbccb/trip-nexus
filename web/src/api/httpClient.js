@@ -38,3 +38,14 @@ export async function apiPost(path, body) {
   // 返回 JSON 结果
   return response.json();
 }
+
+export async function apiDelete(path) {
+  const url = `${API_BASE}${path}`;
+  const response = await fetch(url, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(`DELETE ${path} failed with status ${response.status}`);
+  }
+  return response.json();
+}

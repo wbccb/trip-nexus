@@ -1,67 +1,100 @@
-import { useCallback, useEffect, useState } from "react"
-import { message } from "antd"
-import { listSessions, startSession } from "../api/index.js"
-import { DEFAULT_DEVICE_ID, DEFAULT_USER_ID, SESSION_STORAGE_KEY } from "../constants/appConfig.js"
+import { useCallback, useEffect, useState } from "react";
+import { message } from "antd";
+import { deleteSession, listSessions, startSession } from "../api/index.js";
+import {
+  DEFAULT_DEVICE_ID,
+  DEFAULT_USER_ID,
+  SESSION_STORAGE_KEY,
+} from "../constants/appConfig.js";
 
 export function useSessions() {
-  const [sessions, setSessions] = useState([])
-  const [activeSessionId, setActiveSessionId] = useState(null)
-  const [loadingSessions, setLoadingSessions] = useState(false)
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [loadingSessions, setLoadingSessions] = useState(false);
 
   const loadSessions = useCallback(async () => {
     try {
-      setLoadingSessions(true)
-      const data = await listSessions(DEFAULT_USER_ID)
-      setSessions(Array.isArray(data) ? data : [])
+      setLoadingSessions(true);
+      const data = await listSessions(DEFAULT_USER_ID);
+      setSessions(Array.isArray(data) ? data : []);
     } catch (error) {
-      message.error(`会话列表加载失败：${error.message}`)
+      message.error(`会话列表加载失败：${error.message}`);
     } finally {
-      setLoadingSessions(false)
+      setLoadingSessions(false);
     }
-  }, [])
+  }, []);
 
   const startNewSession = useCallback(async () => {
     try {
-      const data = await startSession(DEFAULT_USER_ID, DEFAULT_DEVICE_ID)
+      const data = await startSession(DEFAULT_USER_ID, DEFAULT_DEVICE_ID);
       if (data?.session_id) {
-        localStorage.setItem(SESSION_STORAGE_KEY, data.session_id)
-        setActiveSessionId(data.session_id)
-        await loadSessions()
+        localStorage.setItem(SESSION_STORAGE_KEY, data.session_id);
+        setActiveSessionId(data.session_id);
+        await loadSessions();
       }
     } catch (error) {
-      message.error(`创建会话失败：${error.message}`)
+      message.error(`创建会话失败：${error.message}`);
     }
-  }, [loadSessions])
+  }, [loadSessions]);
+
+  const deleteSessionById = useCallback(
+    async (sessionId) => {
+      if (!sessionId) {
+        return;
+      }
+      try {
+        await deleteSession(sessionId);
+        const data = await listSessions(DEFAULT_USER_ID);
+        const nextSessions = Array.isArray(data) ? data : [];
+        setSessions(nextSessions);
+        if (sessionId === activeSessionId) {
+          const nextSessionId = nextSessions[0]?.session_id || null;
+          if (nextSessionId) {
+            setActiveSessionId(nextSessionId);
+            localStorage.setItem(SESSION_STORAGE_KEY, nextSessionId);
+          } else {
+            localStorage.removeItem(SESSION_STORAGE_KEY);
+            setActiveSessionId(null);
+          }
+        }
+        message.success(`会话 ${sessionId} 删除成功`);
+      } catch (error) {
+        message.error(`删除会话失败：${error.message}`);
+      }
+    },
+    [activeSessionId],
+  );
 
   const ensureSession = useCallback(async () => {
-    const cachedSession = localStorage.getItem(SESSION_STORAGE_KEY)
+    const cachedSession = localStorage.getItem(SESSION_STORAGE_KEY);
     if (cachedSession) {
-      setActiveSessionId(cachedSession)
-      return
+      setActiveSessionId(cachedSession);
+      return;
     }
-    await startNewSession()
-  }, [startNewSession])
+    await startNewSession();
+  }, [startNewSession]);
 
   const selectSession = useCallback((sessionId) => {
     if (!sessionId) {
-      return
+      return;
     }
-    setActiveSessionId(sessionId)
-    localStorage.setItem(SESSION_STORAGE_KEY, sessionId)
-  }, [])
+    setActiveSessionId(sessionId);
+    localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+  }, []);
 
   useEffect(() => {
-    loadSessions()
-    ensureSession()
-  }, [loadSessions, ensureSession])
+    loadSessions();
+    ensureSession();
+  }, [loadSessions, ensureSession]);
 
   return {
     activeSessionId,
+    deleteSessionById,
     loadSessions,
     loadingSessions,
     selectSession,
     sessions,
     setActiveSessionId,
     startNewSession,
-  }
+  };
 }
