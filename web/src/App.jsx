@@ -56,6 +56,7 @@ export default function App() {
   const [mapHtml, setMapHtml] = useState("")
   const [loadingMap, setLoadingMap] = useState(false)
   const [mapError, setMapError] = useState("")
+  const [isMapFullscreen, setIsMapFullscreen] = useState(false)
   const mapRequestTokenRef = useRef(0)
   const [tripForm] = Form.useForm()
   const sessionTitle = useMemo(() => {
@@ -328,7 +329,17 @@ export default function App() {
             />
           </div>
           <div className="app-right">
-            <Card title="地图概览" className="panel-card map-card">
+            <Card
+              title="地图概览"
+              className="panel-card map-card"
+              extra={
+                tripResult ? (
+                  <Button size="small" type="text" onClick={() => setIsMapFullscreen(true)}>
+                    全屏
+                  </Button>
+                ) : null
+              }
+            >
               {!tripResult && (
                 <div className="map-placeholder map-large">
                   地图占位（后续可替换为地图 iframe/图片）
@@ -345,7 +356,7 @@ export default function App() {
                     </div>
                   </div>
                   <div className="map-view">
-                    <Spin spinning={loadingMap}>
+                    <Spin spinning={loadingMap} style={{ height: "100%" }}>
                       {mapError && <div className="map-placeholder map-large">{mapError}</div>}
                       {!mapError && mapHtml && (
                         <iframe title="trip-map" className="map-iframe" srcDoc={mapHtml} />
@@ -361,6 +372,25 @@ export default function App() {
           </div>
         </div>
       </Content>
+      {isMapFullscreen && (
+        <div className="map-overlay">
+          <div className="map-overlay-toolbar">
+            <div className="map-overlay-title">行程地图</div>
+            <Button size="small" type="text" onClick={() => setIsMapFullscreen(false)}>
+              退出全屏
+            </Button>
+          </div>
+          <div className="map-overlay-body">
+            <Spin spinning={loadingMap} style={{ height: "100%" }}>
+              {mapError && <div className="map-placeholder map-large">{mapError}</div>}
+              {!mapError && mapHtml && <iframe title="trip-map-full" className="map-iframe" srcDoc={mapHtml} />}
+              {!mapError && !mapHtml && !loadingMap && (
+                <div className="map-placeholder map-large">地图生成失败，请稍后重试</div>
+              )}
+            </Spin>
+          </div>
+        </div>
+      )}
       <Drawer
         title="会话列表"
         placement="left"

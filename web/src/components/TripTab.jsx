@@ -22,7 +22,7 @@ export default function TripTab({ loadingTrip, tripDays, tripResult }) {
       dataIndex: "time",
       key: "time",
       render: (value, record) => (
-        <Space direction="vertical" size={0}>
+        <Space direction="vertical" size={0} style={{ width: "100px" }}>
           <div>{`第 ${record.day} 天`}</div>
           <div>{value || "未提供"}</div>
         </Space>
@@ -46,11 +46,11 @@ export default function TripTab({ loadingTrip, tripDays, tripResult }) {
       render: (value) => value || "未提供",
     },
     {
-      title: "停留时间与介绍",
+      title: "停留时间",
       dataIndex: "duration",
       key: "duration",
       render: (value, record) => (
-        <div>
+        <div style={{ width: "64px" }}>
           {record.intro ? `${value || "未提供"} · ${record.intro}` : value || "未提供"}
         </div>
       ),
