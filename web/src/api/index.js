@@ -8,7 +8,14 @@ export {
   startSession,
 } from "./sessionApi.js";
 // 行程相关接口导出
-export { generateTrip, renderTripMap, streamTripGeneration } from "./tripApi.js";
+export {
+  generateTrip,
+  renderTripGeojson,
+  renderTripMap,
+  replanTripDay,
+  streamTripGeneration,
+  updateTripData,
+} from "./tripApi.js";
 export { searchKnowledge } from "./knowledgeApi.js";
 export { API_BASE, apiPost } from "./httpClient.js";
 

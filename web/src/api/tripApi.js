@@ -129,3 +129,15 @@ function parseSseEvent(rawChunk) {
 export async function renderTripMap(payload) {
   return apiPost("/api/map/render", payload);
 }
+
+export async function renderTripGeojson(payload) {
+  return apiPost("/api/map/geojson", payload);
+}
+
+export async function updateTripData(payload) {
+  return apiPost("/api/trip/update", payload);
+}
+
+export async function replanTripDay(payload) {
+  return apiPost("/api/trip/replan_day", payload);
+}

@@ -1,7 +1,12 @@
 import { useCallback, useMemo, useState } from "react";
 import { message } from "antd";
 // 引入行程生成接口与流式接口
-import { generateTrip, streamTripGeneration } from "../api/index.js";
+import {
+  generateTrip,
+  replanTripDay,
+  streamTripGeneration,
+  updateTripData,
+} from "../api/index.js";
 import {
   DEFAULT_DEVICE_ID,
   DEFAULT_USER_ID,
@@ -20,6 +25,50 @@ export function useTrip({
   const updateTripResult = useCallback((data) => {
     setTripResult(data || null);
   }, []);
+
+  const persistTripResult = useCallback(
+    async (nextTrip, sessionOverride) => {
+      if (!nextTrip) {
+        return;
+      }
+      const payload = {
+        user_id: DEFAULT_USER_ID,
+        device_id: DEFAULT_DEVICE_ID,
+        session_id: sessionOverride || activeSessionId,
+        trip_data: nextTrip,
+      };
+      const data = await updateTripData(payload);
+      if (data?.session_id && data.session_id !== activeSessionId) {
+        setActiveSessionId(data.session_id);
+        localStorage.setItem(SESSION_STORAGE_KEY, data.session_id);
+      }
+    },
+    [activeSessionId, setActiveSessionId],
+  );
+
+  const handleReplanDay = useCallback(
+    async (day) => {
+      if (!day) {
+        return null;
+      }
+      const payload = {
+        user_id: DEFAULT_USER_ID,
+        device_id: DEFAULT_DEVICE_ID,
+        session_id: activeSessionId,
+        day,
+      };
+      const data = await replanTripDay(payload);
+      if (data?.session_id && data.session_id !== activeSessionId) {
+        setActiveSessionId(data.session_id);
+        localStorage.setItem(SESSION_STORAGE_KEY, data.session_id);
+      }
+      if (data?.trip_data) {
+        setTripResult(data.trip_data);
+      }
+      return data?.trip_data || null;
+    },
+    [activeSessionId, setActiveSessionId],
+  );
 
   // 提交行程表单（支持流式）
   const handleTripSubmit = useCallback(
@@ -173,6 +222,8 @@ export function useTrip({
     loadingTrip,
     tripDays,
     tripResult,
+    persistTripResult,
+    handleReplanDay,
     updateTripResult,
   };
 }

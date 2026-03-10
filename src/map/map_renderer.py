@@ -223,6 +223,102 @@ class TripMap:
 
         return m  # 返回基础地图对象
 
+    def build_geojson(self, trip_data: Dict[str, Any]) -> Dict[str, Any]:
+        dest = trip_data.get("destination", "成都")
+        center_coords = self._get_coordinates(dest)
+        daily_plan_raw = trip_data.get("daily_plan")
+        if isinstance(daily_plan_raw, dict):
+            daily_plans_grouped: Dict[str, List[Dict[str, Any]]] = daily_plan_raw
+        elif isinstance(daily_plan_raw, list):
+            daily_plans_grouped = {"1": daily_plan_raw}
+        else:
+            daily_plans_grouped = {}
+
+        points_features: List[Dict[str, Any]] = []
+        route_features: List[Dict[str, Any]] = []
+        all_coords: List[Tuple[float, float]] = []
+        day_items = sorted(
+            daily_plans_grouped.items(),
+            key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]),
+        )
+        for day_str, items in day_items:
+            try:
+                day_idx = int(day_str) - 1
+            except ValueError:
+                continue
+            coords_list: List[Tuple[float, float]] = []
+            overlap_counter: Dict[Tuple[float, float], int] = {}
+            for idx, item in enumerate(items):
+                address = item.get("address")
+                attraction = item.get("attraction", "未知景点")
+                lat = item.get("latitude")
+                lon = item.get("longitude")
+                if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and not (lat == 0 and lon == 0):
+                    coords = (float(lat), float(lon))
+                else:
+                    if not address:
+                        continue
+                    coords = self._get_coordinates(
+                        address,
+                        city_name=dest,
+                        attraction_name=attraction,
+                        fallback=center_coords,
+                        max_offset_deg=1.0,
+                    )
+                if not coords or all(c == 0 for c in coords):
+                    continue
+                adjusted_coords = self._spread_overlapping_coords(coords, overlap_counter)
+                coords_list.append(adjusted_coords)
+                all_coords.append(adjusted_coords)
+                points_features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "Point",
+                            "coordinates": [adjusted_coords[1], adjusted_coords[0]],
+                        },
+                        "properties": {
+                            "poi_id": f"{day_str}-{idx}",
+                            "day": day_str,
+                            "order": idx + 1,
+                            "attraction": attraction,
+                            "address": address,
+                            "time": item.get("time"),
+                            "transport": item.get("transport"),
+                            "duration": item.get("duration"),
+                            "note": item.get("note") or item.get("description") or item.get("introduction"),
+                            "color": self.colors[day_idx % len(self.colors)],
+                        },
+                    }
+                )
+            if len(coords_list) >= 2:
+                route_features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [[lon, lat] for lat, lon in coords_list],
+                        },
+                        "properties": {
+                            "day": day_str,
+                            "color": self.colors[day_idx % len(self.colors)],
+                        },
+                    }
+                )
+        if all_coords:
+            lats = [coord[0] for coord in all_coords]
+            lons = [coord[1] for coord in all_coords]
+            bounds = [min(lons), min(lats), max(lons), max(lats)]
+        else:
+            bounds = [center_coords[1], center_coords[0], center_coords[1], center_coords[0]]
+        return {
+            "points": {"type": "FeatureCollection", "features": points_features},
+            "routes": {"type": "FeatureCollection", "features": route_features},
+            "center": {"latitude": center_coords[0], "longitude": center_coords[1]},
+            "bounds": bounds,
+            "total_points": len(points_features),
+        }
+
     def render_map(self, trip_data: Dict[str, Any]) -> folium.Map:
         """
         一次性渲染完整地图（包含所有 POI 与路线）。

@@ -119,6 +119,42 @@ class MapRenderResponse(BaseModel):
     is_final: bool = Field(False, description="是否最终批次")
 
 
+class MapGeoJsonRequest(BaseModel):
+    trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
+
+
+class MapGeoJsonResponse(BaseModel):
+    points: Dict[str, Any] = Field(..., description="POI 点位 GeoJSON")
+    routes: Dict[str, Any] = Field(..., description="路线 GeoJSON")
+    center: Dict[str, float] = Field(..., description="地图中心点")
+    bounds: List[float] = Field(..., description="地图边界")
+    total_points: int = Field(..., description="POI 数量")
+
+
+class TripUpdateRequest(BaseModel):
+    user_id: str = Field(..., description="用户唯一ID")
+    device_id: str = Field(..., description="设备唯一ID")
+    session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
+    trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
+
+
+class TripUpdateResponse(BaseModel):
+    session_id: str = Field(..., description="会话ID")
+    trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
+
+
+class TripReplanDayRequest(BaseModel):
+    user_id: str = Field(..., description="用户唯一ID")
+    device_id: str = Field(..., description="设备唯一ID")
+    session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
+    day: int = Field(..., description="需要重新规划的天数")
+
+
+class TripReplanDayResponse(BaseModel):
+    session_id: str = Field(..., description="会话ID")
+    trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
+
+
 class AgentRunRequest(BaseModel):
     user_id: str = Field(..., description="用户唯一ID")
     device_id: str = Field(..., description="设备唯一ID")
@@ -208,6 +244,15 @@ def _ensure_session_id(user_id: str, device_id: str, session_id: Optional[str]) 
     new_session_id = storage.generate_session_id(user_id, device_id)
     storage.store_session(user_id, new_session_id)
     return new_session_id
+
+
+def _normalize_daily_plan(trip_data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    daily_plan_raw = trip_data.get("daily_plan")
+    if isinstance(daily_plan_raw, dict):
+        return {str(key): value for key, value in daily_plan_raw.items() if isinstance(value, list)}
+    if isinstance(daily_plan_raw, list):
+        return {"1": daily_plan_raw}
+    return {}
 
 
 def _build_agent_thread_id(user_id: str, device_id: str) -> str:
@@ -652,6 +697,55 @@ def render_map(payload: MapRenderRequest) -> MapRenderResponse:
         day=day if isinstance(day, str) or day is None else str(day),
         is_final=is_final,
     )
+
+
+@app.post("/api/map/geojson", response_model=MapGeoJsonResponse)
+def render_map_geojson(payload: MapGeoJsonRequest) -> MapGeoJsonResponse:
+    trip_data = payload.trip_data or {}
+    map_renderer = _get_map_renderer()
+    geo_payload = map_renderer.build_geojson(trip_data)
+    return MapGeoJsonResponse(**geo_payload)
+
+
+@app.post("/api/trip/update", response_model=TripUpdateResponse)
+def update_trip(payload: TripUpdateRequest) -> TripUpdateResponse:
+    session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
+    storage = _get_storage()
+    storage.store_trip_data(session_id, payload.trip_data)
+    return TripUpdateResponse(session_id=session_id, trip_data=payload.trip_data)
+
+
+@app.post("/api/trip/replan_day", response_model=TripReplanDayResponse)
+def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
+    session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
+    storage = _get_storage()
+    current_trip = storage.get_trip_data(session_id)
+    if not current_trip:
+        raise HTTPException(status_code=404, detail="当前会话未找到行程数据")
+    day_value = int(payload.day)
+    llm_manager = _get_llm_manager()
+    user_input = {
+        "destination": current_trip.get("destination", "成都"),
+        "days": current_trip.get("days", 3),
+        "budget": current_trip.get("budget", ""),
+        "preference": current_trip.get("preference", ""),
+    }
+    edit_cmd = {
+        "type": "modify",
+        "msg": f"仅重新规划第{day_value}天行程，其余天保持不变",
+    }
+    replanned_trip = llm_manager.generate_trip(user_input, [], edit_cmd)
+    if not replanned_trip:
+        raise HTTPException(status_code=500, detail="重新规划失败")
+    current_daily_plan = _normalize_daily_plan(current_trip)
+    replanned_daily_plan = _normalize_daily_plan(replanned_trip)
+    day_key = str(day_value)
+    if day_key in replanned_daily_plan:
+        current_daily_plan[day_key] = replanned_daily_plan[day_key]
+    merged_trip = dict(current_trip)
+    merged_trip["daily_plan"] = current_daily_plan
+    storage.store_trip_data(session_id, merged_trip)
+    return TripReplanDayResponse(session_id=session_id, trip_data=merged_trip)
 
 
 def _run_agent_background(

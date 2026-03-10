@@ -91,6 +91,137 @@ body {
   flex: 1;
 }
 
+.map-canvas {
+  height: 100%;
+  width: 100%;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.map-view {
+  height: 100%;
+}
+
+.map-frame {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+}
+
+.trip-day-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.trip-day-block {
+  background: #f8fafc;
+  border-radius: 12px;
+  padding: 12px;
+  border: 1px solid #eef1f6;
+}
+
+.trip-day-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.trip-day-title {
+  font-weight: 600;
+}
+
+.trip-day-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.trip-day-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.trip-card {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+  padding: 12px;
+  background: #ffffff;
+  border-radius: 12px;
+  border: 1px solid #eef1f6;
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.06);
+}
+
+.trip-card.is-selected {
+  border-color: #ff5722;
+  box-shadow: 0 10px 24px rgba(255, 87, 34, 0.2);
+}
+
+.trip-card.is-dragging {
+  opacity: 0.7;
+}
+
+.trip-card-left {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+}
+
+.trip-card-order {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #1e40af;
+  color: #ffffff;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.trip-card-body {
+  flex: 1;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.trip-card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.trip-card-name {
+  font-weight: 600;
+}
+
+.trip-card-meta {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.trip-card-note {
+  font-size: 12px;
+  color: #475569;
+  background: #f1f5f9;
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+
+.trip-card-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+}
+
 .app-main .ant-tabs {
   height: 100%;
   display: flex;

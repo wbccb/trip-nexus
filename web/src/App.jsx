@@ -18,6 +18,11 @@ import {
   Typography,
   message,
 } from "antd"
+import { DeckGL } from "@deck.gl/react"
+import { ScatterplotLayer, LineLayer, TextLayer } from "@deck.gl/layers"
+import { WebMercatorViewport } from "@deck.gl/core"
+import Map from "react-map-gl/maplibre"
+import Supercluster from "supercluster"
 import KnowledgeTab from "./components/KnowledgeTab.jsx"
 import SessionSider from "./components/SessionSider.jsx"
 import TripTab from "./components/TripTab.jsx"
@@ -25,7 +30,7 @@ import {
   buildAgentStreamUrl,
   getSessionHistory,
   getSessionTrip,
-  renderTripMap,
+  renderTripGeojson,
   runAgent,
   sendChatMessage,
 } from "./api/index.js"
@@ -75,6 +80,24 @@ const resolveStatusColor = (status) => {
   }
   return "default"
 }
+const resolveRouteColor = (colorName) => {
+  if (colorName === "green") {
+    return [76, 175, 80]
+  }
+  if (colorName === "red") {
+    return [244, 67, 54]
+  }
+  if (colorName === "purple") {
+    return [156, 39, 176]
+  }
+  if (colorName === "orange") {
+    return [255, 152, 0]
+  }
+  if (colorName === "darkblue") {
+    return [25, 118, 210]
+  }
+  return [33, 150, 243]
+}
 
 export default function App() {
   const {
@@ -87,7 +110,15 @@ export default function App() {
     setActiveSessionId,
     startNewSession,
   } = useSessions()
-  const { handleTripSubmit, loadingTrip, tripDays, tripResult, updateTripResult } = useTrip({
+  const {
+    handleTripSubmit,
+    handleReplanDay,
+    loadingTrip,
+    persistTripResult,
+    tripDays,
+    tripResult,
+    updateTripResult,
+  } = useTrip({
     activeSessionId,
     refreshSessions: loadSessions,
     setActiveSessionId,
@@ -106,8 +137,17 @@ export default function App() {
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false)
   const [isTripModalOpen, setIsTripModalOpen] = useState(false)
   const [mapHtml, setMapHtml] = useState("")
+  const [mapGeojson, setMapGeojson] = useState(null)
   const [loadingMap, setLoadingMap] = useState(false)
   const [mapError, setMapError] = useState("")
+  const [selectedPoiId, setSelectedPoiId] = useState("")
+  const [mapViewState, setMapViewState] = useState({
+    longitude: 104.065,
+    latitude: 30.657,
+    zoom: 11,
+    bearing: 0,
+    pitch: 0,
+  })
   const [isMapFullscreen, setIsMapFullscreen] = useState(false)
   const mapRequestTokenRef = useRef(0)
   const [tripForm] = Form.useForm()
@@ -137,6 +177,136 @@ export default function App() {
       "请根据以下信息生成行程：目的地 {destination}，天数 {days} 天，预算 {budget}，偏好 {preference}。请给出每天安排、交通方式、停留时长与地址。",
     []
   )
+  const mapPoints = useMemo(() => {
+    if (!mapGeojson?.points?.features) {
+      return []
+    }
+    return mapGeojson.points.features
+  }, [mapGeojson])
+  const mapRoutes = useMemo(() => {
+    if (!mapGeojson?.routes?.features) {
+      return []
+    }
+    return mapGeojson.routes.features
+  }, [mapGeojson])
+  useEffect(() => {
+    if (!selectedPoiId) {
+      return
+    }
+    const exists = mapPoints.some((feature) => feature?.properties?.poi_id === selectedPoiId)
+    if (!exists) {
+      setSelectedPoiId("")
+    }
+  }, [mapPoints, selectedPoiId])
+  const clusterIndex = useMemo(() => {
+    const index = new Supercluster({ radius: 50, maxZoom: 16 })
+    index.load(mapPoints)
+    return index
+  }, [mapPoints])
+  const clusters = useMemo(() => {
+    if (!clusterIndex || !mapViewState) {
+      return []
+    }
+    const viewport = new WebMercatorViewport({
+      width: 800,
+      height: 600,
+      longitude: mapViewState.longitude,
+      latitude: mapViewState.latitude,
+      zoom: mapViewState.zoom,
+      bearing: mapViewState.bearing,
+      pitch: mapViewState.pitch,
+    })
+    const bounds = viewport.getBounds()
+    return clusterIndex.getClusters(
+      [bounds[0][0], bounds[0][1], bounds[1][0], bounds[1][1]],
+      Math.round(mapViewState.zoom),
+    )
+  }, [clusterIndex, mapViewState])
+  const clusterCounts = useMemo(
+    () => clusters.filter((item) => item?.properties?.cluster),
+    [clusters],
+  )
+  const routeSegments = useMemo(() => {
+    const segments = []
+    mapRoutes.forEach((feature) => {
+      const coords = feature?.geometry?.coordinates
+      if (Array.isArray(coords) && coords.length >= 2) {
+        for (let i = 0; i < coords.length - 1; i += 1) {
+          segments.push({
+            source: coords[i],
+            target: coords[i + 1],
+            color: resolveRouteColor(feature?.properties?.color),
+          })
+        }
+      }
+    })
+    return segments
+  }, [mapRoutes])
+  const handleSelectPoi = useCallback((poiId) => {
+    if (!poiId) {
+      return
+    }
+    setSelectedPoiId(String(poiId))
+  }, [])
+  const mapLayers = useMemo(() => {
+    const layers = []
+    if (routeSegments.length > 0) {
+      layers.push(
+        new LineLayer({
+          id: "trip-routes",
+          data: routeSegments,
+          getSourcePosition: (d) => d.source,
+          getTargetPosition: (d) => d.target,
+          getColor: (d) => d.color,
+          getWidth: 3,
+          opacity: 0.7,
+        }),
+      )
+    }
+    if (clusters.length > 0) {
+      layers.push(
+        new ScatterplotLayer({
+          id: "trip-points",
+          data: clusters,
+          getPosition: (d) => d.geometry.coordinates,
+          getRadius: (d) => {
+            if (d.properties.cluster) {
+              return 14 + Math.log(d.properties.point_count) * 6
+            }
+            return d.properties?.poi_id === selectedPoiId ? 14 : 10
+          },
+          getFillColor: (d) => {
+            if (d.properties.cluster) {
+              return [30, 136, 229, 200]
+            }
+            return d.properties?.poi_id === selectedPoiId ? [255, 87, 34, 230] : [76, 175, 80, 210]
+          },
+          getLineColor: (d) => (d.properties?.poi_id === selectedPoiId ? [255, 87, 34, 255] : [255, 255, 255]),
+          getLineWidth: (d) => (d.properties?.poi_id === selectedPoiId ? 2 : 1),
+          pickable: true,
+          onClick: (info) => {
+            if (!info?.object || info.object?.properties?.cluster) {
+              return
+            }
+            handleSelectPoi(info.object?.properties?.poi_id)
+          },
+        }),
+      )
+      layers.push(
+        new TextLayer({
+          id: "trip-cluster-count",
+          data: clusterCounts,
+          getPosition: (d) => d.geometry.coordinates,
+          getText: (d) => String(d.properties.point_count_abbreviated || d.properties.point_count || ""),
+          getSize: 12,
+          getColor: [255, 255, 255],
+          getTextAnchor: "middle",
+          getAlignmentBaseline: "center",
+        }),
+      )
+    }
+    return layers
+  }, [clusterCounts, clusters, handleSelectPoi, routeSegments, selectedPoiId])
   // 根据消息 ID 更新聊天内容
   const updateChatMessageById = useCallback((messageId, nextContent) => {
     // 更新消息列表
@@ -489,10 +659,11 @@ export default function App() {
     loadChatHistory(activeSessionId)
   }, [activeSessionId, loadChatHistory])
 
-  const loadMapHtml = useCallback(async (currentTrip) => {
+  const loadMapGeojson = useCallback(async (currentTrip) => {
     if (!currentTrip) {
       mapRequestTokenRef.current += 1
       setMapHtml("")
+      setMapGeojson(null)
       setMapError("")
       setLoadingMap(false)
       return
@@ -503,41 +674,51 @@ export default function App() {
       setLoadingMap(true)
       setMapError("")
       setMapHtml("")
-      let batchIndex = 0
-      while (mapRequestTokenRef.current === token) {
-        const data = await renderTripMap({
-          trip_data: currentTrip,
-          batch_index: batchIndex,
-          batch_size: 4,
-        })
-        if (mapRequestTokenRef.current !== token) {
-          return
-        }
-        const nextHtml = data?.map_html || ""
-        if (nextHtml) {
-          setMapHtml(nextHtml)
-        }
-        if (data?.is_final) {
-          setLoadingMap(false)
-          return
-        }
-        const nextSequence = Number.isFinite(data?.sequence) ? data.sequence : batchIndex
-        batchIndex = Math.max(nextSequence + 1, batchIndex + 1)
-        await new Promise((resolve) => setTimeout(resolve, 250))
+      const data = await renderTripGeojson({ trip_data: currentTrip })
+      if (mapRequestTokenRef.current !== token) {
+        return
       }
+      setMapGeojson(data || null)
+      if (data?.bounds && Array.isArray(data.bounds) && data.bounds.length === 4) {
+        const viewport = new WebMercatorViewport({
+          width: 800,
+          height: 600,
+        })
+        const nextViewState = viewport.fitBounds(
+          [
+            [data.bounds[0], data.bounds[1]],
+            [data.bounds[2], data.bounds[3]],
+          ],
+          { padding: 40 },
+        )
+        setMapViewState((prev) => ({
+          ...prev,
+          longitude: nextViewState.longitude,
+          latitude: nextViewState.latitude,
+          zoom: nextViewState.zoom,
+        }))
+      } else if (data?.center) {
+        setMapViewState((prev) => ({
+          ...prev,
+          longitude: data.center.longitude || prev.longitude,
+          latitude: data.center.latitude || prev.latitude,
+        }))
+      }
+      setLoadingMap(false)
     } catch (error) {
       setMapHtml("")
+      setMapGeojson(null)
       setMapError(`地图加载失败：${error.message}`)
       setLoadingMap(false)
     }
   }, [])
 
   useEffect(() => {
-    loadMapHtml(tripResult)
+    loadMapGeojson(tripResult)
     return () => {
       mapRequestTokenRef.current += 1
     }
-  }, [tripResult, loadMapHtml])
+  }, [tripResult, loadMapGeojson])
 
   // 聊天消息点击发送
   const handleSendChat = async () => {
@@ -863,6 +1044,13 @@ export default function App() {
                       loadingTrip={loadingTrip}
                       tripDays={tripDays}
                       tripResult={tripResult}
+                      selectedPoiId={selectedPoiId}
+                      onSelectPoi={handleSelectPoi}
+                      onTripChange={async (nextTrip) => {
+                        updateTripResult(nextTrip)
+                        await persistTripResult(nextTrip)
+                      }}
+                      onReplanDay={handleReplanDay}
                     />
                   ),
                 },
@@ -1023,10 +1211,22 @@ export default function App() {
                   <div className="map-view">
                     <Spin spinning={loadingMap} style={{ height: "100%" }}>
                       {mapError && <div className="map-placeholder map-large">{mapError}</div>}
-                      {!mapError && mapHtml && (
-                        <iframe title="trip-map" className="map-iframe" srcDoc={mapHtml} />
+                      {!mapError && mapGeojson && (
+                        <div className="map-canvas">
+                          <DeckGL
+                            layers={mapLayers}
+                            viewState={mapViewState}
+                            controller
+                            onViewStateChange={(event) => setMapViewState(event.viewState)}
+                          >
+                            <Map
+                              reuseMaps
+                              mapStyle="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
+                            />
+                          </DeckGL>
+                        </div>
                       )}
-                      {!mapError && !mapHtml && !loadingMap && (
+                      {!mapError && !mapGeojson && !loadingMap && (
                         <div className="map-placeholder map-large">地图生成失败，请稍后重试</div>
                       )}
                     </Spin>
@@ -1048,8 +1248,22 @@ export default function App() {
           <div className="map-overlay-body">
             <Spin spinning={loadingMap} style={{ height: "100%" }}>
               {mapError && <div className="map-placeholder map-large">{mapError}</div>}
-              {!mapError && mapHtml && <iframe title="trip-map-full" className="map-iframe" srcDoc={mapHtml} />}
-              {!mapError && !mapHtml && !loadingMap && (
+              {!mapError && mapGeojson && (
+                <div className="map-canvas">
+                  <DeckGL
+                    layers={mapLayers}
+                    viewState={mapViewState}
+                    controller
+                    onViewStateChange={(event) => setMapViewState(event.viewState)}
+                  >
+                    <Map
+                      reuseMaps
+                      mapStyle="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
+                    />
+                  </DeckGL>
+                </div>
+              )}
+              {!mapError && !mapGeojson && !loadingMap && (
                 <div className="map-placeholder map-large">地图生成失败，请稍后重试</div>
               )}
             </Spin>
