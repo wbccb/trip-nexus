@@ -1,7 +1,8 @@
 from typing import Dict, Any, Callable, List, Optional
+import time  # 用于统计工具调用耗时
 from pydantic import BaseModel
 from src.config import Config
-from src.observability import TTLCache, build_tool_cache_key, normalize_tool_params, ErrorCodes, build_error_payload, MetricsRecorder, normalize_exception, get_global_recorder
+from src.observability import TTLCache, build_tool_cache_key, normalize_tool_params, ErrorCodes, build_error_payload, MetricsRecorder, normalize_exception, get_global_recorder, CircuitBreaker
 
 
 class ToolSchema(BaseModel):
@@ -67,6 +68,15 @@ class ToolRegistry:
         )
         # 初始化指标记录器
         self._metrics = get_global_recorder()
+        # 初始化工具级熔断器
+        self._circuit_breaker = CircuitBreaker(
+            # 读取熔断失败阈值
+            failure_threshold=self._config.TOOL_CIRCUIT_FAILURE_THRESHOLD,
+            # 读取熔断冷却时间
+            cooldown_seconds=self._config.TOOL_CIRCUIT_COOLDOWN_SECONDS,
+        )
+        # 读取单次调用时间预算
+        self._tool_time_budget_seconds = self._config.TOOL_CALL_MAX_DURATION_SECONDS
         # 敏感字段列表
         self._sensitive_keys = {
             "api_key",
@@ -218,6 +228,18 @@ class ToolRegistry:
             )
             # 返回错误结果
             return ToolCallResult(tool_name=name, success=False, error=error)
+        # 判断熔断状态
+        if not self._circuit_breaker.allow(name):
+            # 构造熔断错误
+            error = build_error_payload(
+                code=ErrorCodes.TOOL_CIRCUIT_OPEN,
+                message=f"Tool {name} circuit open",
+                source="tool_registry",
+            )
+            # 记录熔断指标
+            self._metrics.record("tool_call_circuit_open", {"tool": name})
+            # 返回熔断结果
+            return ToolCallResult(tool_name=name, success=False, error=error)
         # 原始参数
         raw_params = params or {}
         # 参数校验
@@ -244,9 +266,30 @@ class ToolRegistry:
         # 记录缓存未命中
         self._metrics.record("tool_cache_miss", {"tool": name})
         try:
+            # 记录调用开始时间
+            started_at = time.time()
             # 执行工具逻辑
             # 调用工具 handler
             result = tool["handler"](**raw_params)
+            # 计算调用耗时
+            duration_seconds = time.time() - started_at
+            # 校验时间预算
+            if self._tool_time_budget_seconds and duration_seconds > self._tool_time_budget_seconds:
+                # 构造预算超限错误
+                error = build_error_payload(
+                    code=ErrorCodes.BUDGET_EXCEEDED,
+                    message=f"tool_time_budget_exceeded:{name}",
+                    source="tool_registry",
+                )
+                # 记录熔断失败
+                self._circuit_breaker.record_failure(name)
+                # 记录预算超限指标
+                self._metrics.record(
+                    "tool_call_budget_exceeded",
+                    {"tool": name, "duration_ms": int(duration_seconds * 1000)},
+                )
+                # 返回预算超限结果
+                return ToolCallResult(tool_name=name, success=False, error=error)
             # 组装成功结果
             # 组装成功结果
             tool_result = ToolCallResult(tool_name=name, success=True, data=result)
@@ -256,6 +299,8 @@ class ToolRegistry:
             # 记录成功指标
             # 记录成功指标
             self._metrics.record("tool_call_success", {"tool": name})
+            # 重置熔断计数
+            self._circuit_breaker.record_success(name)
             # 返回成功结果
             # 返回成功结果
             return tool_result
@@ -266,5 +311,7 @@ class ToolRegistry:
             tool_result = ToolCallResult(tool_name=name, success=False, error=error)
             # 记录失败指标
             self._metrics.record("tool_call_failed", {"tool": name, "error": error.get("code")})
+            # 记录熔断失败
+            self._circuit_breaker.record_failure(name)
             # 返回失败结果
             return tool_result

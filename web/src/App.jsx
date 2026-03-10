@@ -137,6 +137,59 @@ export default function App() {
       "请根据以下信息生成行程：目的地 {destination}，天数 {days} 天，预算 {budget}，偏好 {preference}。请给出每天安排、交通方式、停留时长与地址。",
     []
   )
+  // 根据消息 ID 更新聊天内容
+  const updateChatMessageById = useCallback((messageId, nextContent) => {
+    // 更新消息列表
+    setChatMessages((prev) =>
+      // 映射生成新数组
+      prev.map((item) =>
+        // 匹配指定消息
+        item.id === messageId
+          ? {
+              // 保留原字段
+              ...item,
+              // 更新内容
+              content: nextContent,
+            }
+          : item
+      )
+    )
+  }, [])
+  // 应用 Agent 的上下文补丁
+  const applyAgentPatch = useCallback((patchOps) => {
+    // 校验 patch 列表
+    if (!Array.isArray(patchOps) || patchOps.length === 0) {
+      return
+    }
+    // 逐条应用 patch
+    patchOps.forEach((op) => {
+      // 校验 patch 结构
+      if (!op || typeof op.path !== "string") {
+        return
+      }
+      // 解析路径分段
+      const segments = op.path.split("/").filter(Boolean)
+      // 仅处理 shared_context 变更
+      if (segments[0] !== "shared_context") {
+        return
+      }
+      // 读取 task id
+      const taskId = segments[1]
+      // 读取输出 key
+      const key = segments.slice(2).join("/")
+      // 行程草案更新
+      if (taskId === "t4" && key === "draft_trip" && op.value) {
+        updateTripResult(op.value)
+        return
+      }
+      // 地图 HTML 更新
+      if (taskId === "t5" && key === "map_payload" && op.value?.map_html) {
+        setMapHtml(op.value.map_html)
+        setMapError("")
+        setLoadingMap(false)
+      }
+    })
+  }, [updateTripResult])
   const loadSequenceMap = useCallback(() => {
     try {
       return JSON.parse(localStorage.getItem(AGENT_SEQUENCE_STORAGE_KEY) || "{}")
@@ -174,6 +227,9 @@ export default function App() {
       const nextQueue = Array.isArray(prev.queue) ? [...prev.queue] : []
       const nextEvents = Array.isArray(prev.events) ? [...prev.events] : []
       const detail = payload?.payload || {}
+      if (eventType === "context_patch") {
+        applyAgentPatch(detail?.patch || [])
+      }
       if (eventType === "plan_created") {
         Object.keys(nextNodes).forEach((key) => {
           nextNodes[key] = { ...nextNodes[key], status: "planned", tasks: [] }
@@ -269,7 +325,7 @@ export default function App() {
         lastSequence: nextSequence || prev.lastSequence,
       }
     })
-  }, [])
+  }, [applyAgentPatch])
   const connectAgentStream = useCallback((threadId) => {
     if (!threadId) {
       return
@@ -538,31 +594,86 @@ export default function App() {
     }
   }
 
+  // 处理行程表单提交
   const handleTripFormSubmit = async (values) => {
+    // 生成提示词文本
     const prompt = promptTemplate
+      // 替换目的地
       .replace("{destination}", values.destination)
+      // 替换天数
       .replace("{days}", values.days)
+      // 替换预算
       .replace("{budget}", values.budget || "未填写")
+      // 替换偏好
       .replace("{preference}", values.preference || "未填写")
+    // 构造用户消息 ID
+    const userMessageId = `${Date.now()}-user-trip`
+    // 构造助手消息 ID
+    const assistantMessageId = `${Date.now()}-assistant-trip`
+    // 写入用户消息
     setChatMessages((prev) => [
+      // 保留历史消息
       ...prev,
       {
-        id: `${Date.now()}-user-trip`,
+        // 用户消息 ID
+        id: userMessageId,
+        // 角色标识
         role: "user",
+        // 提示词内容
         content: prompt,
       },
-    ])
-    setIsTripModalOpen(false)
-    tripForm.resetFields()
-    await handleTripSubmit(values)
-    setChatMessages((prev) => [
-      ...prev,
       {
-        id: `${Date.now()}-assistant-trip`,
+        // 助手消息 ID
+        id: assistantMessageId,
+        // 角色标识
         role: "assistant",
-        content: `已生成 ${values.destination} 的 ${values.days} 天游程，请查看中间行程详情。`,
+        // 初始内容
+        content: "行程生成中...",
       },
     ])
+    // 关闭弹窗
+    setIsTripModalOpen(false)
+    // 重置表单
+    tripForm.resetFields()
+    // 初始化流式文本
+    let streamingText = ""
+    // 调用行程生成（流式）
+    await handleTripSubmit(values, {
+      // 流开始回调
+      onStreamStart: () => {
+        // 更新为加载提示
+        updateChatMessageById(assistantMessageId, "行程生成中...")
+      },
+      // 流增量回调
+      onStreamDelta: (nextText) => {
+        // 缓存最新文本
+        streamingText = nextText || ""
+        // 更新聊天内容
+        updateChatMessageById(assistantMessageId, streamingText || "行程生成中...")
+      },
+      // 流结束回调
+      onStreamEnd: () => {
+        // 若无流内容则使用默认提示
+        if (!streamingText) {
+          // 更新聊天内容
+          updateChatMessageById(
+            assistantMessageId,
+            `已生成 ${values.destination} 的 ${values.days} 天游程，请查看中间行程详情。`
+          )
+        }
+      },
+      // 行程数据回调
+      onTripData: () => {
+        // 若流内容为空则提示完成
+        if (!streamingText) {
+          // 更新聊天内容
+          updateChatMessageById(
+            assistantMessageId,
+            `已生成 ${values.destination} 的 ${values.days} 天游程，请查看中间行程详情。`
+          )
+        }
+      },
+    })
   }
   const agentNodeRows = useMemo(() => {
     const nodes = agentState.nodes || {}
@@ -722,6 +833,15 @@ export default function App() {
                 <Input.TextArea
                   value={chatInput}
                   onChange={(event) => setChatInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    // Enter 触发发送
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      // 阻止默认换行
+                      event.preventDefault()
+                      // 发送聊天消息
+                      handleSendChat()
+                    }
+                  }}
                   placeholder="输入要咨询的问题或想法"
                   autoSize={{ minRows: 1, maxRows: 3 }}
                 />

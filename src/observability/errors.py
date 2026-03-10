@@ -9,6 +9,8 @@ class ErrorCodes:
     TOOL_INVALID_PARAMS = "TOOL_INVALID_PARAMS"
     # 统一错误码：工具执行失败
     TOOL_EXECUTION_ERROR = "TOOL_EXECUTION_ERROR"
+    # 统一错误码：工具熔断开启
+    TOOL_CIRCUIT_OPEN = "TOOL_CIRCUIT_OPEN"
     # 统一错误码：搜索实例失败
     SEARCH_INSTANCE_FAILED = "SEARCH_INSTANCE_FAILED"
     # 统一错误码：搜索超时
@@ -23,6 +25,8 @@ class ErrorCodes:
     LLM_FAILED = "LLM_FAILED"
     # 统一错误码：未知异常
     UNEXPECTED_ERROR = "UNEXPECTED_ERROR"
+    # 统一错误码：预算超限
+    BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
 
 
 def build_error_payload(

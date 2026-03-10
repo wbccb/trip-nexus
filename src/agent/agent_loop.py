@@ -11,7 +11,8 @@ from src.agent.event_bus import event_bus, snapshot_store
 from src.llm.llm_manager import LlmManager
 from src.llm.tool_protocol import ToolCallResult
 from src.map.map_renderer import TripMap
-from src.observability import ErrorCodes, build_error_payload, normalize_exception
+from src.observability import ErrorCodes, build_error_payload, normalize_exception, BudgetManager, ConstraintChecker
+from src.config import Config  # 读取全局配置预算
 
 
 class PlannerAgent:
@@ -282,6 +283,21 @@ class AgentExecutor:
     def _resolve_node(self, task: Task) -> str:
         return self._node_alias.get(task.type, task.type or "executor")
 
+    # 发送共享上下文的 JSON Patch 事件
+    def _emit_context_patch(self, state: TripState, task: Task, output_key: str, value: Any) -> None:
+        # 构造 JSON Patch 列表
+        patch_ops = [
+            # 追加共享上下文变更
+            {"op": "add", "path": f"/shared_context/{task.id}/{output_key}", "value": value}
+        ]
+        # 发送上下文补丁事件
+        event_bus.emit(
+            "context_patch",
+            state.thread_id,
+            self._resolve_node(task),
+            {"task_id": task.id, "key": output_key, "value": value, "patch": patch_ops},
+        )
+
     def _execute_task(
         self,
         task: Task,
@@ -316,6 +332,7 @@ class AgentExecutor:
                 output_key = task.output_key or "result"
                 cleaned = self._extract_tool_result(task.tool or "", result_dict)
                 state.shared_context.write(task.id, output_key, cleaned)
+                self._emit_context_patch(state, task, output_key, cleaned)
             # 返回结果
             event_bus.emit(
                 "task_end",
@@ -351,6 +368,7 @@ class AgentExecutor:
             # 写入共享上下文
             output_key = task.output_key or "draft_trip"
             state.shared_context.write(task.id, output_key, draft)
+            self._emit_context_patch(state, task, output_key, draft)
             # 返回统一结果
             result_payload = {"success": True, "data": draft}
             event_bus.emit(
@@ -375,6 +393,7 @@ class AgentExecutor:
             # 写入共享上下文
             output_key = task.output_key or "map_payload"
             state.shared_context.write(task.id, output_key, map_payload)
+            self._emit_context_patch(state, task, output_key, map_payload)
             # 返回结果
             result_payload = {"success": True, "data": map_payload}
             event_bus.emit(
@@ -398,6 +417,7 @@ class AgentExecutor:
             # 写入共享上下文
             output_key = task.output_key or "summary"
             state.shared_context.write(task.id, output_key, {"summary": summary})
+            self._emit_context_patch(state, task, output_key, {"summary": summary})
             print(f"生成摘要完成:{summary}")
             print("\n")
             # 返回结果
@@ -514,7 +534,22 @@ class AgentExecutor:
             )
 
         # 初始化反思器
+        # 初始化反思器
         reflector = Reflector(max_replan_depth=max_replan_depth)
+        # 读取配置
+        config = Config()
+        # 获取时间预算配置
+        time_budget_seconds = agent_config.get("time_budget_seconds")
+        # 兜底使用全局预算
+        if time_budget_seconds is None:
+            time_budget_seconds = config.AGENT_TIME_BUDGET_SECONDS
+        # 非正数视为不启用
+        if time_budget_seconds is not None and float(time_budget_seconds) <= 0:
+            time_budget_seconds = None
+        # 构建预算检查器
+        budget_checker = ConstraintChecker(BudgetManager(time_budget_seconds=time_budget_seconds))
+        # 记录循环起始时间
+        loop_started_at = time.time()
         
         # 初始化调度器
         scheduler = Scheduler(
@@ -536,6 +571,26 @@ class AgentExecutor:
         print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 初始化调度器")
         # 主循环
         while True:
+            # 计算累计耗时
+            elapsed_seconds = time.time() - loop_started_at
+            # 校验预算是否满足
+            if not budget_checker.ensure_within_budget(elapsed_seconds=elapsed_seconds):
+                # 构造预算超限错误
+                error_payload = build_error_payload(
+                    code=ErrorCodes.BUDGET_EXCEEDED,
+                    message="agent_time_budget_exceeded",
+                    source="agent_executor",
+                )
+                # 标记执行失败
+                state.status = "failed"
+                # 写入错误消息
+                state.error = error_payload.get("message")
+                # 记录停止原因
+                state.stop_reason = "budget_exceeded"
+                # 发送错误事件
+                event_bus.emit("error", thread_id, "executor", {"error": error_payload})
+                # 终止循环
+                break
             # 检查是否处于暂停状态 (例如在循环中被置为 paused)
             if state.status == "paused":
                 print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 暂停执行: {state.stop_reason}")
@@ -591,6 +646,7 @@ class AgentExecutor:
                     if task.type == "tool_call":
                         output_key = task.output_key or "result"
                         state.shared_context.write(task.id, output_key, {})
+                        self._emit_context_patch(state, task, output_key, {})
                     scheduler.mark_done(task.id)
                 # 反思器判断是否触发重规划
                 if reflector.should_replan(task, result) and reflector.can_replan(state):

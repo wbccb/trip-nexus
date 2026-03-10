@@ -99,6 +99,9 @@ class Config:
     # 工具缓存配置
     TOOL_CACHE_TTL_SECONDS = int(os.getenv("TOOL_CACHE_TTL_SECONDS", "300"))
     TOOL_CACHE_MAX_SIZE = int(os.getenv("TOOL_CACHE_MAX_SIZE", "512"))
+    TOOL_CIRCUIT_FAILURE_THRESHOLD = int(os.getenv("TOOL_CIRCUIT_FAILURE_THRESHOLD", "3"))  # 工具熔断失败阈值
+    TOOL_CIRCUIT_COOLDOWN_SECONDS = int(os.getenv("TOOL_CIRCUIT_COOLDOWN_SECONDS", "30"))  # 工具熔断冷却时间
+    TOOL_CALL_MAX_DURATION_SECONDS = float(os.getenv("TOOL_CALL_MAX_DURATION_SECONDS", "0"))  # 工具单次执行时间上限
 
     # 搜索并发与熔断配置
     SEARCH_INSTANCE_CONCURRENCY = int(os.getenv("SEARCH_INSTANCE_CONCURRENCY", "3"))
@@ -131,3 +134,4 @@ class Config:
     MAX_CONTEXT_TOKENS = int(os.getenv('MAX_CONTEXT_TOKENS', '4096'))
     SESSION_EXPIRY_HOURS = int(os.getenv('SESSION_EXPIRY_HOURS', '2'))
     CORE_ENTITIES_EXPIRY_HOURS = int(os.getenv('CORE_ENTITIES_EXPIRY_HOURS', '24'))
+    AGENT_TIME_BUDGET_SECONDS = float(os.getenv("AGENT_TIME_BUDGET_SECONDS", "0"))  # Agent 执行时间预算

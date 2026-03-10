@@ -2,6 +2,7 @@
 from datetime import datetime
 import asyncio
 import json
+import time
 from functools import lru_cache  # 用于缓存全局单例对象，减少重复初始化
 from typing import Any, Dict, List, Optional  # 提供类型注解，便于接口契约清晰
 
@@ -305,6 +306,86 @@ app.add_middleware(
     allow_headers=["*"],  # 允许所有请求头
 )
 
+_trip_streams: Dict[str, Dict[str, Any]] = {}
+_trip_streams_lock = asyncio.Lock()
+_TRIP_STREAM_TTL_SECONDS = 600
+
+
+async def _cleanup_trip_streams() -> None:
+    now = time.time()
+    async with _trip_streams_lock:
+        expired = []
+        for key, payload in _trip_streams.items():
+            updated_at = float(payload.get("updated_at") or now)
+            done = bool(payload.get("done"))
+            running = bool(payload.get("running"))
+            if done and not running and now - updated_at > _TRIP_STREAM_TTL_SECONDS:
+                expired.append(key)
+        for key in expired:
+            _trip_streams.pop(key, None)
+
+
+async def _append_trip_event(message_id: str, event_payload: Dict[str, Any]) -> None:
+    async with _trip_streams_lock:
+        stream_state = _trip_streams.get(message_id)
+        if not stream_state:
+            return
+        stream_state["events"].append(event_payload)
+        stream_state["updated_at"] = time.time()
+        if event_payload.get("event") in ("trip_data", "error"):
+            stream_state["done"] = True
+            stream_state["running"] = False
+
+
+async def _run_trip_stream(
+    message_id: str,
+    session_id: str,
+    llm_manager: LlmManager,
+    user_input: Dict[str, Any],
+    context_texts: List[str],
+) -> None:
+    response_chunks: List[str] = []
+    last_sequence = 0
+    try:
+        stream = llm_manager.stream_trip_generation(user_input, context_texts)
+        for event in llm_manager.build_stream_events_from_stream(stream, message_id):
+            delta_text = event.get("content_delta") or ""
+            response_chunks.append(delta_text)
+            last_sequence = int(event.get("sequence") or last_sequence)
+            event_payload = {
+                "event": event.get("event"),
+                "sequence": event.get("sequence"),
+                "message_id": event.get("message_id"),
+                "content_delta": delta_text,
+                "is_final": event.get("is_final"),
+                "session_id": session_id,
+            }
+            await _append_trip_event(message_id, event_payload)
+            await asyncio.sleep(0)
+        response_text = "".join(response_chunks)
+        trip_data = llm_manager.parse_trip_from_response_text(response_text)
+        if trip_data:
+            storage = _get_storage()
+            storage.store_trip_data(session_id, trip_data)
+        final_payload = {
+            "event": "trip_data",
+            "sequence": last_sequence + 1,
+            "message_id": message_id,
+            "session_id": session_id,
+            "trip_data": trip_data,
+            "content": response_text,
+        }
+        await _append_trip_event(message_id, final_payload)
+    except Exception as exc:
+        error_payload = {
+            "event": "error",
+            "sequence": last_sequence + 1,
+            "message_id": message_id,
+            "session_id": session_id,
+            "error": str(exc),
+        }
+        await _append_trip_event(message_id, error_payload)
+
 
 @app.get("/api/health")
 def health_check() -> Dict[str, str]:
@@ -462,6 +543,88 @@ def generate_trip(payload: TripGenerateRequest) -> TripGenerateResponse:
         storage = _get_storage()
         storage.store_trip_data(session_id, trip_data)
     return TripGenerateResponse(session_id=session_id, trip_data=trip_data)
+
+
+@app.post("/api/trip/stream")
+async def stream_trip_generation(
+    payload: TripGenerateRequest,
+    request: Request,
+    message_id: Optional[str] = Query(None, description="流式消息ID"),
+    last_sequence: Optional[int] = Query(None, description="断线续传序号"),
+):
+    if not payload.destination or payload.days <= 0:
+        raise HTTPException(status_code=400, detail="destination 和 days 为必填且 days 必须大于 0")
+    session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
+    user_input = {
+        "destination": payload.destination,
+        "days": payload.days,
+        "budget": payload.budget,
+        "preference": payload.preference,
+    }
+    llm_manager = _get_llm_manager()
+    await _cleanup_trip_streams()
+    async with _trip_streams_lock:
+        stream_id = message_id or f"trip-{datetime.now().strftime('%H%M%S%f')}"
+        stream_state = _trip_streams.get(stream_id)
+        if not stream_state:
+            stream_state = {
+                "message_id": stream_id,
+                "session_id": session_id,
+                "events": [],
+                "done": False,
+                "running": False,
+                "created_at": time.time(),
+                "updated_at": time.time(),
+            }
+            _trip_streams[stream_id] = stream_state
+        else:
+            session_id = stream_state.get("session_id") or session_id
+        if not stream_state.get("running") and not stream_state.get("done"):
+            stream_state["running"] = True
+            asyncio.create_task(
+                _run_trip_stream(
+                    stream_id,
+                    session_id,
+                    llm_manager,
+                    user_input,
+                    payload.context_texts or [],
+                )
+            )
+    header_sequence = request.headers.get("Last-Event-ID")
+    try:
+        header_sequence_value = int(header_sequence) if header_sequence else None
+    except Exception:
+        header_sequence_value = None
+    start_sequence = header_sequence_value if header_sequence_value is not None else last_sequence
+
+    async def event_generator():
+        current_sequence = int(start_sequence or 0)
+        while True:
+            if await request.is_disconnected():
+                break
+            async with _trip_streams_lock:
+                events = [
+                    event
+                    for event in stream_state.get("events", [])
+                    if int(event.get("sequence") or 0) > current_sequence
+                ]
+                done = bool(stream_state.get("done"))
+            if events:
+                for event in events:
+                    current_sequence = int(event.get("sequence") or current_sequence)
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    if event.get("event") in ("trip_data", "error"):
+                        return
+            else:
+                if done:
+                    return
+                await asyncio.sleep(0.2)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.post("/api/map/render", response_model=MapRenderResponse)

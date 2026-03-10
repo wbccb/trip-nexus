@@ -118,3 +118,78 @@ class DomainConcurrencyLimiter:
         domain_semaphore.release()
         # 释放全局信号量
         self._global_semaphore.release()
+
+
+class BudgetManager:
+    # 初始化预算管理器
+    def __init__(
+        self,
+        token_budget: Optional[int] = None,
+        cost_budget: Optional[float] = None,
+        time_budget_seconds: Optional[float] = None,
+    ) -> None:
+        # 初始化 token 预算上限
+        self._token_budget = None if token_budget is None else max(0, int(token_budget))
+        # 初始化成本预算上限
+        self._cost_budget = None if cost_budget is None else max(0.0, float(cost_budget))
+        # 初始化时间预算字段
+        self._time_budget_seconds = None
+        # 写入时间预算上限
+        if time_budget_seconds is not None:
+            self._time_budget_seconds = max(0.0, float(time_budget_seconds))
+
+    # 检查 token 预算
+    def check_tokens(self, token_estimate: Optional[int]) -> bool:
+        # 未配置预算直接通过
+        if self._token_budget is None:
+            return True
+        # 未提供估算值直接通过
+        if token_estimate is None:
+            return True
+        # 判断估算值是否在预算内
+        return int(token_estimate) <= self._token_budget
+
+    # 检查成本预算
+    def check_cost(self, cost_estimate: Optional[float]) -> bool:
+        # 未配置预算直接通过
+        if self._cost_budget is None:
+            return True
+        # 未提供估算值直接通过
+        if cost_estimate is None:
+            return True
+        # 判断估算值是否在预算内
+        return float(cost_estimate) <= self._cost_budget
+
+    # 检查时间预算
+    def check_time(self, elapsed_seconds: float) -> bool:
+        # 未配置预算直接通过
+        if self._time_budget_seconds is None:
+            return True
+        # 判断耗时是否在预算内
+        return float(elapsed_seconds) <= self._time_budget_seconds
+
+
+class ConstraintChecker:
+    # 初始化约束检查器
+    def __init__(self, budget_manager: BudgetManager) -> None:
+        # 记录预算管理器
+        self._budget = budget_manager
+
+    # 统一校验预算约束
+    def ensure_within_budget(
+        self,
+        elapsed_seconds: float,
+        token_estimate: Optional[int] = None,
+        cost_estimate: Optional[float] = None,
+    ) -> bool:
+        # 检查时间预算
+        if not self._budget.check_time(elapsed_seconds):
+            return False
+        # 检查 token 预算
+        if not self._budget.check_tokens(token_estimate):
+            return False
+        # 检查成本预算
+        if not self._budget.check_cost(cost_estimate):
+            return False
+        # 全部满足预算
+        return True

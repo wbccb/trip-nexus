@@ -7,7 +7,8 @@ export {
   sendChatMessage,
   startSession,
 } from "./sessionApi.js";
-export { generateTrip, renderTripMap } from "./tripApi.js";
+// 行程相关接口导出
+export { generateTrip, renderTripMap, streamTripGeneration } from "./tripApi.js";
 export { searchKnowledge } from "./knowledgeApi.js";
 export { API_BASE, apiPost } from "./httpClient.js";
 
