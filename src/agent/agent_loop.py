@@ -235,6 +235,12 @@ class AgentExecutor:
         self._map_renderer = map_renderer or TripMap()
         # 初始化 Planner
         self._planner = PlannerAgent(llm_manager)
+        self._node_alias = {
+            "tool_call": "checker",
+            "trip_generate": "optimizer",
+            "map_render": "map_rag",
+            "trip_summarize": "map_rag",
+        }
 
     def _tool_whitelist(self) -> List[str]:
         # 读取工具清单
@@ -273,12 +279,27 @@ class AgentExecutor:
         status_text = "success" if success else "failed"
         return f"{task.id}:{task.type}:{status_text}"
 
+    def _resolve_node(self, task: Task) -> str:
+        return self._node_alias.get(task.type, task.type or "executor")
+
     def _execute_task(
         self,
         task: Task,
         state: TripState,
         agent_config: Dict[str, Any],
     ) -> Tuple[Task, Dict[str, Any]]:
+        node_name = self._resolve_node(task)
+        event_bus.emit(
+            "task_start",
+            state.thread_id,
+            node_name,
+            {
+                "task_id": task.id,
+                "task_type": task.type,
+                "tool": task.tool,
+                "description": task.description,
+            },
+        )
         # 工具任务执行
         if task.type == "tool_call":
             # 调用工具注册表
@@ -296,6 +317,16 @@ class AgentExecutor:
                 cleaned = self._extract_tool_result(task.tool or "", result_dict)
                 state.shared_context.write(task.id, output_key, cleaned)
             # 返回结果
+            event_bus.emit(
+                "task_end",
+                state.thread_id,
+                node_name,
+                {
+                    "task_id": task.id,
+                    "task_type": task.type,
+                    "success": bool(result_dict.get("success")),
+                },
+            )
             return task, result_dict
         # 行程生成任务
         if task.type == "trip_generate":
@@ -321,7 +352,18 @@ class AgentExecutor:
             output_key = task.output_key or "draft_trip"
             state.shared_context.write(task.id, output_key, draft)
             # 返回统一结果
-            return task, {"success": True, "data": draft}
+            result_payload = {"success": True, "data": draft}
+            event_bus.emit(
+                "task_end",
+                state.thread_id,
+                node_name,
+                {
+                    "task_id": task.id,
+                    "task_type": task.type,
+                    "success": True,
+                },
+            )
+            return task, result_payload
         # 地图渲染任务
         if task.type == "map_render":
             # 读取行程数据
@@ -334,7 +376,18 @@ class AgentExecutor:
             output_key = task.output_key or "map_payload"
             state.shared_context.write(task.id, output_key, map_payload)
             # 返回结果
-            return task, {"success": True, "data": map_payload}
+            result_payload = {"success": True, "data": map_payload}
+            event_bus.emit(
+                "task_end",
+                state.thread_id,
+                node_name,
+                {
+                    "task_id": task.id,
+                    "task_type": task.type,
+                    "success": True,
+                },
+            )
+            return task, result_payload
         # 行程摘要任务
         if task.type == "trip_summarize":
             print("\n")
@@ -348,9 +401,31 @@ class AgentExecutor:
             print(f"生成摘要完成:{summary}")
             print("\n")
             # 返回结果
-            return task, {"success": True, "data": {"summary": summary}}
+            result_payload = {"success": True, "data": {"summary": summary}}
+            event_bus.emit(
+                "task_end",
+                state.thread_id,
+                node_name,
+                {
+                    "task_id": task.id,
+                    "task_type": task.type,
+                    "success": True,
+                },
+            )
+            return task, result_payload
         # 默认未知任务类型
-        return task, {"success": False, "error": {"code": "UNKNOWN_TASK_TYPE", "message": task.type}}
+        result_payload = {"success": False, "error": {"code": "UNKNOWN_TASK_TYPE", "message": task.type}}
+        event_bus.emit(
+            "task_end",
+            state.thread_id,
+            node_name,
+            {
+                "task_id": task.id,
+                "task_type": task.type,
+                "success": False,
+            },
+        )
+        return task, result_payload
 
     async def _execute_batch(
         self,
@@ -385,6 +460,7 @@ class AgentExecutor:
             if state.status == "paused":
                 state.status = "running"
                 state.stop_reason = None
+            state.thread_id = thread_id
             
             # 恢复 Plan 对象（State 中只存了 Task 列表）
             plan = Plan(tasks=state.plan)
@@ -392,6 +468,7 @@ class AgentExecutor:
             state = TripState(
                 user_intent=user_intent or "",
                 user_input=user_input or {},
+                thread_id=thread_id,
                 plan=[],
                 plan_history=[],
                 execution_queue=[],
@@ -419,6 +496,22 @@ class AgentExecutor:
                 plan = self._planner.plan(user_intent, user_input, agent_config, tool_whitelist)
             # 写入计划
             state.plan = plan.tasks
+            event_bus.emit(
+                "plan_created",
+                thread_id,
+                "planner",
+                {
+                    "tasks": [
+                        {
+                            "task_id": task.id,
+                            "task_type": task.type,
+                            "tool": task.tool,
+                            "description": task.description,
+                        }
+                        for task in plan.tasks
+                    ],
+                },
+            )
 
         # 初始化反思器
         reflector = Reflector(max_replan_depth=max_replan_depth)
@@ -480,6 +573,12 @@ class AgentExecutor:
                     retry_count = state.retry_counts.get(task.id, 0)
                     if retry_count < retry_limit:
                         state.retry_counts[task.id] = retry_count + 1
+                        event_bus.emit(
+                            "task_retry",
+                            thread_id,
+                            self._resolve_node(task),
+                            {"task_id": task.id, "retry_count": retry_count + 1},
+                        )
                         retry_task, retry_result = self._execute_task(task, state, agent_config)
                         state.task_results[retry_task.id] = retry_result
                         final_success = bool(retry_result.get("success"))
@@ -507,6 +606,12 @@ class AgentExecutor:
                         print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 任务 {task.id} 产生 RAG 证据，触发人工复核暂停")
                         state.status = "paused"
                         state.stop_reason = "rag_review"
+                        event_bus.emit(
+                            "paused",
+                            thread_id,
+                            "map_rag",
+                            {"reason": "rag_review", "task_id": task.id},
+                        )
                         break
             
             # 落快照
@@ -540,6 +645,22 @@ class AgentExecutor:
                 print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 重规划完成，工具序列: {', '.join(tools)}；已重置调度器并继续执行\n")
                 state.plan = new_plan.tasks
                 scheduler = Scheduler(new_plan.tasks)
+                event_bus.emit(
+                    "plan_created",
+                    thread_id,
+                    "planner",
+                    {
+                        "tasks": [
+                            {
+                                "task_id": task.id,
+                                "task_type": task.type,
+                                "tool": task.tool,
+                                "description": task.description,
+                            }
+                            for task in new_plan.tasks
+                        ],
+                    },
+                )
                 event_bus.emit("replan", thread_id, "executor", {"depth": state.replan_depth})
                 continue
         # 生成最终聚合输出

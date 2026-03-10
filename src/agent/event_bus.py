@@ -12,7 +12,13 @@ Agent 调试事件与快照存储（最小实现）。
 """
 
 from typing import TypedDict, Optional, List, Dict, Any
+import json
+import os
+import sqlite3
+import threading
 import time
+
+from src.config import PROJECT_ROOT
 
 
 class AgentEvent(TypedDict):
@@ -32,6 +38,7 @@ class AgentEvent(TypedDict):
     thread_id: str
     node: Optional[str]
     detail: Dict[str, Any]
+    sequence: int
 
 
 class EventBus:
@@ -52,6 +59,30 @@ class EventBus:
         """
 
         self._events: List[AgentEvent] = []
+        self._lock = threading.Lock()
+        self._db_path = os.path.join(PROJECT_ROOT, "agent_events.db")
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=5)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                node TEXT,
+                kind TEXT NOT NULL,
+                ts REAL NOT NULL,
+                detail_json TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_events_thread_id ON agent_events(thread_id)")
+        self._conn.commit()
 
     def emit(self, kind: str, thread_id: str, node: Optional[str], detail: Dict[str, Any]) -> None:
         """
@@ -64,17 +95,36 @@ class EventBus:
         - detail：可序列化详情（建议只放摘要/关键字段，避免过大）
         """
 
+        ts = time.time()
+        detail_json = json.dumps(detail or {}, ensure_ascii=False)
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO agent_events (thread_id, node, kind, ts, detail_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (thread_id, node, kind, ts, detail_json),
+            )
+            self._conn.commit()
+            sequence = int(cursor.lastrowid or 0)
         self._events.append(
             {
                 "kind": kind,
-                "ts": time.time(),
+                "ts": ts,
                 "thread_id": thread_id,
                 "node": node,
                 "detail": detail,
+                "sequence": sequence,
             }
         )
 
-    def list(self, thread_id: Optional[str] = None) -> List[AgentEvent]:
+    def list(
+        self,
+        thread_id: Optional[str] = None,
+        after_sequence: Optional[int] = None,
+        limit: int = 200,
+    ) -> List[AgentEvent]:
         """
         读取事件列表。
 
@@ -85,9 +135,43 @@ class EventBus:
         - 事件列表（浅拷贝），调用方可自行排序/切片/摘要展示。
         """
 
-        if thread_id is None:
-            return list(self._events)
-        return [event for event in self._events if event["thread_id"] == thread_id]
+        clauses = []
+        params: List[Any] = []
+        if thread_id is not None:
+            clauses.append("thread_id = ?")
+            params.append(thread_id)
+        if after_sequence is not None:
+            clauses.append("id > ?")
+            params.append(int(after_sequence))
+        where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"""
+            SELECT id, thread_id, node, kind, ts, detail_json
+            FROM agent_events
+            {where_clause}
+            ORDER BY id ASC
+            LIMIT ?
+        """
+        params.append(int(limit))
+        cursor = self._conn.cursor()
+        rows = cursor.execute(sql, params).fetchall()
+        events: List[AgentEvent] = []
+        for row in rows:
+            detail = {}
+            try:
+                detail = json.loads(row["detail_json"]) if row["detail_json"] else {}
+            except Exception:
+                detail = {}
+            events.append(
+                {
+                    "kind": row["kind"],
+                    "ts": float(row["ts"]),
+                    "thread_id": row["thread_id"],
+                    "node": row["node"],
+                    "detail": detail,
+                    "sequence": int(row["id"]),
+                }
+            )
+        return events
 
     def clear(self, thread_id: Optional[str] = None) -> None:
         """
@@ -97,10 +181,23 @@ class EventBus:
         - thread_id：为空则清理全部事件；否则只清理该 thread_id 的事件。
         """
 
+        cursor = self._conn.cursor()
         if thread_id is None:
+            cursor.execute("DELETE FROM agent_events")
+            self._conn.commit()
             self._events = []
             return
+        cursor.execute("DELETE FROM agent_events WHERE thread_id = ?", (thread_id,))
+        self._conn.commit()
         self._events = [event for event in self._events if event["thread_id"] != thread_id]
+
+    def latest_sequence(self, thread_id: str) -> int:
+        cursor = self._conn.cursor()
+        row = cursor.execute(
+            "SELECT MAX(id) AS max_id FROM agent_events WHERE thread_id = ?",
+            (thread_id,),
+        ).fetchone()
+        return int(row["max_id"] or 0) if row else 0
 
 
 class SnapshotStore:
@@ -122,6 +219,31 @@ class SnapshotStore:
         """
 
         self._snapshots: Dict[str, List[Dict[str, Any]]] = {}
+        self._lock = threading.Lock()
+        self._db_path = os.path.join(PROJECT_ROOT, "agent_events.db")
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=5)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                ts REAL NOT NULL,
+                step TEXT,
+                duration_ms INTEGER,
+                payload_json TEXT,
+                state_json TEXT
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_snapshots_thread_id ON agent_snapshots(thread_id)")
+        self._conn.commit()
 
     def add(self, thread_id: str, snapshot: Dict[str, Any]) -> None:
         """
@@ -134,7 +256,25 @@ class SnapshotStore:
 
         if "ts" not in snapshot:
             snapshot["ts"] = time.time()
-        self._snapshots.setdefault(thread_id, []).append(snapshot)
+        payload_json = json.dumps(snapshot.get("payload") or {}, ensure_ascii=False)
+        state_json = json.dumps(snapshot.get("state") or {}, ensure_ascii=False)
+        step = snapshot.get("step")
+        duration_ms = snapshot.get("duration_ms")
+        ts_value = float(snapshot.get("ts") or time.time())
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO agent_snapshots (thread_id, ts, step, duration_ms, payload_json, state_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (thread_id, ts_value, step, duration_ms, payload_json, state_json),
+            )
+            self._conn.commit()
+            sequence = int(cursor.lastrowid or 0)
+        snapshot_with_seq = dict(snapshot)
+        snapshot_with_seq["sequence"] = sequence
+        self._snapshots.setdefault(thread_id, []).append(snapshot_with_seq)
 
     def list(self, thread_id: str) -> List[Dict[str, Any]]:
         """
@@ -144,7 +284,40 @@ class SnapshotStore:
         - 快照列表（浅拷贝），通常用于 UI 时间线/快照面板展示。
         """
 
-        return list(self._snapshots.get(thread_id, []))
+        cursor = self._conn.cursor()
+        rows = cursor.execute(
+            """
+            SELECT id, thread_id, ts, step, duration_ms, payload_json, state_json
+            FROM agent_snapshots
+            WHERE thread_id = ?
+            ORDER BY id ASC
+            """,
+            (thread_id,),
+        ).fetchall()
+        snapshots: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = {}
+            state = {}
+            try:
+                payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+            except Exception:
+                payload = {}
+            try:
+                state = json.loads(row["state_json"]) if row["state_json"] else {}
+            except Exception:
+                state = {}
+            snapshots.append(
+                {
+                    "sequence": int(row["id"]),
+                    "thread_id": row["thread_id"],
+                    "ts": float(row["ts"]),
+                    "step": row["step"],
+                    "duration_ms": row["duration_ms"],
+                    "payload": payload,
+                    "state": state,
+                }
+            )
+        return snapshots
 
     def latest(self, thread_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -154,8 +327,38 @@ class SnapshotStore:
         - 最新快照 dict；没有快照则返回 None。
         """
 
-        snapshots = self._snapshots.get(thread_id, [])
-        return snapshots[-1] if snapshots else None
+        cursor = self._conn.cursor()
+        row = cursor.execute(
+            """
+            SELECT id, thread_id, ts, step, duration_ms, payload_json, state_json
+            FROM agent_snapshots
+            WHERE thread_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (thread_id,),
+        ).fetchone()
+        if not row:
+            return None
+        payload = {}
+        state = {}
+        try:
+            payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+        except Exception:
+            payload = {}
+        try:
+            state = json.loads(row["state_json"]) if row["state_json"] else {}
+        except Exception:
+            state = {}
+        return {
+            "sequence": int(row["id"]),
+            "thread_id": row["thread_id"],
+            "ts": float(row["ts"]),
+            "step": row["step"],
+            "duration_ms": row["duration_ms"],
+            "payload": payload,
+            "state": state,
+        }
 
     def clear(self, thread_id: Optional[str] = None) -> None:
         """
@@ -165,14 +368,15 @@ class SnapshotStore:
         - thread_id：为空则清理全部快照；否则仅清理该 thread_id。
         """
 
+        cursor = self._conn.cursor()
         if thread_id is None:
+            cursor.execute("DELETE FROM agent_snapshots")
+            self._conn.commit()
             self._snapshots = {}
             return
+        cursor.execute("DELETE FROM agent_snapshots WHERE thread_id = ?", (thread_id,))
+        self._conn.commit()
         self._snapshots.pop(thread_id, None)
 
-
-# 单例实例：
-# - event_bus：供 orchestrator 与 UI 写入/读取事件
-# - snapshot_store：供 orchestrator 每步写入快照，UI 用于恢复与展示
 event_bus = EventBus()
 snapshot_store = SnapshotStore()

@@ -1,7 +1,7 @@
 // 统一封装前端 API 请求方法
 
 // 获取 API 基础地址，默认指向本地后端
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+export const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 
 // 封装 GET 请求
 export async function apiGet(path) {

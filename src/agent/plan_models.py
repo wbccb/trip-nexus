@@ -154,6 +154,7 @@ class TripState(BaseModel):
     user_intent: str = ""
     # 结构化用户输入
     user_input: Dict[str, Any] = Field(default_factory=dict)
+    thread_id: str = ""
     # 当前计划任务
     plan: List[Task] = Field(default_factory=list)
     # 计划历史，用于重规划回溯

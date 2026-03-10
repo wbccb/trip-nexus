@@ -1,9 +1,12 @@
 # API 服务入口，提供行程生成、会话列表、知识库检索的 HTTP 接口
 from datetime import datetime
+import asyncio
+import json
 from functools import lru_cache  # 用于缓存全局单例对象，减少重复初始化
 from typing import Any, Dict, List, Optional  # 提供类型注解，便于接口契约清晰
 
-from fastapi import FastAPI, HTTPException, Query  # FastAPI 框架与错误处理
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request  # FastAPI 框架与错误处理
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware  # 允许前端跨域访问
 from pydantic import BaseModel, Field  # 数据模型与字段校验
 
@@ -14,6 +17,9 @@ from src.frontend.context.storage import get_conversation_storage  # 获取会�
 from src.llm.llm_manager import LlmManager  # 行程生成核心管理器
 from src.map.map_renderer import TripMap
 from src.rag.rag_main import AIRetrievalPipeline  # 知识库检索流水线
+from src.agent import run_agent_loop_sync
+from src.agent.event_bus import event_bus, snapshot_store
+from src.agent.plan_models import TripState
 
 
 class StartSessionRequest(BaseModel):
@@ -112,6 +118,21 @@ class MapRenderResponse(BaseModel):
     is_final: bool = Field(False, description="是否最终批次")
 
 
+class AgentRunRequest(BaseModel):
+    user_id: str = Field(..., description="用户唯一ID")
+    device_id: str = Field(..., description="设备唯一ID")
+    thread_id: Optional[str] = Field(None, description="执行线程ID")
+    user_intent: Optional[str] = Field("generate_trip", description="用户意图")
+    user_input: Dict[str, Any] = Field(default_factory=dict, description="用户输入")
+    agent_config: Dict[str, Any] = Field(default_factory=dict, description="Agent 配置")
+    resume: bool = Field(False, description="是否从快照恢复")
+
+
+class AgentRunResponse(BaseModel):
+    thread_id: str = Field(..., description="执行线程ID")
+    status: str = Field(..., description="启动状态")
+
+
 @lru_cache(maxsize=1)
 def _get_config() -> Config:
     """缓存 Config 实例，避免重复读取环境变量"""
@@ -186,6 +207,53 @@ def _ensure_session_id(user_id: str, device_id: str, session_id: Optional[str]) 
     new_session_id = storage.generate_session_id(user_id, device_id)
     storage.store_session(user_id, new_session_id)
     return new_session_id
+
+
+def _build_agent_thread_id(user_id: str, device_id: str) -> str:
+    timestamp_ms = int(datetime.now().timestamp() * 1000)
+    return f"{user_id}-{device_id}-{timestamp_ms}"
+
+
+def _resolve_initial_state(thread_id: str, resume: bool) -> Optional[TripState]:
+    if not resume:
+        return None
+    snapshot = snapshot_store.latest(thread_id)
+    if not snapshot:
+        return None
+    state_payload = snapshot.get("state")
+    if not isinstance(state_payload, dict):
+        return None
+    try:
+        return TripState.model_validate(state_payload)
+    except Exception:
+        return None
+
+
+def _build_stream_payload(event: Dict[str, Any]) -> Dict[str, Any]:
+    kind = event.get("kind") or ""
+    detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
+    status = "running"
+    if kind == "task_end":
+        status = "done" if detail.get("success", True) else "failed"
+    elif kind in ["paused"]:
+        status = "paused"
+    elif kind in ["error"]:
+        status = "failed"
+    elif kind in ["loop_end"]:
+        status = str(detail.get("status") or "done")
+    return {
+        "event": kind,
+        "sequence": int(event.get("sequence") or 0),
+        "thread_id": event.get("thread_id") or "",
+        "node": event.get("node"),
+        "status": status,
+        "payload": detail or {},
+    }
+
+
+def _format_sse(event_payload: Dict[str, Any]) -> str:
+    payload_text = json.dumps(event_payload, ensure_ascii=False)
+    return f"id: {event_payload.get('sequence')}\nevent: {event_payload.get('event')}\ndata: {payload_text}\n\n"
 
 
 def _row_to_session_item(row: Any) -> Dict[str, str]:
@@ -421,6 +489,71 @@ def render_map(payload: MapRenderRequest) -> MapRenderResponse:
         day=day if isinstance(day, str) or day is None else str(day),
         is_final=is_final,
     )
+
+
+def _run_agent_background(
+    thread_id: str,
+    user_input: Dict[str, Any],
+    agent_config: Dict[str, Any],
+    user_intent: str,
+    resume: bool,
+) -> None:
+    llm_manager = _get_llm_manager()
+    initial_state = _resolve_initial_state(thread_id, resume)
+    run_agent_loop_sync(
+        llm_manager=llm_manager,
+        user_input=user_input,
+        thread_id=thread_id,
+        agent_config=agent_config,
+        user_intent=user_intent,
+        initial_state=initial_state,
+    )
+
+
+@app.post("/api/agent/run", response_model=AgentRunResponse)
+def run_agent(payload: AgentRunRequest, background_tasks: BackgroundTasks) -> AgentRunResponse:
+    thread_id = payload.thread_id or _build_agent_thread_id(payload.user_id, payload.device_id)
+    background_tasks.add_task(
+        _run_agent_background,
+        thread_id,
+        payload.user_input or {},
+        payload.agent_config or {},
+        payload.user_intent or "generate_trip",
+        payload.resume,
+    )
+    return AgentRunResponse(thread_id=thread_id, status="started")
+
+
+@app.get("/api/agent/stream")
+async def stream_agent_events(
+    request: Request,
+    thread_id: str = Query(..., description="执行线程ID"),
+    last_sequence: Optional[int] = Query(None, description="断线续传序号"),
+):
+    header_sequence = request.headers.get("Last-Event-ID")
+    try:
+        header_sequence_value = int(header_sequence) if header_sequence else None
+    except Exception:
+        header_sequence_value = None
+    start_sequence = header_sequence_value if header_sequence_value is not None else last_sequence
+
+    async def event_generator():
+        current_sequence = int(start_sequence or 0)
+        while True:
+            if await request.is_disconnected():
+                break
+            events = event_bus.list(thread_id=thread_id, after_sequence=current_sequence, limit=200)
+            if events:
+                for event in events:
+                    payload = _build_stream_payload(event)
+                    current_sequence = int(payload.get("sequence") or current_sequence)
+                    yield _format_sse(payload)
+                    if payload.get("event") == "loop_end":
+                        return
+            else:
+                await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.post("/api/knowledge/search", response_model=KnowledgeSearchResponse)
