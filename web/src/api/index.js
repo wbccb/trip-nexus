@@ -16,7 +16,7 @@ export {
   streamTripGeneration,
   updateTripData,
 } from "./tripApi.js";
-export { searchKnowledge } from "./knowledgeApi.js";
+export { generateKnowledgeAnswer, searchKnowledge } from "./knowledgeApi.js";
 export { API_BASE, apiPost } from "./httpClient.js";
 
 export async function runAgent(payload) {

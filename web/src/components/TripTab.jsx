@@ -23,6 +23,37 @@ function SortableTripItem({ item, onEdit, onDelete, onCardClick, isSelected, ite
     transition,
     opacity: isDragging ? 0.6 : 1,
   }
+  const ratingValueRaw = item?.rating
+  const ratingValue = Number.isFinite(ratingValueRaw) ? ratingValueRaw : Number(ratingValueRaw)
+  const tagList = Array.isArray(item?.tags) ? item.tags : item?.tags ? [item.tags] : []
+  const tagTokens = []
+  if (Number.isFinite(ratingValue)) {
+    tagTokens.push(`⭐${ratingValue.toFixed(1)}`)
+  }
+  tagList.filter(Boolean).forEach((tag) => tagTokens.push(`🏷️${tag}`))
+  if (item?.duration) {
+    tagTokens.push(`⏱️${item.duration}`)
+  }
+  const recommendReason = item?.recommend_reason || item?.reason || ""
+  const rawSources = item?.sources || item?.source || []
+  const sourceList = Array.isArray(rawSources) ? rawSources : [rawSources]
+  const normalizedSources = sourceList
+    .map((source) => {
+      if (!source) {
+        return null
+      }
+      if (typeof source === "string") {
+        return { title: source, url: source }
+      }
+      if (typeof source === "object") {
+        return {
+          title: source.title || source.name || source.url || source.source || "来源链接",
+          url: source.url || source.source || "",
+        }
+      }
+      return null
+    })
+    .filter(Boolean)
   return (
     <div
       ref={handleRef}
@@ -41,6 +72,30 @@ function SortableTripItem({ item, onEdit, onDelete, onCardClick, isSelected, ite
         <div className="trip-card-meta">
           {item.transport || "交通未提供"} · {item.duration || "停留时间未提供"}
         </div>
+        {tagTokens.length > 0 && (
+          <div className="trip-card-tags">
+            {tagTokens.map((tag) => (
+              <span key={tag}>{tag}</span>
+            ))}
+          </div>
+        )}
+        {recommendReason && <div className="trip-card-reason">推荐理由：{recommendReason}</div>}
+        {normalizedSources.length > 0 && (
+          <div className="trip-card-sources">
+            {normalizedSources.map((source, index) => (
+              <div key={`${source.url || source.title}-${index}`}>
+                来源：
+                {source.url ? (
+                  <a href={source.url} target="_blank" rel="noreferrer">
+                    {source.title}
+                  </a>
+                ) : (
+                  source.title
+                )}
+              </div>
+            ))}
+          </div>
+        )}
         {item.note && <div className="trip-card-note">{item.note}</div>}
       </div>
       <div className="trip-card-actions">

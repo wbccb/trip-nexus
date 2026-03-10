@@ -83,6 +83,17 @@ class KnowledgeSearchResponse(BaseModel):
     answer: Optional[str] = Field(None, description="可选回答")
 
 
+class KnowledgeAnswerRequest(BaseModel):
+    query: str = Field(..., description="检索问题")
+    evidence: Dict[str, Any] = Field(..., description="证据结构化结果")
+
+
+class KnowledgeAnswerResponse(BaseModel):
+    query: str = Field(..., description="检索问题")
+    evidence: Dict[str, Any] = Field(..., description="证据结构化结果")
+    answer: str = Field(..., description="生成回答")
+
+
 class ChatHistoryItem(BaseModel):
     role: str = Field(..., description="消息角色")
     content: str = Field(..., description="消息内容")
@@ -821,3 +832,12 @@ def knowledge_search(payload: KnowledgeSearchRequest) -> KnowledgeSearchResponse
     evidence = result.get("evidence") or {}
     answer = result.get("answer")
     return KnowledgeSearchResponse(query=payload.query, evidence=evidence, answer=answer)
+
+
+@app.post("/api/knowledge/answer_from_evidence", response_model=KnowledgeAnswerResponse)
+def knowledge_answer_from_evidence(payload: KnowledgeAnswerRequest) -> KnowledgeAnswerResponse:
+    rag_pipeline = _get_rag_pipeline()
+    if not payload.query or not isinstance(payload.evidence, dict):
+        raise HTTPException(status_code=400, detail="证据或问题不能为空")
+    answer = rag_pipeline.generate_answer_from_evidence(payload.query, payload.evidence)
+    return KnowledgeAnswerResponse(query=payload.query, evidence=payload.evidence, answer=answer)

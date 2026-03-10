@@ -215,6 +215,75 @@ body {
   border-radius: 8px;
 }
 
+.trip-card-tags {
+  font-size: 12px;
+  color: #0f172a;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.trip-card-reason {
+  font-size: 12px;
+  color: #334155;
+  background: #f8fafc;
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.trip-card-sources {
+  font-size: 12px;
+  color: #475569;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.trip-card-sources a {
+  color: #2563eb;
+}
+
+.evidence-card {
+  background: #f8fafc;
+}
+
+.evidence-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.evidence-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.evidence-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.evidence-title {
+  font-weight: 600;
+}
+
+.evidence-text {
+  font-size: 12px;
+  color: #334155;
+}
+
+.evidence-meta {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.evidence-answer {
+  background: #ffffff;
+}
+
 .trip-card-actions {
   display: flex;
   flex-direction: column;
@@ -316,7 +385,7 @@ body {
   position: absolute;
   right: 5px;
   top: auto;
-  bototm: auto;
+  bottom: auto;
 }
 
 .session-item:hover .session-content {

@@ -8,3 +8,10 @@ export async function searchKnowledge(query, generateAnswer) {
     generate_answer: Boolean(generateAnswer),
   })
 }
+
+export async function generateKnowledgeAnswer(query, evidence) {
+  return apiPost("/api/knowledge/answer_from_evidence", {
+    query,
+    evidence,
+  })
+}

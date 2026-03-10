@@ -33,6 +33,10 @@ class DailyPlanItem(BaseModel):
     longitude: float = Field(default=0.0, description="景点经度，精确到小数点后至少4位")
     transport: str = Field(description="具体交通方式，如'地铁2号线→步行5分钟'")
     duration: str = Field(description="停留时间，如'2小时'")
+    rating: Optional[float] = Field(default=None, description="评分，0-5 之间的小数")
+    tags: List[str] = Field(default_factory=list, description="类型标签列表")
+    recommend_reason: Optional[str] = Field(default="", description="推荐理由，简洁描述")
+    sources: List[Any] = Field(default_factory=list, description="来源链接列表，元素可为 {title,url} 或 url 字符串")
 
 
 class TripPlan(BaseModel):
@@ -876,7 +880,13 @@ class LlmManager:
                         "latitude": 30.6570,
                         "longitude": 104.0650,
                         "transport": "交通A",
-                        "duration": "30分钟"
+                        "duration": "30分钟",
+                        "rating": 4.5,
+                        "tags": ["博物馆", "人文"],
+                        "recommend_reason": "馆藏丰富，适合深入了解城市历史。",
+                        "sources": [
+                            {"title": "景点评价来源", "url": "https://example.com/poi-a"}
+                        ]
                     }},
                     {{
                         "time": "09:30-10:00",
@@ -887,7 +897,13 @@ class LlmManager:
                         "latitude": 30.6580,
                         "longitude": 104.0660,
                         "transport": "步行",
-                        "duration": "30分钟"
+                        "duration": "30分钟",
+                        "rating": 4.2,
+                        "tags": ["美食", "本地餐厅"],
+                        "recommend_reason": "距离近，适合补充体力。",
+                        "sources": [
+                            {"title": "餐厅信息", "url": "https://example.com/poi-b"}
+                        ]
                     }}
                 ]
             }}
@@ -909,6 +925,8 @@ class LlmManager:
         - 地址必须精确到街道和门牌号（如"成都市青羊区青华路9号"），并同时提供匹配的 city、street 字段。
         - 每个行程项必须包含精确的 latitude 和 longitude 坐标，且与地址一致。
         - 交通方式具体（如"地铁2号线人民公园站B口出"）。
+        - rating 为 0-5 的小数，tags 为 1-3 个类型标签，recommend_reason 简洁说明推荐依据。
+        - sources 提供 1-2 个可点击来源链接，优先引用攻略或权威页面。
 
         【Schema 定义】
         {format_instructions}
