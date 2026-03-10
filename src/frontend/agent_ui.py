@@ -793,7 +793,8 @@ class AgentUI:
                             user_intent=st.session_state.get("agent_plan_intent", ""),
                             context=st.session_state.get("agent_context_texts"),
                             plan_override=None,
-                            initial_state=last_state_obj
+                            initial_state=last_state_obj,
+                            resume=True,
                         )
                         st.session_state.agent_last_state = final_state
                         st.rerun()

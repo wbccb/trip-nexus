@@ -19,7 +19,7 @@ from src.llm.llm_manager import LlmManager  # 行程生成核心管理器
 from src.map.map_renderer import TripMap
 from src.rag.rag_main import AIRetrievalPipeline  # 知识库检索流水线
 from src.agent import run_agent_loop_sync
-from src.agent.event_bus import event_bus, snapshot_store
+from src.agent.event_bus import event_bus
 from src.agent.plan_models import TripState
 
 
@@ -272,18 +272,7 @@ def _build_agent_thread_id(user_id: str, device_id: str) -> str:
 
 
 def _resolve_initial_state(thread_id: str, resume: bool) -> Optional[TripState]:
-    if not resume:
-        return None
-    snapshot = snapshot_store.latest(thread_id)
-    if not snapshot:
-        return None
-    state_payload = snapshot.get("state")
-    if not isinstance(state_payload, dict):
-        return None
-    try:
-        return TripState.model_validate(state_payload)
-    except Exception:
-        return None
+    return None
 
 
 def _build_stream_payload(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -767,14 +756,13 @@ def _run_agent_background(
     resume: bool,
 ) -> None:
     llm_manager = _get_llm_manager()
-    initial_state = _resolve_initial_state(thread_id, resume)
     run_agent_loop_sync(
         llm_manager=llm_manager,
         user_input=user_input,
         thread_id=thread_id,
         agent_config=agent_config,
         user_intent=user_intent,
-        initial_state=initial_state,
+        resume=resume,
     )
 
 

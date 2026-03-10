@@ -3,16 +3,49 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
+
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, StateGraph
+from langgraph.types import Command, interrupt
 
 from src.agent.plan_models import Plan, Task, TripState, SharedContext
-from src.agent.scheduler import Scheduler, RateLimitExceeded, BudgetExceeded
-from src.agent.event_bus import event_bus, snapshot_store
+from src.agent.event_bus import event_bus
 from src.llm.llm_manager import LlmManager
 from src.llm.tool_protocol import ToolCallResult
 from src.map.map_renderer import TripMap
 from src.observability import ErrorCodes, build_error_payload, normalize_exception, BudgetManager, ConstraintChecker
 from src.config import Config  # 读取全局配置预算
+
+
+class AgentGraphState(TypedDict):
+    user_intent: str
+    user_input: Dict[str, Any]
+    thread_id: str
+    agent_config: Dict[str, Any]
+    plan: List[Dict[str, Any]]
+    plan_history: List[List[Dict[str, Any]]]
+    execution_queue: List[str]
+    completed_tasks: List[str]
+    failed_tasks: List[str]
+    pending_count: int
+    task_summaries: Dict[str, str]
+    shared_context: Dict[str, Any]
+    task_results: Dict[str, Any]
+    context_revisions: List[Dict[str, Any]]
+    final_payload: Dict[str, Any]
+    status: str
+    error: Optional[str]
+    stop_reason: Optional[str]
+    retry_counts: Dict[str, int]
+    replan_depth: int
+    max_replan_depth: int
+    loop_started_at: float
+    last_task_id: Optional[str]
+    last_task_result: Dict[str, Any]
+
+
+_AGENT_CHECKPOINTER = InMemorySaver()
 
 
 class PlannerAgent:
@@ -226,6 +259,107 @@ class Reflector:
     def can_replan(self, state: TripState) -> bool:
         # 判断是否超过最大重规划深度
         return int(state.replan_depth) < self._max_replan_depth
+
+
+def _serialize_shared_context(shared_context: SharedContext) -> Dict[str, Any]:
+    # 将 SharedContext 转成可序列化结构，便于 checkpoint 持久化
+    return {
+        "data": shared_context.data or {},
+        "revisions": shared_context.revisions or [],
+    }
+
+
+def _deserialize_shared_context(payload: Any) -> SharedContext:
+    # 从 checkpoint payload 还原 SharedContext
+    if isinstance(payload, SharedContext):
+        return payload
+    if not isinstance(payload, dict):
+        return SharedContext()
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    revisions = payload.get("revisions") if isinstance(payload.get("revisions"), list) else []
+    return SharedContext(data=data, revisions=revisions)
+
+
+def _serialize_plan_items(tasks: List[Task]) -> List[Dict[str, Any]]:
+    # 将 Task 列表转成 JSON 友好的结构
+    return [task.model_dump() for task in tasks]
+
+
+def _deserialize_plan_items(payload: Any) -> List[Task]:
+    # 将 checkpoint 中的任务结构还原为 Task 列表
+    if not isinstance(payload, list):
+        return []
+    tasks: List[Task] = []
+    for item in payload:
+        if isinstance(item, Task):
+            tasks.append(item)
+            continue
+        if isinstance(item, dict):
+            tasks.append(Task(**item))
+    return tasks
+
+
+def _graph_state_from_trip_state(state: TripState, agent_config: Dict[str, Any]) -> AgentGraphState:
+    # 将 TripState 映射为 LangGraph State
+    return {
+        "user_intent": state.user_intent,
+        "user_input": state.user_input,
+        "thread_id": state.thread_id,
+        "agent_config": agent_config,
+        "plan": _serialize_plan_items(state.plan),
+        "plan_history": [
+            _serialize_plan_items(history) for history in (state.plan_history or [])
+        ],
+        "execution_queue": list(state.execution_queue or []),
+        "completed_tasks": list(state.completed_tasks or []),
+        "failed_tasks": list(state.failed_tasks or []),
+        "pending_count": 0,
+        "task_summaries": dict(state.task_summaries or {}),
+        "shared_context": _serialize_shared_context(state.shared_context),
+        "task_results": dict(state.task_results or {}),
+        "context_revisions": list(state.context_revisions or []),
+        "final_payload": dict(state.final_payload or {}),
+        "status": state.status,
+        "error": state.error,
+        "stop_reason": state.stop_reason,
+        "retry_counts": dict(state.retry_counts or {}),
+        "replan_depth": int(state.replan_depth),
+        "max_replan_depth": int(state.max_replan_depth),
+        "loop_started_at": float(time.time()),
+        "last_task_id": None,
+        "last_task_result": {},
+    }
+
+
+def _trip_state_from_graph_state(payload: Dict[str, Any]) -> TripState:
+    # 将 LangGraph State 还原为 TripState
+    plan_items = _deserialize_plan_items(payload.get("plan"))
+    plan_history_payload = payload.get("plan_history") if isinstance(payload.get("plan_history"), list) else []
+    plan_history = [
+        _deserialize_plan_items(history) for history in plan_history_payload if isinstance(history, list)
+    ]
+    shared_context = _deserialize_shared_context(payload.get("shared_context"))
+    return TripState(
+        user_intent=payload.get("user_intent") or "",
+        user_input=payload.get("user_input") or {},
+        thread_id=payload.get("thread_id") or "",
+        plan=plan_items,
+        plan_history=plan_history,
+        execution_queue=list(payload.get("execution_queue") or []),
+        completed_tasks=set(payload.get("completed_tasks") or []),
+        failed_tasks=set(payload.get("failed_tasks") or []),
+        task_summaries=payload.get("task_summaries") or {},
+        shared_context=shared_context,
+        task_results=payload.get("task_results") or {},
+        context_revisions=payload.get("context_revisions") or [],
+        final_payload=payload.get("final_payload") or {},
+        status=payload.get("status") or "pending",
+        error=payload.get("error"),
+        stop_reason=payload.get("stop_reason"),
+        retry_counts=payload.get("retry_counts") or {},
+        replan_depth=int(payload.get("replan_depth") or 0),
+        max_replan_depth=int(payload.get("max_replan_depth") or 0),
+    )
 
 
 class AgentExecutor:
@@ -473,52 +607,286 @@ class AgentExecutor:
         retry_limit: int = 1,
         max_replan_depth: int = 2,
         initial_state: Optional[TripState] = None,
+        resume: bool = False,
     ) -> TripState:
-        # 初始化或恢复状态
-        if initial_state:
-            state = initial_state
-            if state.status == "paused":
-                state.status = "running"
-                state.stop_reason = None
-            state.thread_id = thread_id
-            
-            # 恢复 Plan 对象（State 中只存了 Task 列表）
-            plan = Plan(tasks=state.plan)
-        else:
-            state = TripState(
-                user_intent=user_intent or "",
-                user_input=user_input or {},
-                thread_id=thread_id,
-                plan=[],
-                plan_history=[],
-                execution_queue=[],
-                completed_tasks=set(),
-                failed_tasks=set(),
-                task_summaries={},
-                shared_context=SharedContext(),
-                task_results={},
-                context_revisions=[],
-                final_payload={},
-                status="running",
-                error=None,
-                stop_reason=None,
-                retry_counts={},
-                replan_depth=0,
-                max_replan_depth=max_replan_depth,
+        return await asyncio.to_thread(
+            run_agent_loop_sync,
+            self._llm_manager,
+            user_input,
+            thread_id,
+            agent_config,
+            user_intent,
+            context,
+            plan_override,
+            retry_limit,
+            max_replan_depth,
+            initial_state,
+            resume,
+        )
+
+
+def _build_initial_graph_state(
+    user_input: Dict[str, Any],
+    thread_id: str,
+    agent_config: Dict[str, Any],
+    user_intent: str,
+    plan_override: Optional[Plan],
+    retry_limit: int,
+    max_replan_depth: int,
+) -> AgentGraphState:
+    plan_items = _serialize_plan_items(plan_override.tasks) if plan_override else []
+    merged_config = dict(agent_config or {})
+    merged_config["retry_limit"] = int(retry_limit)
+    merged_config["max_replan_depth"] = int(max_replan_depth)
+    return {
+        "user_intent": user_intent or "",
+        "user_input": user_input or {},
+        "thread_id": thread_id,
+        "agent_config": merged_config,
+        "plan": plan_items,
+        "plan_history": [],
+        "execution_queue": [],
+        "completed_tasks": [],
+        "failed_tasks": [],
+        "pending_count": 0,
+        "task_summaries": {},
+        "shared_context": _serialize_shared_context(SharedContext()),
+        "task_results": {},
+        "context_revisions": [],
+        "final_payload": {},
+        "status": "running",
+        "error": None,
+        "stop_reason": None,
+        "retry_counts": {},
+        "replan_depth": 0,
+        "max_replan_depth": int(max_replan_depth),
+        "loop_started_at": float(time.time()),
+        "last_task_id": None,
+        "last_task_result": {},
+    }
+
+
+def _build_agent_graph(llm_manager: LlmManager) -> Any:
+    planner_agent = PlannerAgent(llm_manager)
+    executor = AgentExecutor(llm_manager)
+
+    def _planner_node(state: AgentGraphState) -> Dict[str, Any]:
+        if state.get("plan"):
+            return {}
+        tool_whitelist = executor._tool_whitelist()
+        plan = planner_agent.plan(
+            state.get("user_intent") or "",
+            state.get("user_input") or {},
+            state.get("agent_config") or {},
+            tool_whitelist,
+        )
+        plan_items = _serialize_plan_items(plan.tasks)
+        event_bus.emit(
+            "plan_created",
+            state.get("thread_id") or "",
+            "planner",
+            {
+                "tasks": [
+                    {
+                        "task_id": task.id,
+                        "task_type": task.type,
+                        "tool": task.tool,
+                        "description": task.description,
+                    }
+                    for task in plan.tasks
+                ],
+            },
+        )
+        return {"plan": plan_items}
+
+    def _scheduler_node(state: AgentGraphState) -> Dict[str, Any]:
+        if state.get("status") in {"paused", "failed"}:
+            return {"execution_queue": [], "pending_count": 0}
+        agent_config = state.get("agent_config") or {}
+        config = Config()
+        time_budget_seconds = agent_config.get("time_budget_seconds")
+        if time_budget_seconds is None:
+            time_budget_seconds = config.AGENT_TIME_BUDGET_SECONDS
+        if time_budget_seconds is not None and float(time_budget_seconds) <= 0:
+            time_budget_seconds = None
+        budget_checker = ConstraintChecker(BudgetManager(time_budget_seconds=time_budget_seconds))
+        elapsed_seconds = time.time() - float(state.get("loop_started_at") or time.time())
+        if not budget_checker.ensure_within_budget(elapsed_seconds=elapsed_seconds):
+            error_payload = build_error_payload(
+                code=ErrorCodes.BUDGET_EXCEEDED,
+                message="agent_time_budget_exceeded",
+                source="agent_executor",
             )
-            # 初始化反思器 (reflector is stateless here, but created below)
-            # 生成计划
-            if plan_override:
-                plan = plan_override
-                plan.validate_plan(tool_whitelist=set(self._tool_whitelist()))
+            event_bus.emit("error", state.get("thread_id") or "", "executor", {"error": error_payload})
+            return {
+                "status": "failed",
+                "error": error_payload.get("message"),
+                "stop_reason": "budget_exceeded",
+                "execution_queue": [],
+                "pending_count": 0,
+            }
+        plan_items = _deserialize_plan_items(state.get("plan"))
+        completed = set(state.get("completed_tasks") or [])
+        failed = set(state.get("failed_tasks") or [])
+        pending_tasks = [task for task in plan_items if task.id not in completed and task.id not in failed]
+        ready_tasks = [
+            task.id
+            for task in pending_tasks
+            if all(dep in completed for dep in (task.dependencies or []))
+        ]
+        max_concurrency = int(agent_config.get("max_concurrency") or 4)
+        execution_queue = ready_tasks[:max_concurrency]
+        if not execution_queue and pending_tasks:
+            error_payload = build_error_payload(
+                code=ErrorCodes.UNEXPECTED_ERROR,
+                message="scheduler_no_ready_tasks",
+                source="agent_scheduler",
+            )
+            event_bus.emit("error", state.get("thread_id") or "", "scheduler", {"error": error_payload})
+            return {
+                "status": "failed",
+                "error": error_payload.get("message"),
+                "stop_reason": "no_ready_tasks",
+                "execution_queue": [],
+                "pending_count": len(pending_tasks),
+            }
+        if execution_queue:
+            event_bus.emit(
+                "batch_start",
+                state.get("thread_id") or "",
+                "executor",
+                {"tasks": execution_queue},
+            )
+        return {"execution_queue": execution_queue, "pending_count": len(pending_tasks)}
+
+    def _executor_node(state: AgentGraphState) -> Dict[str, Any]:
+        execution_queue = state.get("execution_queue") or []
+        if not execution_queue:
+            return {}
+        plan_items = _deserialize_plan_items(state.get("plan"))
+        task_id = execution_queue[0]
+        task = next((item for item in plan_items if item.id == task_id), None)
+        if not task:
+            return {"execution_queue": []}
+        trip_state = _trip_state_from_graph_state(state)
+        result_task, result_payload = executor._execute_task(task, trip_state, state.get("agent_config") or {})
+        success = bool(result_payload.get("success"))
+        final_success = success
+        retry_limit = int((state.get("agent_config") or {}).get("retry_limit") or 1)
+        if not success:
+            retry_count = (state.get("retry_counts") or {}).get(task.id, 0)
+            if retry_count < retry_limit:
+                event_bus.emit(
+                    "task_retry",
+                    state.get("thread_id") or "",
+                    executor._resolve_node(task),
+                    {"task_id": task.id, "retry_count": retry_count + 1},
+                )
+                retry_task, retry_result = executor._execute_task(task, trip_state, state.get("agent_config") or {})
+                result_task, result_payload = retry_task, retry_result
+                final_success = bool(retry_result.get("success"))
+        completed = set(state.get("completed_tasks") or [])
+        failed = set(state.get("failed_tasks") or [])
+        if final_success:
+            completed.add(task.id)
+        else:
+            failed.add(task.id)
+        if not final_success and task.type == "tool_call":
+            event_bus.emit(
+                "paused",
+                state.get("thread_id") or "",
+                executor._resolve_node(task),
+                {"reason": "tool_failed", "task_id": task.id},
+            )
+            decision = interrupt(
+                {
+                    "reason": "tool_failed",
+                    "task_id": task.id,
+                    "task_type": task.type,
+                    "tool": task.tool,
+                    "result": result_payload,
+                }
+            )
+            action = decision.get("action") if isinstance(decision, dict) else "retry"
+            if action == "skip":
+                output_key = task.output_key or "result"
+                trip_state.shared_context.write(task.id, output_key, {})
+                executor._emit_context_patch(trip_state, task, output_key, {})
+            elif action == "override" and isinstance(decision, dict):
+                override_result = decision.get("override_result")
+                output_key = task.output_key or "result"
+                trip_state.shared_context.write(task.id, output_key, override_result or {})
+                executor._emit_context_patch(trip_state, task, output_key, override_result or {})
+                completed.add(task.id)
+                failed.discard(task.id)
             else:
-                tool_whitelist = self._tool_whitelist()
-                plan = self._planner.plan(user_intent, user_input, agent_config, tool_whitelist)
-            # 写入计划
-            state.plan = plan.tasks
+                retry_task, retry_result = executor._execute_task(task, trip_state, state.get("agent_config") or {})
+                result_task, result_payload = retry_task, retry_result
+                final_success = bool(retry_result.get("success"))
+                if final_success:
+                    completed.add(task.id)
+                    failed.discard(task.id)
+        data_payload = result_payload.get("data") if isinstance(result_payload, dict) else None
+        if final_success and (state.get("agent_config") or {}).get("manual_rag_review"):
+            if isinstance(data_payload, dict) and data_payload.get("evidence"):
+                event_bus.emit(
+                    "paused",
+                    state.get("thread_id") or "",
+                    "map_rag",
+                    {"reason": "rag_review", "task_id": task.id},
+                )
+                return {
+                    "status": "paused",
+                    "stop_reason": "rag_review",
+                    "execution_queue": [],
+                    "completed_tasks": list(completed),
+                    "failed_tasks": list(failed),
+                    "task_results": trip_state.task_results,
+                    "shared_context": _serialize_shared_context(trip_state.shared_context),
+                }
+        task_summaries = dict(state.get("task_summaries") or {})
+        task_summaries[task.id] = executor._summarize_task(task, final_success)
+        updated_retry_counts = dict(state.get("retry_counts") or {})
+        if not final_success:
+            updated_retry_counts[task.id] = updated_retry_counts.get(task.id, 0) + 1
+        return {
+            "execution_queue": [],
+            "completed_tasks": list(completed),
+            "failed_tasks": list(failed),
+            "task_results": trip_state.task_results,
+            "task_summaries": task_summaries,
+            "shared_context": _serialize_shared_context(trip_state.shared_context),
+            "last_task_id": task.id,
+            "last_task_result": result_payload,
+            "retry_counts": updated_retry_counts,
+        }
+
+    def _reflector_node(state: AgentGraphState) -> Dict[str, Any]:
+        last_task_id = state.get("last_task_id")
+        if not last_task_id:
+            return {}
+        plan_items = _deserialize_plan_items(state.get("plan"))
+        last_task = next((task for task in plan_items if task.id == last_task_id), None)
+        if not last_task:
+            return {}
+        trip_state = _trip_state_from_graph_state(state)
+        reflector = Reflector(max_replan_depth=int(state.get("max_replan_depth") or 0))
+        last_result = state.get("last_task_result") or {}
+        if reflector.should_replan(last_task, last_result) and reflector.can_replan(trip_state):
+            tool_whitelist = executor._tool_whitelist()
+            new_plan = planner_agent.plan(
+                state.get("user_intent") or "",
+                state.get("user_input") or {},
+                state.get("agent_config") or {},
+                tool_whitelist,
+                force_sop=False,
+                error_context={"task_id": last_task.id, "result": last_result},
+            )
+            plan_history = list(state.get("plan_history") or [])
+            plan_history.append(state.get("plan") or [])
             event_bus.emit(
                 "plan_created",
-                thread_id,
+                state.get("thread_id") or "",
                 "planner",
                 {
                     "tasks": [
@@ -528,210 +896,82 @@ class AgentExecutor:
                             "tool": task.tool,
                             "description": task.description,
                         }
-                        for task in plan.tasks
+                        for task in new_plan.tasks
                     ],
                 },
             )
-
-        # 初始化反思器
-        # 初始化反思器
-        reflector = Reflector(max_replan_depth=max_replan_depth)
-        # 读取配置
-        config = Config()
-        # 获取时间预算配置
-        time_budget_seconds = agent_config.get("time_budget_seconds")
-        # 兜底使用全局预算
-        if time_budget_seconds is None:
-            time_budget_seconds = config.AGENT_TIME_BUDGET_SECONDS
-        # 非正数视为不启用
-        if time_budget_seconds is not None and float(time_budget_seconds) <= 0:
-            time_budget_seconds = None
-        # 构建预算检查器
-        budget_checker = ConstraintChecker(BudgetManager(time_budget_seconds=time_budget_seconds))
-        # 记录循环起始时间
-        loop_started_at = time.time()
-        
-        # 初始化调度器
-        scheduler = Scheduler(
-            plan.tasks,
-            max_concurrency=int(agent_config.get("max_concurrency") or 4),
-            rate_limit_per_min=agent_config.get("rate_limit_per_min"),
-            max_total_tasks=agent_config.get("max_total_tasks"),
-        )
-        
-        # 如果是恢复执行，需要重放已完成的任务状态给调度器
-        if initial_state:
-            print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 恢复执行，已完成任务: {len(state.completed_tasks)}")
-            for task_id in state.completed_tasks:
-                scheduler.mark_done(task_id)
-            # 同时标记失败但已跳过的任务
-            for task_id in state.failed_tasks:
-                scheduler.mark_done(task_id)
-
-        print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 初始化调度器")
-        # 主循环
-        while True:
-            # 计算累计耗时
-            elapsed_seconds = time.time() - loop_started_at
-            # 校验预算是否满足
-            if not budget_checker.ensure_within_budget(elapsed_seconds=elapsed_seconds):
-                # 构造预算超限错误
-                error_payload = build_error_payload(
-                    code=ErrorCodes.BUDGET_EXCEEDED,
-                    message="agent_time_budget_exceeded",
-                    source="agent_executor",
-                )
-                # 标记执行失败
-                state.status = "failed"
-                # 写入错误消息
-                state.error = error_payload.get("message")
-                # 记录停止原因
-                state.stop_reason = "budget_exceeded"
-                # 发送错误事件
-                event_bus.emit("error", thread_id, "executor", {"error": error_payload})
-                # 终止循环
-                break
-            # 检查是否处于暂停状态 (例如在循环中被置为 paused)
-            if state.status == "paused":
-                print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 暂停执行: {state.stop_reason}")
-                break
-            # 获取就绪批次
-            batch = scheduler.next_batch()
-            # 无就绪任务则结束
-            if not batch:
-                break
-            # 记录执行队列
-            state.execution_queue = [task.id for task in batch]
-            # 发出批次开始事件
-            event_bus.emit("batch_start", thread_id, "executor", {"tasks": state.execution_queue})
-            # 执行批次任务
-            try:
-                print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 执行批次任务")
-                results = await self._execute_batch(batch, state, agent_config)
-            except (RateLimitExceeded, BudgetExceeded) as e:
-                # 记录预算/速率错误并终止
-                state.status = "failed"
-                state.error = str(e)
-                state.stop_reason = "budget_or_rate_limit"
-                event_bus.emit("error", thread_id, "executor", {"error": state.error})
-                break
-            # 处理任务结果
-            replan_triggered = False
-            error_context = {}
-            for task, result in results:
-                # 缓存原始结果
-                state.task_results[task.id] = result
-                success = bool(result.get("success"))
-                state.task_summaries[task.id] = self._summarize_task(task, success)
-                final_success = success
-                if not success:
-                    retry_count = state.retry_counts.get(task.id, 0)
-                    if retry_count < retry_limit:
-                        state.retry_counts[task.id] = retry_count + 1
-                        event_bus.emit(
-                            "task_retry",
-                            thread_id,
-                            self._resolve_node(task),
-                            {"task_id": task.id, "retry_count": retry_count + 1},
-                        )
-                        retry_task, retry_result = self._execute_task(task, state, agent_config)
-                        state.task_results[retry_task.id] = retry_result
-                        final_success = bool(retry_result.get("success"))
-                        state.task_summaries[retry_task.id] = self._summarize_task(retry_task, final_success)
-                if final_success:
-                    state.completed_tasks.add(task.id)
-                    scheduler.mark_done(task.id)
-                else:
-                    state.failed_tasks.add(task.id)
-                    if task.type == "tool_call":
-                        output_key = task.output_key or "result"
-                        state.shared_context.write(task.id, output_key, {})
-                        self._emit_context_patch(state, task, output_key, {})
-                    scheduler.mark_done(task.id)
-                # 反思器判断是否触发重规划
-                if reflector.should_replan(task, result) and reflector.can_replan(state):
-                    replan_triggered = True
-                    error_context = {"task_id": task.id, "result": result}
-                    print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 反思器判断触发重规划，任务 ID: {task.id}")
-                
-            # 检查是否需要人工复核 RAG 结果
-            if agent_config.get("manual_rag_review"):
-                for task, result in results:
-                    data = result.get("data", {})
-                    if task.id in state.completed_tasks and isinstance(data, dict) and data.get("evidence"):
-                        print(f"\n[{time.strftime('%H:%M:%S')}] [AgentExecutor] 任务 {task.id} 产生 RAG 证据，触发人工复核暂停")
-                        state.status = "paused"
-                        state.stop_reason = "rag_review"
-                        event_bus.emit(
-                            "paused",
-                            thread_id,
-                            "map_rag",
-                            {"reason": "rag_review", "task_id": task.id},
-                        )
-                        break
-            
-            # 落快照
-            snapshot_store.add(
-                thread_id,
-                {
-                    "step": "executor_batch",
-                    "payload": {"completed": list(state.completed_tasks), "failed": list(state.failed_tasks)},
-                    "state": state.model_dump(),
-                    "duration_ms": 0,
-                },
+            event_bus.emit(
+                "replan",
+                state.get("thread_id") or "",
+                "executor",
+                {"depth": int(state.get("replan_depth") or 0) + 1},
             )
+            return {
+                "plan": _serialize_plan_items(new_plan.tasks),
+                "plan_history": plan_history,
+                "replan_depth": int(state.get("replan_depth") or 0) + 1,
+                "execution_queue": [],
+            }
+        return {}
 
-            if state.status == "paused":
-                break
-
-            # 触发重规划
-            if replan_triggered:
-                print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 开始重规划")
-                state.plan_history.append(list(state.plan))
-                state.replan_depth = int(state.replan_depth) + 1
-                new_plan = self._planner.plan(
-                    user_intent,
-                    user_input,
-                    agent_config,
-                    tool_whitelist,
-                    force_sop=False,
-                    error_context=error_context,
-                )
-                tools = [t.tool for t in new_plan.tasks if t.type == "tool_call"]
-                print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 重规划完成，工具序列: {', '.join(tools)}；已重置调度器并继续执行\n")
-                state.plan = new_plan.tasks
-                scheduler = Scheduler(new_plan.tasks)
-                event_bus.emit(
-                    "plan_created",
-                    thread_id,
-                    "planner",
-                    {
-                        "tasks": [
-                            {
-                                "task_id": task.id,
-                                "task_type": task.type,
-                                "tool": task.tool,
-                                "description": task.description,
-                            }
-                            for task in new_plan.tasks
-                        ],
-                    },
-                )
-                event_bus.emit("replan", thread_id, "executor", {"depth": state.replan_depth})
-                continue
-        # 生成最终聚合输出
-        state.final_payload = {
-            "draft_trip": state.shared_context.resolve("t4.draft_trip", default={}),
-            "map_payload": state.shared_context.resolve("t5.map_payload", default={}),
-            "summary": state.shared_context.resolve("t6.summary", default={}),
+    def _finalize_node(state: AgentGraphState) -> Dict[str, Any]:
+        shared_context = _deserialize_shared_context(state.get("shared_context"))
+        final_payload = {
+            "draft_trip": shared_context.resolve("t4.draft_trip", default={}),
+            "map_payload": shared_context.resolve("t5.map_payload", default={}),
+            "summary": shared_context.resolve("t6.summary", default={}),
         }
-        # 设置完成状态
-        if state.status == "running":
-            state.status = "done"
-        # 发出结束事件
-        event_bus.emit("loop_end", thread_id, "executor", {"status": state.status})
-        # 返回最终状态
-        return state
+        status = state.get("status") or "running"
+        if status == "running":
+            status = "done"
+        event_bus.emit("loop_end", state.get("thread_id") or "", "executor", {"status": status})
+        return {"final_payload": final_payload, "status": status}
+
+    planner_builder = StateGraph(AgentGraphState)
+    planner_builder.add_node("planner", _planner_node)
+    planner_builder.set_entry_point("planner")
+    planner_builder.add_edge("planner", END)
+    planner_graph = planner_builder.compile()
+
+    executor_builder = StateGraph(AgentGraphState)
+    executor_builder.add_node("executor", _executor_node)
+    executor_builder.set_entry_point("executor")
+    executor_builder.add_edge("executor", END)
+    executor_graph = executor_builder.compile()
+
+    reflector_builder = StateGraph(AgentGraphState)
+    reflector_builder.add_node("reflector", _reflector_node)
+    reflector_builder.set_entry_point("reflector")
+    reflector_builder.add_edge("reflector", END)
+    reflector_graph = reflector_builder.compile()
+
+    workflow = StateGraph(AgentGraphState)
+    workflow.add_node("planner", planner_graph)
+    workflow.add_node("scheduler", _scheduler_node)
+    workflow.add_node("executor", executor_graph)
+    workflow.add_node("reflector", reflector_graph)
+    workflow.add_node("finalize", _finalize_node)
+    workflow.set_entry_point("planner")
+    workflow.add_edge("planner", "scheduler")
+
+    def _route_from_scheduler(state: AgentGraphState) -> str:
+        if state.get("status") in {"paused", "failed"}:
+            return "end"
+        if not state.get("execution_queue") and not state.get("pending_count"):
+            return "end"
+        if not state.get("execution_queue"):
+            return "end"
+        return "execute"
+
+    workflow.add_conditional_edges(
+        "scheduler",
+        _route_from_scheduler,
+        {"execute": "executor", "end": "finalize"},
+    )
+    workflow.add_edge("executor", "reflector")
+    workflow.add_edge("reflector", "scheduler")
+    workflow.add_edge("finalize", END)
+    return workflow.compile(checkpointer=_AGENT_CHECKPOINTER)
 
 
 def run_agent_loop_sync(
@@ -745,32 +985,49 @@ def run_agent_loop_sync(
     retry_limit: int = 1,
     max_replan_depth: int = 2,
     initial_state: Optional[TripState] = None,
+    resume: bool = False,
 ) -> TripState:
-    # 初始化执行器
-    executor = AgentExecutor(llm_manager)
-    # 构建协程对象
-    coroutine = executor.run_agent_loop(
-        user_input=user_input,
-        thread_id=thread_id,
-        agent_config=agent_config,
-        user_intent=user_intent,
-        context=context,
-        plan_override=plan_override,
-        retry_limit=retry_limit,
-        max_replan_depth=max_replan_depth,
-        initial_state=initial_state,
-    )
-    # 尝试获取当前事件循环
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    # 无运行中的事件循环直接运行
-    if not loop or not loop.is_running():
-        return asyncio.run(coroutine)
-    # 存在运行中的事件循环则创建临时事件循环
-    temp_loop = asyncio.new_event_loop()
-    try:
-        return temp_loop.run_until_complete(coroutine)
-    finally:
-        temp_loop.close()
+    agent_graph = _build_agent_graph(llm_manager)
+    config = {"configurable": {"thread_id": thread_id}}
+    resume_payload = agent_config.get("human_decision") or {"approved": True}
+    if resume or (initial_state and initial_state.status == "paused"):
+        if initial_state:
+            state_payload = _graph_state_from_trip_state(initial_state, agent_config)
+            try:
+                agent_graph.update_state(config, state_payload)
+            except Exception:
+                pass
+        try:
+            result = agent_graph.invoke(Command(resume=resume_payload), config=config)
+        except Exception:
+            result = agent_graph.invoke(
+                _build_initial_graph_state(
+                    user_input=user_input,
+                    thread_id=thread_id,
+                    agent_config=agent_config,
+                    user_intent=user_intent,
+                    plan_override=plan_override,
+                    retry_limit=retry_limit,
+                    max_replan_depth=max_replan_depth,
+                ),
+                config=config,
+            )
+    else:
+        result = agent_graph.invoke(
+            _build_initial_graph_state(
+                user_input=user_input,
+                thread_id=thread_id,
+                agent_config=agent_config,
+                user_intent=user_intent,
+                plan_override=plan_override,
+                retry_limit=retry_limit,
+                max_replan_depth=max_replan_depth,
+            ),
+            config=config,
+        )
+    if isinstance(result, dict) and result.get("__interrupt__") is not None:
+        result["status"] = "paused"
+        result["stop_reason"] = "human_intervention"
+        result.setdefault("final_payload", {})
+        result["final_payload"]["interrupt"] = result.get("__interrupt__")
+    return _trip_state_from_graph_state(result if isinstance(result, dict) else {})
