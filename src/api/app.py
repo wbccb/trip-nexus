@@ -312,7 +312,8 @@ def _normalize_knowledge_base_id(raw_id: str) -> str:
 def _to_collection_name(knowledge_base_id: str) -> str:
     """将业务知识库ID映射为向量集合名。"""
     normalized_id = _normalize_knowledge_base_id(knowledge_base_id).lower()
-    return f"{KNOWLEDGE_COLLECTION_PREFIX}{normalized_id}"
+    safe_collection_id = re.sub(r"[^a-z0-9_\-]", "_", normalized_id)
+    return f"{KNOWLEDGE_COLLECTION_PREFIX}{safe_collection_id}"[:63]
 
 
 def _build_kb_query(destination: str, days: int, budget: Optional[str], preference: Optional[str], override_query: Optional[str]) -> str:
@@ -363,7 +364,7 @@ def _upsert_knowledge_base_registry(knowledge_base_id: str, name: str, collectio
     """写入或更新知识库 registry 记录。"""
     store = _get_knowledge_store()
     store.switch_collection(KNOWLEDGE_REGISTRY_COLLECTION, create_if_missing=True)
-    existing = store.vector_db.get(where={"knowledge_base_id": knowledge_base_id}, include=["ids"])
+    existing = store.vector_db.get(where={"knowledge_base_id": knowledge_base_id}, include=["metadatas"])
     existing_ids = existing.get("ids") if isinstance(existing, dict) else []
     if isinstance(existing_ids, list) and existing_ids:
         store.vector_db.delete(ids=existing_ids)
@@ -386,7 +387,7 @@ def _delete_knowledge_base_registry(knowledge_base_id: str) -> None:
     """删除知识库 registry 记录。"""
     store = _get_knowledge_store()
     store.switch_collection(KNOWLEDGE_REGISTRY_COLLECTION, create_if_missing=True)
-    existing = store.vector_db.get(where={"knowledge_base_id": knowledge_base_id}, include=["ids"])
+    existing = store.vector_db.get(where={"knowledge_base_id": knowledge_base_id}, include=["metadatas"])
     existing_ids = existing.get("ids") if isinstance(existing, dict) else []
     if isinstance(existing_ids, list) and existing_ids:
         store.vector_db.delete(ids=existing_ids)
@@ -1035,16 +1036,16 @@ def create_knowledge_base(payload: KnowledgeBaseCreateRequest) -> KnowledgeBaseC
     normalized_id = _normalize_knowledge_base_id(payload.name)
     collection_name = _to_collection_name(normalized_id)
     store = _get_knowledge_store()
-    store.create_collection(collection_name)
+    created_collection_name = store.create_collection(collection_name)
     _upsert_knowledge_base_registry(
         knowledge_base_id=normalized_id,
         name=str(payload.name).strip(),
-        collection_name=collection_name,
+        collection_name=created_collection_name,
     )
     return KnowledgeBaseCreateResponse(
         knowledge_base_id=normalized_id,
         name=str(payload.name).strip(),
-        collection_name=collection_name,
+        collection_name=created_collection_name,
     )
 
 
