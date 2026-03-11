@@ -49,3 +49,6 @@ settings.local.json
 trip_test.*
 搁置的计划
 目前存在的问题.md
+
+
+agent_events.*

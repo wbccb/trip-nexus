@@ -3,13 +3,16 @@ from datetime import datetime
 import asyncio
 import json
 import time
+import re
+from io import BytesIO
 from functools import lru_cache  # 用于缓存全局单例对象，减少重复初始化
 from typing import Any, Dict, List, Optional  # 提供类型注解，便于接口契约清晰
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request  # FastAPI 框架与错误处理
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile  # FastAPI 框架与错误处理
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware  # 允许前端跨域访问
 from pydantic import BaseModel, Field  # 数据模型与字段校验
+from pypdf import PdfReader
 
 from src.config import Config  # 读取项目配置
 from src.frontend.context.conversation_manager import ConversationManager
@@ -18,6 +21,7 @@ from src.frontend.context.storage import get_conversation_storage  # 获取会�
 from src.llm.llm_manager import LlmManager  # 行程生成核心管理器
 from src.map.map_renderer import TripMap
 from src.rag.rag_main import AIRetrievalPipeline  # 知识库检索流水线
+from src.rag.store.vector_store import VectorStore
 from src.agent import run_agent_loop_sync
 from src.agent.event_bus import event_bus
 from src.agent.plan_models import TripState
@@ -52,6 +56,8 @@ class TripGenerateRequest(BaseModel):
     budget: Optional[str] = Field(None, description="预算（可选）")
     preference: Optional[str] = Field(None, description="偏好（可选）")
     context_texts: List[str] = Field(default_factory=list, description="上下文文本列表")
+    knowledge_base_id: Optional[str] = Field(None, description="知识库ID（可选）")
+    knowledge_query: Optional[str] = Field(None, description="知识库检索查询（可选）")
 
 
 class TripGenerateResponse(BaseModel):
@@ -92,6 +98,43 @@ class KnowledgeAnswerResponse(BaseModel):
     query: str = Field(..., description="检索问题")
     evidence: Dict[str, Any] = Field(..., description="证据结构化结果")
     answer: str = Field(..., description="生成回答")
+
+
+class KnowledgeBaseCreateRequest(BaseModel):
+    """创建知识库请求体"""
+    name: str = Field(..., description="知识库名称")
+
+
+class KnowledgeBaseCreateResponse(BaseModel):
+    """创建知识库响应体"""
+    knowledge_base_id: str = Field(..., description="知识库ID")
+    name: str = Field(..., description="知识库名称")
+    collection_name: str = Field(..., description="向量集合名")
+
+
+class KnowledgeBaseDeleteResponse(BaseModel):
+    """删除知识库响应体"""
+    knowledge_base_id: str = Field(..., description="知识库ID")
+    success: bool = Field(..., description="是否删除成功")
+
+
+class KnowledgeBaseItem(BaseModel):
+    """知识库列表项"""
+    knowledge_base_id: str = Field(..., description="知识库ID")
+    name: str = Field(..., description="知识库名称")
+    collection_name: str = Field(..., description="向量集合名")
+
+
+class KnowledgeBaseListResponse(BaseModel):
+    """知识库列表响应体"""
+    items: List[KnowledgeBaseItem] = Field(default_factory=list, description="知识库列表")
+
+
+class KnowledgeUploadResponse(BaseModel):
+    """知识库文档上传响应体"""
+    knowledge_base_id: str = Field(..., description="知识库ID")
+    filename: str = Field(..., description="原始文件名")
+    chunks: int = Field(..., description="入库分块数")
 
 
 class ChatHistoryItem(BaseModel):
@@ -245,6 +288,156 @@ def _get_rag_pipeline() -> AIRetrievalPipeline:
 @lru_cache(maxsize=1)
 def _get_map_renderer() -> TripMap:
     return TripMap()
+
+
+KNOWLEDGE_COLLECTION_PREFIX = "kb_"
+KNOWLEDGE_REGISTRY_COLLECTION = "knowledge_registry"
+
+
+@lru_cache(maxsize=1)
+def _get_knowledge_store() -> VectorStore:
+    """缓存知识库向量实例，统一管理 collection 生命周期。"""
+    return VectorStore(collection_name=KNOWLEDGE_REGISTRY_COLLECTION)
+
+
+def _normalize_knowledge_base_id(raw_id: str) -> str:
+    """将知识库ID标准化为可持久化命名。"""
+    cleaned = re.sub(r"[^a-zA-Z0-9_\-\u4e00-\u9fa5]", "_", str(raw_id or "").strip())
+    cleaned = cleaned.strip("_")
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="知识库名称不能为空")
+    return cleaned[:48]
+
+
+def _to_collection_name(knowledge_base_id: str) -> str:
+    """将业务知识库ID映射为向量集合名。"""
+    normalized_id = _normalize_knowledge_base_id(knowledge_base_id).lower()
+    return f"{KNOWLEDGE_COLLECTION_PREFIX}{normalized_id}"
+
+
+def _build_kb_query(destination: str, days: int, budget: Optional[str], preference: Optional[str], override_query: Optional[str]) -> str:
+    """构造知识库检索查询，支持用户自定义覆盖。"""
+    if override_query and override_query.strip():
+        return override_query.strip()
+    query_parts = [
+        f"目的地:{destination}",
+        f"天数:{days}",
+        f"预算:{budget or '未指定'}",
+        f"偏好:{preference or '未指定'}",
+        "行程建议",
+    ]
+    return " ".join(query_parts)
+
+
+def _load_knowledge_base_registry() -> List[Dict[str, str]]:
+    """从 registry 集合加载知识库定义列表。"""
+    store = _get_knowledge_store()
+    store.switch_collection(KNOWLEDGE_REGISTRY_COLLECTION, create_if_missing=True)
+    payload = store.vector_db.get(include=["metadatas"])
+    metadata_list = payload.get("metadatas") if isinstance(payload, dict) else []
+    rows: List[Dict[str, str]] = []
+    if not isinstance(metadata_list, list):
+        return rows
+    for metadata in metadata_list:
+        if not isinstance(metadata, dict):
+            continue
+        knowledge_base_id = str(metadata.get("knowledge_base_id") or "").strip()
+        collection_name = str(metadata.get("collection_name") or "").strip()
+        name = str(metadata.get("name") or "").strip()
+        if not knowledge_base_id or not collection_name or not name:
+            continue
+        rows.append(
+            {
+                "knowledge_base_id": knowledge_base_id,
+                "name": name,
+                "collection_name": collection_name,
+            }
+        )
+    unique_map: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        unique_map[row["knowledge_base_id"]] = row
+    return list(unique_map.values())
+
+
+def _upsert_knowledge_base_registry(knowledge_base_id: str, name: str, collection_name: str) -> None:
+    """写入或更新知识库 registry 记录。"""
+    store = _get_knowledge_store()
+    store.switch_collection(KNOWLEDGE_REGISTRY_COLLECTION, create_if_missing=True)
+    existing = store.vector_db.get(where={"knowledge_base_id": knowledge_base_id}, include=["ids"])
+    existing_ids = existing.get("ids") if isinstance(existing, dict) else []
+    if isinstance(existing_ids, list) and existing_ids:
+        store.vector_db.delete(ids=existing_ids)
+    store.add_documents(
+        [
+            {
+                "content": f"knowledge_base:{knowledge_base_id}",
+                "metadata": {
+                    "record_type": "knowledge_base",
+                    "knowledge_base_id": knowledge_base_id,
+                    "name": name,
+                    "collection_name": collection_name,
+                },
+            }
+        ]
+    )
+
+
+def _delete_knowledge_base_registry(knowledge_base_id: str) -> None:
+    """删除知识库 registry 记录。"""
+    store = _get_knowledge_store()
+    store.switch_collection(KNOWLEDGE_REGISTRY_COLLECTION, create_if_missing=True)
+    existing = store.vector_db.get(where={"knowledge_base_id": knowledge_base_id}, include=["ids"])
+    existing_ids = existing.get("ids") if isinstance(existing, dict) else []
+    if isinstance(existing_ids, list) and existing_ids:
+        store.vector_db.delete(ids=existing_ids)
+
+
+def _extract_text_from_upload(filename: str, content_bytes: bytes) -> str:
+    """按文件后缀解析上传文档文本，支持 PDF/Markdown/纯文本。"""
+    lower_name = str(filename or "").lower()
+    if lower_name.endswith(".pdf"):
+        reader = PdfReader(BytesIO(content_bytes))
+        page_text_list: List[str] = []
+        for page in reader.pages:
+            page_text_list.append(str(page.extract_text() or ""))
+        return "\n".join(page_text_list).strip()
+    if lower_name.endswith(".md") or lower_name.endswith(".markdown") or lower_name.endswith(".txt"):
+        for encoding in ["utf-8", "utf-8-sig", "gbk"]:
+            try:
+                return content_bytes.decode(encoding).strip()
+            except Exception:
+                continue
+        raise HTTPException(status_code=400, detail="文本文件编码不支持，请使用 UTF-8/GBK")
+    raise HTTPException(status_code=400, detail="仅支持 PDF/Markdown/纯文本文件")
+
+
+def _build_knowledge_context_texts(
+    knowledge_base_id: Optional[str],
+    destination: str,
+    days: int,
+    budget: Optional[str],
+    preference: Optional[str],
+    knowledge_query: Optional[str],
+) -> List[str]:
+    """从指定知识库检索与本次行程相关的上下文片段并转为提示词上下文。"""
+    if not knowledge_base_id:
+        return []
+    store = _get_knowledge_store()
+    collection_name = _to_collection_name(knowledge_base_id)
+    all_collections = set(store.list_collections())
+    if collection_name not in all_collections:
+        raise HTTPException(status_code=404, detail="指定知识库不存在")
+    store.switch_collection(collection_name, create_if_missing=False)
+    query_text = _build_kb_query(destination, days, budget, preference, knowledge_query)
+    related_docs = store.similarity_search(query_text, k=4)
+    context_texts: List[str] = []
+    for doc in related_docs:
+        source = str((doc.metadata or {}).get("source") or "私有知识库")
+        snippet = str(doc.page_content or "").strip()
+        if not snippet:
+            continue
+        context_texts.append(f"私有知识库参考（来源:{source}）：{snippet[:800]}")
+    return context_texts
 
 
 def _ensure_session_id(user_id: str, device_id: str, session_id: Optional[str]) -> str:
@@ -583,7 +776,16 @@ def generate_trip(payload: TripGenerateRequest) -> TripGenerateResponse:
         "preference": payload.preference,
     }
     llm_manager = _get_llm_manager()
-    trip_data = llm_manager.generate_trip(user_input, payload.context_texts or [])
+    kb_context_texts = _build_knowledge_context_texts(
+        payload.knowledge_base_id,
+        payload.destination,
+        payload.days,
+        payload.budget,
+        payload.preference,
+        payload.knowledge_query,
+    )
+    merged_context_texts = list(payload.context_texts or []) + kb_context_texts
+    trip_data = llm_manager.generate_trip(user_input, merged_context_texts)
     if trip_data:
         storage = _get_storage()
         storage.store_trip_data(session_id, trip_data)
@@ -607,6 +809,15 @@ async def stream_trip_generation(
         "preference": payload.preference,
     }
     llm_manager = _get_llm_manager()
+    kb_context_texts = _build_knowledge_context_texts(
+        payload.knowledge_base_id,
+        payload.destination,
+        payload.days,
+        payload.budget,
+        payload.preference,
+        payload.knowledge_query,
+    )
+    merged_context_texts = list(payload.context_texts or []) + kb_context_texts
     await _cleanup_trip_streams()
     async with _trip_streams_lock:
         stream_id = message_id or f"trip-{datetime.now().strftime('%H%M%S%f')}"
@@ -632,7 +843,7 @@ async def stream_trip_generation(
                     session_id,
                     llm_manager,
                     user_input,
-                    payload.context_texts or [],
+                    merged_context_texts,
                 )
             )
     header_sequence = request.headers.get("Last-Event-ID")
@@ -810,6 +1021,81 @@ async def stream_agent_events(
                 await asyncio.sleep(0.5)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/api/knowledge/bases", response_model=KnowledgeBaseListResponse)
+def list_knowledge_bases() -> KnowledgeBaseListResponse:
+    records = _load_knowledge_base_registry()
+    items = [KnowledgeBaseItem(**row) for row in records]
+    return KnowledgeBaseListResponse(items=items)
+
+
+@app.post("/api/knowledge/bases", response_model=KnowledgeBaseCreateResponse)
+def create_knowledge_base(payload: KnowledgeBaseCreateRequest) -> KnowledgeBaseCreateResponse:
+    normalized_id = _normalize_knowledge_base_id(payload.name)
+    collection_name = _to_collection_name(normalized_id)
+    store = _get_knowledge_store()
+    store.create_collection(collection_name)
+    _upsert_knowledge_base_registry(
+        knowledge_base_id=normalized_id,
+        name=str(payload.name).strip(),
+        collection_name=collection_name,
+    )
+    return KnowledgeBaseCreateResponse(
+        knowledge_base_id=normalized_id,
+        name=str(payload.name).strip(),
+        collection_name=collection_name,
+    )
+
+
+@app.delete("/api/knowledge/bases/{knowledge_base_id}", response_model=KnowledgeBaseDeleteResponse)
+def delete_knowledge_base(knowledge_base_id: str) -> KnowledgeBaseDeleteResponse:
+    normalized_id = _normalize_knowledge_base_id(knowledge_base_id)
+    collection_name = _to_collection_name(normalized_id)
+    store = _get_knowledge_store()
+    existing = set(store.list_collections())
+    if collection_name not in existing:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    delete_success = store.delete_collection(collection_name)
+    if not delete_success:
+        raise HTTPException(status_code=500, detail="知识库删除失败")
+    _delete_knowledge_base_registry(normalized_id)
+    return KnowledgeBaseDeleteResponse(knowledge_base_id=normalized_id, success=True)
+
+
+@app.post("/api/knowledge/bases/{knowledge_base_id}/upload", response_model=KnowledgeUploadResponse)
+async def upload_knowledge_document(knowledge_base_id: str, file: UploadFile = File(...)) -> KnowledgeUploadResponse:
+    normalized_id = _normalize_knowledge_base_id(knowledge_base_id)
+    collection_name = _to_collection_name(normalized_id)
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="文件内容不能为空")
+    extracted_text = _extract_text_from_upload(file.filename, file_bytes)
+    if not extracted_text:
+        raise HTTPException(status_code=400, detail="文档中未提取到可用文本")
+    store = _get_knowledge_store()
+    existing = set(store.list_collections())
+    if collection_name not in existing:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    store.switch_collection(collection_name, create_if_missing=False)
+    added_chunks = store.add_documents(
+        [
+            {
+                "content": extracted_text,
+                "metadata": {
+                    "source": str(file.filename),
+                    "knowledge_base_id": normalized_id,
+                    "uploaded_at": datetime.now().isoformat(),
+                    "file_type": str(file.content_type or ""),
+                },
+            }
+        ]
+    )
+    if added_chunks <= 0:
+        raise HTTPException(status_code=500, detail="文档入库失败")
+    return KnowledgeUploadResponse(knowledge_base_id=normalized_id, filename=str(file.filename), chunks=added_chunks)
 
 
 @app.post("/api/knowledge/search", response_model=KnowledgeSearchResponse)

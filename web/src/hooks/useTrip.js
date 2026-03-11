@@ -16,6 +16,8 @@ import { normalizeTripDays } from "../utils/tripUtils.js";
 
 export function useTrip({
   activeSessionId,
+  knowledgeGenerateQuery,
+  selectedKnowledgeBaseId,
   refreshSessions,
   setActiveSessionId,
 }) {
@@ -94,6 +96,10 @@ export function useTrip({
           preference: values.preference || "",
           // 上下文文本
           context_texts: [],
+          // 知识库 ID
+          knowledge_base_id: selectedKnowledgeBaseId || null,
+          // 知识库检索查询
+          knowledge_query: knowledgeGenerateQuery || "",
         };
         // 解构流式回调
         const {
@@ -214,7 +220,13 @@ export function useTrip({
         setLoadingTrip(false);
       }
     },
-    [activeSessionId, refreshSessions, setActiveSessionId],
+    [
+      activeSessionId,
+      knowledgeGenerateQuery,
+      refreshSessions,
+      selectedKnowledgeBaseId,
+      setActiveSessionId,
+    ],
   );
 
   return {

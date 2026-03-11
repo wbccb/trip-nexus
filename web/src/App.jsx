@@ -111,6 +111,23 @@ export default function App() {
     startNewSession,
   } = useSessions()
   const {
+    handleCreateKnowledgeBase,
+    handleDeleteKnowledgeBase,
+    handleKnowledgeSearch,
+    handleUploadKnowledgeDocument,
+    knowledgeBases,
+    knowledgeGenerateQuery,
+    knowledgeQuery,
+    knowledgeResult,
+    loadingKnowledge,
+    loadingKnowledgeBases,
+    selectedKnowledgeBaseId,
+    setKnowledgeGenerateQuery,
+    setKnowledgeQuery,
+    setSelectedKnowledgeBaseId,
+    uploadingKnowledge,
+  } = useKnowledge()
+  const {
     handleTripSubmit,
     handleReplanDay,
     loadingTrip,
@@ -120,16 +137,11 @@ export default function App() {
     updateTripResult,
   } = useTrip({
     activeSessionId,
+    knowledgeGenerateQuery,
     refreshSessions: loadSessions,
+    selectedKnowledgeBaseId,
     setActiveSessionId,
   })
-  const {
-    handleKnowledgeSearch,
-    knowledgeQuery,
-    knowledgeResult,
-    loadingKnowledge,
-    setKnowledgeQuery,
-  } = useKnowledge()
   const [chatMessages, setChatMessages] = useState([])
   const [chatInput, setChatInput] = useState("")
   const [loadingChatHistory, setLoadingChatHistory] = useState(false)
@@ -1059,11 +1071,21 @@ export default function App() {
                   label: "旅行灵感",
                   children: (
                     <KnowledgeTab
+                      knowledgeBases={knowledgeBases}
+                      knowledgeGenerateQuery={knowledgeGenerateQuery}
                       knowledgeQuery={knowledgeQuery}
                       knowledgeResult={knowledgeResult}
                       loadingKnowledge={loadingKnowledge}
+                      loadingKnowledgeBases={loadingKnowledgeBases}
+                      onCreateKnowledgeBase={handleCreateKnowledgeBase}
+                      onDeleteKnowledgeBase={handleDeleteKnowledgeBase}
+                      onSelectKnowledgeBase={setSelectedKnowledgeBaseId}
+                      onUploadKnowledgeDocument={handleUploadKnowledgeDocument}
+                      onChangeGenerateQuery={setKnowledgeGenerateQuery}
                       onChangeQuery={setKnowledgeQuery}
                       onSearch={handleKnowledgeSearch}
+                      selectedKnowledgeBaseId={selectedKnowledgeBaseId}
+                      uploadingKnowledge={uploadingKnowledge}
                     />
                   ),
                 },

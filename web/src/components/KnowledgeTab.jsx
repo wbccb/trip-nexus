@@ -1,14 +1,25 @@
 import React, { useEffect, useMemo, useState } from "react"
-import { Button, Card, Checkbox, Divider, Input, InputNumber, List, Space, Spin, Tabs, Tag, Typography } from "antd"
+import { Button, Card, Checkbox, Divider, Input, InputNumber, List, Popconfirm, Select, Space, Spin, Tabs, Tag, Typography, Upload } from "antd"
 import { generateKnowledgeAnswer } from "../api/index.js"
 
 export default function KnowledgeTab({
+  knowledgeBases,
+  knowledgeGenerateQuery,
   knowledgeQuery,
   knowledgeResult,
   loadingKnowledge,
+  loadingKnowledgeBases,
+  onChangeGenerateQuery,
   onChangeQuery,
+  onCreateKnowledgeBase,
+  onDeleteKnowledgeBase,
   onSearch,
+  onSelectKnowledgeBase,
+  onUploadKnowledgeDocument,
+  selectedKnowledgeBaseId,
+  uploadingKnowledge,
 }) {
+  const [knowledgeBaseName, setKnowledgeBaseName] = useState("")
   const [filterKeyword, setFilterKeyword] = useState("")
   const [minConfidence, setMinConfidence] = useState(0)
   const [onlySelected, setOnlySelected] = useState(false)
@@ -16,6 +27,12 @@ export default function KnowledgeTab({
   const [answer, setAnswer] = useState("")
   const [loadingAnswer, setLoadingAnswer] = useState(false)
   const evidence = knowledgeResult?.evidence || {}
+  const knowledgeBaseOptions = Array.isArray(knowledgeBases)
+    ? knowledgeBases.map((item) => ({
+        label: `${item.name} (${item.knowledge_base_id})`,
+        value: item.knowledge_base_id,
+      }))
+    : []
 
   const buildEvidenceId = (section, item, index) => {
     const source = item?.source || ""
@@ -110,6 +127,16 @@ export default function KnowledgeTab({
     }
   }
 
+  const handleCreateKnowledgeBase = async () => {
+    if (!onCreateKnowledgeBase) {
+      return
+    }
+    const result = await onCreateKnowledgeBase(knowledgeBaseName)
+    if (result?.knowledge_base_id) {
+      setKnowledgeBaseName("")
+    }
+  }
+
   const renderEvidenceList = (entries) => {
     const filteredEntries = filterEntries(entries)
     return (
@@ -161,6 +188,57 @@ export default function KnowledgeTab({
     <div className="knowledge-layout">
       <Card title="旅行灵感检索" className="panel-card">
         <Space direction="vertical" className="full-width">
+          <Card size="small" title="知识库管理" className="evidence-card">
+            <Space direction="vertical" className="full-width" size="small">
+              <Space.Compact className="full-width">
+                <Input
+                  placeholder="新知识库名称"
+                  value={knowledgeBaseName}
+                  onChange={(event) => setKnowledgeBaseName(event.target.value)}
+                />
+                <Button onClick={handleCreateKnowledgeBase}>创建</Button>
+              </Space.Compact>
+              <Space size="small" wrap>
+                <Select
+                  className="knowledge-base-select"
+                  placeholder="选择知识库"
+                  value={selectedKnowledgeBaseId || undefined}
+                  options={knowledgeBaseOptions}
+                  loading={loadingKnowledgeBases}
+                  onChange={(value) => onSelectKnowledgeBase && onSelectKnowledgeBase(value)}
+                />
+                <Popconfirm
+                  title="确认删除当前知识库？"
+                  onConfirm={() => onDeleteKnowledgeBase && onDeleteKnowledgeBase(selectedKnowledgeBaseId)}
+                  okText="删除"
+                  cancelText="取消"
+                >
+                  <Button danger disabled={!selectedKnowledgeBaseId}>
+                    删除
+                  </Button>
+                </Popconfirm>
+              </Space>
+              <Upload
+                showUploadList={false}
+                beforeUpload={(file) => {
+                  if (onUploadKnowledgeDocument) {
+                    onUploadKnowledgeDocument(file)
+                  }
+                  return false
+                }}
+                disabled={!selectedKnowledgeBaseId || uploadingKnowledge}
+              >
+                <Button loading={uploadingKnowledge} disabled={!selectedKnowledgeBaseId}>
+                  上传 PDF/Markdown/文本
+                </Button>
+              </Upload>
+            </Space>
+          </Card>
+          <Input
+            placeholder="行程生成时的知识库检索条件（可选）"
+            value={knowledgeGenerateQuery}
+            onChange={(event) => onChangeGenerateQuery && onChangeGenerateQuery(event.target.value)}
+          />
           <Input
             placeholder="输入要检索的问题或主题"
             value={knowledgeQuery}

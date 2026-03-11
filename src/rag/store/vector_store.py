@@ -1,12 +1,12 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from chromadb import PersistentClient
 from src.config import Config
 from src.rag.module.intent_recognition import _get_sentence_transformer
 import logging
-import shutil
-import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,8 @@ class VectorStore:
         self.config = Config()
         self.embeddings = _SentenceTransformerEmbeddings(self.config.SENTENCE_BERT_MODEL)
         self.persist_directory = self.config.CHROMA_DB_PATH
-        self.collection_name = collection_name
+        self.collection_name = self._normalize_collection_name(collection_name)
+        self.client = None
         self.vector_db = None
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config.RAG_CHUNK_SIZE,
@@ -36,11 +37,22 @@ class VectorStore:
         )
         self._init_db()
 
+    def _normalize_collection_name(self, collection_name: str) -> str:
+        """规范化集合名，确保可持久化且命名安全。"""
+        raw_value = str(collection_name or "").strip().lower()
+        if not raw_value:
+            raw_value = "default"
+        normalized = re.sub(r"[^a-z0-9_\-]", "_", raw_value)
+        return normalized[:63] or "default"
+
     def _init_db(self):
         """初始化向量数据库"""
         try:
+            self.client = PersistentClient(path=self.persist_directory)
+            self.client.get_or_create_collection(name=self.collection_name)
             self.vector_db = Chroma(
                 collection_name=self.collection_name,
+                client=self.client,
                 embedding_function=self.embeddings,
                 persist_directory=self.persist_directory
             )
@@ -48,13 +60,54 @@ class VectorStore:
             logger.error(f"Failed to initialize ChromaDB: {e}")
             raise
 
-    def add_documents(self, documents: List[Dict[str, Any]]) -> None:
+    def switch_collection(self, collection_name: str, create_if_missing: bool = True) -> None:
+        """切换当前集合，用于多知识库并行管理。"""
+        next_collection_name = self._normalize_collection_name(collection_name)
+        if create_if_missing:
+            self.client.get_or_create_collection(name=next_collection_name)
+        self.collection_name = next_collection_name
+        self.vector_db = Chroma(
+            collection_name=self.collection_name,
+            client=self.client,
+            embedding_function=self.embeddings,
+            persist_directory=self.persist_directory
+        )
+
+    def create_collection(self, collection_name: str) -> str:
+        """创建集合并返回规范化后的集合名。"""
+        normalized_name = self._normalize_collection_name(collection_name)
+        self.client.get_or_create_collection(name=normalized_name)
+        return normalized_name
+
+    def list_collections(self) -> List[str]:
+        """列出当前持久化目录下的全部集合名。"""
+        try:
+            collections = self.client.list_collections()
+            return [str(item.name) for item in collections]
+        except Exception as e:
+            logger.error(f"Error listing collections: {e}")
+            return []
+
+    def delete_collection(self, collection_name: str) -> bool:
+        """删除指定集合，删除成功返回 True。"""
+        normalized_name = self._normalize_collection_name(collection_name)
+        try:
+            self.client.delete_collection(name=normalized_name)
+            if normalized_name == self.collection_name:
+                fallback_collection = "web_search_cache"
+                self.switch_collection(fallback_collection, create_if_missing=True)
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting collection {normalized_name}: {e}")
+            return False
+
+    def add_documents(self, documents: List[Dict[str, Any]]) -> int:
         """
         添加文档到向量数据库
         documents: List of dict with 'content' and 'metadata'
         """
         if not documents:
-            return
+            return 0
 
         docs_to_add = []
         for doc in documents:
@@ -69,8 +122,10 @@ class VectorStore:
             try:
                 self.vector_db.add_documents(docs_to_add)
                 logger.info(f"Added {len(docs_to_add)} chunks to vector store")
+                return len(docs_to_add)
             except Exception as e:
                 logger.error(f"Error adding documents to vector store: {e}")
+        return 0
 
     def similarity_search(self, query: str, k: int = 5) -> List[Document]:
         """
