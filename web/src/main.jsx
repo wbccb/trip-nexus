@@ -13,9 +13,7 @@ const root = ReactDOM.createRoot(rootElement)
 
 // 渲染应用
 root.render(
-  <React.StrictMode>
-    <ConfigProvider>
-      <App />
-    </ConfigProvider>
-  </React.StrictMode>
+  <ConfigProvider>
+    <App />
+  </ConfigProvider>
 )

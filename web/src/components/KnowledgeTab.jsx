@@ -2,6 +2,17 @@ import React, { useEffect, useMemo, useState } from "react"
 import { Button, Card, Checkbox, Divider, Input, InputNumber, List, Popconfirm, Select, Space, Spin, Tabs, Tag, Typography, Upload } from "antd"
 import { generateKnowledgeAnswer } from "../api/index.js"
 
+const EMPTY_EVIDENCE = {}
+
+function isSelectedMapEqual(prevMap, nextMap) {
+  const prevKeys = Object.keys(prevMap || {})
+  const nextKeys = Object.keys(nextMap || {})
+  if (prevKeys.length !== nextKeys.length) {
+    return false
+  }
+  return prevKeys.every((key) => Boolean(prevMap[key]) === Boolean(nextMap[key]))
+}
+
 export default function KnowledgeTab({
   knowledgeBases,
   knowledgeGenerateQuery,
@@ -26,7 +37,7 @@ export default function KnowledgeTab({
   const [selectedMap, setSelectedMap] = useState({})
   const [answer, setAnswer] = useState("")
   const [loadingAnswer, setLoadingAnswer] = useState(false)
-  const evidence = knowledgeResult?.evidence || {}
+  const evidence = useMemo(() => knowledgeResult?.evidence || EMPTY_EVIDENCE, [knowledgeResult?.evidence])
   const knowledgeBaseOptions = Array.isArray(knowledgeBases)
     ? knowledgeBases.map((item) => ({
         label: `${item.name} (${item.knowledge_base_id})`,
@@ -59,8 +70,8 @@ export default function KnowledgeTab({
 
   useEffect(() => {
     if (!knowledgeResult) {
-      setSelectedMap({})
-      setAnswer("")
+      setSelectedMap((prev) => (Object.keys(prev).length ? {} : prev))
+      setAnswer((prev) => (prev ? "" : prev))
       return
     }
     const nextSelected = {}
@@ -68,8 +79,11 @@ export default function KnowledgeTab({
     allEntries.forEach((entry) => {
       nextSelected[entry._id] = true
     })
-    setSelectedMap(nextSelected)
-    setAnswer(knowledgeResult.answer || "")
+    setSelectedMap((prev) => (isSelectedMapEqual(prev, nextSelected) ? prev : nextSelected))
+    setAnswer((prev) => {
+      const nextAnswer = knowledgeResult.answer || ""
+      return prev === nextAnswer ? prev : nextAnswer
+    })
   }, [knowledgeResult, summaryEntries, bodyEntries])
 
   const filterEntries = (entries) => {

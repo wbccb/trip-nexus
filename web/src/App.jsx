@@ -1242,7 +1242,6 @@ export default function App() {
                             onViewStateChange={(event) => setMapViewState(event.viewState)}
                           >
                             <Map
-                              reuseMaps
                               mapStyle="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
                             />
                           </DeckGL>
@@ -1279,7 +1278,6 @@ export default function App() {
                     onViewStateChange={(event) => setMapViewState(event.viewState)}
                   >
                     <Map
-                      reuseMaps
                       mapStyle="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
                     />
                   </DeckGL>
