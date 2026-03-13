@@ -11,6 +11,28 @@ from datetime import datetime as _dt
 def _ts() -> str:
     return _dt.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
+def _strip_think_content(text: Any) -> str:
+    if text is None:
+        return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", str(text), flags=re.DOTALL)
+    cleaned = re.sub(r"</?think>", "", cleaned)
+    return cleaned.strip()
+
+
+def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
+    if text is None:
+        return ""
+    text_value = str(text)
+    if len(text_value) <= head + tail + 5:
+        return text_value
+    return f"{text_value[:head]}....{text_value[-tail:]}"
+
+
+def _log_llm_output(tag: str, cleaned_text: str) -> None:
+    preview = _format_log_text(cleaned_text)
+    print(f"[{_ts()}][ConversationManager] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
+
 """
 会话管理：
 1. 提取实体
@@ -91,90 +113,69 @@ class ConversationManager:
         4. 只有当新消息明确提到新偏好时，才更新 preferences。
         """
 
-        try:
-            # 3. 调用 LLM，启用 JSON Mode
-            start_ts = _dt.now()
-            print(
-                f"[{_ts()}][ConversationManager] 抽取实体=> LLM 调用开始, "
-                f"message_len={len(new_message)}, existing_entities_present={bool(existing_entities)}"
-            )
-            raw_response = self.llm_manager.get_analysis_llm().invoke(prompt)
-            if hasattr(raw_response, "content"):
-                response_text = raw_response.content
+        start_ts = _dt.now()
+        print(
+            f"[{_ts()}][ConversationManager] 抽取实体=> LLM 调用开始, "
+            f"message_len={len(new_message)}, existing_entities_present={bool(existing_entities)}"
+        )
+        raw_response = self.llm_manager.get_analysis_llm().invoke(prompt)
+        if hasattr(raw_response, "content"):
+            response_text = raw_response.content
+        else:
+            response_text = raw_response
+        cost = (_dt.now() - start_ts).total_seconds()
+        cleaned_response_text = _strip_think_content(response_text)
+        _log_llm_output("extract_entities_response", cleaned_response_text)
+        print(f"[{_ts()}][ConversationManager] 抽取实体=> LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response_text))}")
+
+        clean_response = self.llm_manager.extract_json_from_string(cleaned_response_text)
+        if not clean_response.startswith("{"):
+            json_match = re.search(r'\{.*\}', clean_response, re.DOTALL)
+            if json_match:
+                clean_response = json_match.group(0)
             else:
-                response_text = raw_response
-            cost = (_dt.now() - start_ts).total_seconds()
-            print(f"[{_ts()}][ConversationManager] 抽取实体=> LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response_text))}")
+                print(f"[{_ts()}][ConversationManager] 抽取实体 未找到可解析 JSON，跳过更新")
+                return existing_entities
 
-            # 4. 解析 LLM 返回的 JSON
-            # 考虑到某些 LLM 可能会返回带有 Markdown 标签的字符串，进行简单清洗
-            clean_response = self.llm_manager.extract_json_from_string(response_text)
-            # 处理可能的非JSON响应
-            if not clean_response.startswith('{'):
-                # 尝试从文本中提取JSON
-                json_match = re.search(r'\{.*\}', clean_response, re.DOTALL)
-                if json_match:
-                    clean_response = json_match.group(0)
-                else:
-                    print(f"[{_ts()}][ConversationManager] 抽取实体 未找到可解析 JSON，跳过更新")
-                    return existing_entities
+        extracted_data = json.loads(clean_response)
 
-            extracted_data = json.loads(clean_response)
+        print(f"[{_ts()}][ConversationManager] 抽取实体=> 解析完成，keys={list(extracted_data.keys())}")
 
-            print(f"[{_ts()}][ConversationManager] 抽取实体=> 解析完成，keys={list(extracted_data.keys())}")
+        updated_entities = existing_entities.model_copy(deep=True)
 
-            # 5. 增量更新逻辑
-            # 使用 model_copy 进行浅拷贝，避免修改原始对象
-            updated_entities = existing_entities.model_copy(deep=True)
+        if extracted_data.get("destination"):
+            updated_entities.destination = extracted_data["destination"]
 
-            # 遍历提取到的字段，仅当不为 None 时更新
-            if extracted_data.get("destination"):
-                updated_entities.destination = extracted_data["destination"]
+        if extracted_data.get("budget") is not None:
+            updated_entities.budget = extracted_data["budget"]
 
-            if extracted_data.get("budget") is not None:
-                updated_entities.budget = extracted_data["budget"]
-
-            if extracted_data.get("travel_dates"):
-                # 过滤掉 None 值，确保只有有效的时间字符串
-                valid_dates_str = [d for d in extracted_data["travel_dates"] if d]
-                valid_dates_obj = []
-                for d_str in valid_dates_str:
+        if extracted_data.get("travel_dates"):
+            valid_dates_str = [d for d in extracted_data["travel_dates"] if d]
+            valid_dates_obj = []
+            for d_str in valid_dates_str:
+                try:
+                    if isinstance(d_str, str):
+                        dt = datetime.strptime(d_str, "%Y-%m-%d")
+                        valid_dates_obj.append(dt)
+                    elif isinstance(d_str, datetime):
+                        valid_dates_obj.append(d_str)
+                except ValueError:
                     try:
-                        # 尝试解析 YYYY-MM-DD
-                        if isinstance(d_str, str):
-                            dt = datetime.strptime(d_str, "%Y-%m-%d")
-                            valid_dates_obj.append(dt)
-                        elif isinstance(d_str, datetime):
-                            valid_dates_obj.append(d_str)
+                        dt = datetime.fromisoformat(d_str)
+                        valid_dates_obj.append(dt)
                     except ValueError:
-                         try:
-                             # 尝试 ISO 格式作为备选
-                             dt = datetime.fromisoformat(d_str)
-                             valid_dates_obj.append(dt)
-                         except ValueError:
-                            print(f"[{_ts()}][ConversationManager] 日期格式无法解析: {d_str}")
-                
-                if valid_dates_obj:
-                    updated_entities.travel_dates = valid_dates_obj
+                        print(f"[{_ts()}][ConversationManager] 日期格式无法解析: {d_str}")
+            
+            if valid_dates_obj:
+                updated_entities.travel_dates = valid_dates_obj
 
-            # 偏好设置采用增量合并（Update）而非直接覆盖
-            if extracted_data.get("preferences"):
-                if updated_entities.preferences is None:
-                    updated_entities.preferences = {}
-                updated_entities.preferences.update(extracted_data["preferences"])
+        if extracted_data.get("preferences"):
+            if updated_entities.preferences is None:
+                updated_entities.preferences = {}
+            updated_entities.preferences.update(extracted_data["preferences"])
 
-            updated_entities.last_updated = datetime.now()
-            return updated_entities
-
-        except json.JSONDecodeError as e:
-            print(f"[{_ts()}][ConversationManager] LLM 返回格式非法: {e} | ResponseLen: {len(str(response_text))}")
-            return existing_entities
-        except ValidationError as e:
-            print(f"[{_ts()}][ConversationManager] 实体校验失败 (Pydantic): {e}")
-            return existing_entities
-        except Exception as e:
-            print(f"[{_ts()}][ConversationManager] 提取过程发生未知错误: {e}")
-            return existing_entities
+        updated_entities.last_updated = datetime.now()
+        return updated_entities
 
     def generate_summary(self, messages: List[Message], existing_summary: str = "") -> str:
         """生成对话摘要"""
@@ -200,24 +201,19 @@ class ConversationManager:
         4. 用中文输出
         """
 
-        try:
-            # 使用 invoke 方法替代不存在的 generate 方法
-            start_ts = _dt.now()
-            print(f"[{_ts()}][ConversationManager] 概要生成 LLM 调用开始, message_count={len(messages)}")
-            raw_response = self.llm_manager.get_analysis_llm().invoke(prompt)
-            if hasattr(raw_response, "content"):
-                response = raw_response.content
-            else:
-                response = raw_response
-            cost = (_dt.now() - start_ts).total_seconds()
-            print(f"[{_ts()}][ConversationManager] 概要生成 LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response))}")
-            
-            # 清理 <think> 标签及其内容
-            clean_response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-            return clean_response
-        except Exception as e:
-            print(f"[{_ts()}][ConversationManager] 摘要生成失败: {e}")
-            return existing_summary
+        start_ts = _dt.now()
+        print(f"[{_ts()}][ConversationManager] 概要生成 LLM 调用开始, message_count={len(messages)}")
+        raw_response = self.llm_manager.get_analysis_llm().invoke(prompt)
+        if hasattr(raw_response, "content"):
+            response = raw_response.content
+        else:
+            response = raw_response
+        cost = (_dt.now() - start_ts).total_seconds()
+        cleaned_response = _strip_think_content(response)
+        _log_llm_output("summary_response", cleaned_response)
+        print(f"[{_ts()}][ConversationManager] 概要生成 LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response))}")
+        
+        return cleaned_response
 
     def compress_early_messages(self, context: SessionContext) -> str:
         """压缩早期对话内容"""

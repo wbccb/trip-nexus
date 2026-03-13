@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any, Dict, Iterable, List
+import re
 
 
 def _ts() -> str:
@@ -10,6 +11,28 @@ def _ts() -> str:
     - 形如 "YYYY-MM-DD HH:MM:SS" 的时间字符串。
     """
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _strip_think_content(text: Any) -> str:
+    if text is None:
+        return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", str(text), flags=re.DOTALL)
+    cleaned = re.sub(r"</?think>", "", cleaned)
+    return cleaned.strip()
+
+
+def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
+    if text is None:
+        return ""
+    text_value = str(text)
+    if len(text_value) <= head + tail + 5:
+        return text_value
+    return f"{text_value[:head]}....{text_value[-tail:]}"
+
+
+def _log_llm_output(tag: str, cleaned_text: str) -> None:
+    preview = _format_log_text(cleaned_text)
+    print(f"[{_ts()}][LlmStreamingAdapter] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
 
 
 class LlmStreamingAdapter:
@@ -156,12 +179,12 @@ class LlmStreamingAdapter:
 
     def stream_llm_text(self, llm: Any, prompt: str) -> Iterable[str]:
         """
-        调用模型的流式接口并输出增量文本，失败时自动降级为单次调用。
+        调用模型的流式接口并输出增量文本。
 
         处理流程：
         1. 优先检查模型是否具备 stream 接口；
         2. 若支持 stream，则逐 chunk 调用 extract_stream_delta 并 yield；
-        3. 发生异常时打印日志并降级为 invoke，一次性返回完整文本。
+        3. 若不支持 stream，则改用 invoke 一次性返回完整文本。
 
         参数说明：
         - llm: 已初始化的模型实例；
@@ -170,21 +193,57 @@ class LlmStreamingAdapter:
         返回：
         - 增量文本片段迭代器。
         """
-        try:
-            if hasattr(llm, "stream"):
-                for chunk in llm.stream(prompt):
-                    delta = self.extract_stream_delta(chunk)
-                    if delta:
-                        yield delta
-                return
-        except Exception as exc:
-            print(f"[{_ts()}][LlmStreamingAdapter] stream_llm_text 流式调用失败，降级为 invoke: {exc}")
+        if hasattr(llm, "stream"):
+            in_think = False
+            carry = ""
+            cleaned_parts: List[str] = []
+
+            def _process_buffer(buffer_text: str) -> tuple[str, str, bool]:
+                nonlocal in_think
+                output = ""
+                while buffer_text:
+                    if in_think:
+                        end_idx = buffer_text.find("</think>")
+                        if end_idx == -1:
+                            keep = buffer_text[-8:] if len(buffer_text) > 8 else buffer_text
+                            return output, keep, in_think
+                        buffer_text = buffer_text[end_idx + 8:]
+                        in_think = False
+                        continue
+                    start_idx = buffer_text.find("<think>")
+                    if start_idx == -1:
+                        if len(buffer_text) <= 7:
+                            return output, buffer_text, in_think
+                        output += buffer_text[:-7]
+                        return output, buffer_text[-7:], in_think
+                    output += buffer_text[:start_idx]
+                    buffer_text = buffer_text[start_idx + 7:]
+                    in_think = True
+                return output, "", in_think
+
+            for chunk in llm.stream(prompt):
+                delta = self.extract_stream_delta(chunk)
+                if not delta:
+                    continue
+                buffer_text = carry + delta
+                output_text, carry, in_think = _process_buffer(buffer_text)
+                if output_text:
+                    cleaned_parts.append(output_text)
+                    yield output_text
+
+            if not in_think and carry:
+                cleaned_parts.append(carry)
+                yield carry
+            cleaned_text = "".join(cleaned_parts)
+            _log_llm_output("stream_response", cleaned_text)
+            return
 
         raw_response = llm.invoke(prompt)
         if hasattr(raw_response, "content"):
             response_text = raw_response.content
         else:
             response_text = raw_response
-        if response_text:
-            yield str(response_text)
-
+        cleaned_text = _strip_think_content(response_text)
+        _log_llm_output("invoke_response", cleaned_text)
+        if cleaned_text:
+            yield str(cleaned_text)

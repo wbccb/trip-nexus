@@ -14,6 +14,28 @@ import re
 
 logger = logging.getLogger(__name__)
 
+
+def _strip_think_content(text: Any) -> str:
+    if text is None:
+        return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", str(text), flags=re.DOTALL)
+    cleaned = re.sub(r"</?think>", "", cleaned)
+    return cleaned.strip()
+
+
+def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
+    if text is None:
+        return ""
+    text_value = str(text)
+    if len(text_value) <= head + tail + 5:
+        return text_value
+    return f"{text_value[:head]}....{text_value[-tail:]}"
+
+
+def _log_llm_output(tag: str, cleaned_text: str) -> None:
+    preview = _format_log_text(cleaned_text)
+    print(f"【RAG】{tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
+
 class AIRetrievalPipeline:
     def __init__(self, llm):
         self.config = Config()
@@ -117,7 +139,7 @@ class AIRetrievalPipeline:
 
     def _summarize_text(self, text: str, max_chars: int) -> str:
         """
-        对超长正文进行压缩摘要，失败时回退为硬截断，确保不超 Evidence Budget。
+        对超长正文进行压缩摘要，空结果时回退为硬截断，确保不超 Evidence Budget。
         """
         if not text:
             return ""
@@ -138,14 +160,13 @@ class AIRetrievalPipeline:
             input_variables=["content", "max_chars"]
         )
         chain = prompt | self.llm
-        try:
-            response = chain.invoke({"content": text, "max_chars": max_chars})
-            summary = response.content if hasattr(response, "content") else response
-            summary = str(summary).strip()
-            if summary:
-                return summary[:max_chars]
-        except Exception as e:
-            logger.warning(f"Summary failed: {e}")
+        response = chain.invoke({"content": text, "max_chars": max_chars})
+        summary_raw = response.content if hasattr(response, "content") else response
+        summary = _strip_think_content(summary_raw)
+        _log_llm_output("summarize_response", summary)
+        summary = str(summary).strip()
+        if summary:
+            return summary[:max_chars]
         return self._truncate_text(text, max_chars)
 
     def _build_summary_section(self, filtered_results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -491,7 +512,11 @@ class AIRetrievalPipeline:
         无需搜索直接回答
         """
         # 简单透传给LLM，或者使用特定的Prompt
-        return self.llm.invoke(query)
+        raw_response = self.llm.invoke(query)
+        response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
+        cleaned_text = _strip_think_content(response_text)
+        _log_llm_output("direct_answer_response", cleaned_text)
+        return cleaned_text
 
     def _generate_rag_answer(self, query: str, context: str) -> str:
         """
@@ -517,4 +542,8 @@ class AIRetrievalPipeline:
 
 
         chain = prompt | self.llm
-        return chain.invoke({"context": context, "query": query})
+        raw_response = chain.invoke({"context": context, "query": query})
+        response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
+        cleaned_text = _strip_think_content(response_text)
+        _log_llm_output("rag_answer_response", cleaned_text)
+        return cleaned_text

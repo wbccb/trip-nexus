@@ -51,6 +51,28 @@ def _ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _strip_think_content(text: Any) -> str:
+    if text is None:
+        return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", str(text), flags=re.DOTALL)
+    cleaned = re.sub(r"</?think>", "", cleaned)
+    return cleaned.strip()
+
+
+def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
+    if text is None:
+        return ""
+    text_value = str(text)
+    if len(text_value) <= head + tail + 5:
+        return text_value
+    return f"{text_value[:head]}....{text_value[-tail:]}"
+
+
+def _log_llm_output(tag: str, cleaned_text: str) -> None:
+    preview = _format_log_text(cleaned_text)
+    print(f"[{_ts()}][LlmManager] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
+
+
 class LlmManager:
     # 默认使用本地安装的 Ollama deepseek-r1:7b
     def __init__(
@@ -246,6 +268,9 @@ class LlmManager:
         bound_llm = self.analysis_llm.bind_tools(tools)
         print("准备触发大模型调用: functionCall获取当前需要使用的工具名")
         response = bound_llm.invoke(prompt)
+        response_text = response.content if hasattr(response, "content") else response
+        cleaned_response_text = _strip_think_content(response_text)
+        _log_llm_output("function_call_response", cleaned_response_text)
         print(f"[LLMManager] functionCall获取当前需要使用的工具名，!!!LLM触发 => 得到大模型原始响应: {response}")
 
         # 兼容不同模型返回结构，优先读取 tool_calls
@@ -392,30 +417,18 @@ class LlmManager:
 
         def _stream_wrapper() -> Iterable[str]:
             nonlocal output_chars
-            try:
-                for delta in self._streaming_adapter.stream_llm_text(llm, prompt):
-                    output_chars += len(str(delta))
-                    yield delta
-                elapsed_ms = int((datetime.now() - start_ts).total_seconds() * 1000)
-                self._metrics.record(
-                    "llm_stream_end",
-                    {"role": llm_role, "elapsed_ms": elapsed_ms, "output_len": output_chars},
-                )
-                print(
-                    f"[{_ts()}][LlmManager] llm_http_request_end stage={stage} role={llm_role} "
-                    f"elapsed_ms={elapsed_ms} output_len={output_chars} request_id={request_id}"
-                )
-            except Exception as exc:
-                error_payload = normalize_exception(
-                    exc,
-                    code=ErrorCodes.LLM_FAILED,
-                    source="llm_stream",
-                )
-                self._metrics.record(
-                    "llm_stream_error",
-                    {"role": llm_role, "error": error_payload},
-                )
-                raise
+            for delta in self._streaming_adapter.stream_llm_text(llm, prompt):
+                output_chars += len(str(delta))
+                yield delta
+            elapsed_ms = int((datetime.now() - start_ts).total_seconds() * 1000)
+            self._metrics.record(
+                "llm_stream_end",
+                {"role": llm_role, "elapsed_ms": elapsed_ms, "output_len": output_chars},
+            )
+            print(
+                f"[{_ts()}][LlmManager] llm_http_request_end stage={stage} role={llm_role} "
+                f"elapsed_ms={elapsed_ms} output_len={output_chars} request_id={request_id}"
+            )
 
         return _stream_wrapper()
 
@@ -684,8 +697,10 @@ class LlmManager:
 """
         raw_response = self.analysis_llm.invoke(prompt)
         response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
+        cleaned_response_text = _strip_think_content(response_text)
+        _log_llm_output("tool_decision_response", cleaned_response_text)
         # 解析失败时降级为“不调用工具”，确保流程可继续
-        clean_response = self.extract_json_from_string(response_text)
+        clean_response = self.extract_json_from_string(cleaned_response_text)
         try:
             data = json.loads(clean_response)
         except Exception:
@@ -1064,75 +1079,47 @@ class LlmManager:
 
     def _execute_trip_generation(self, prompt: str) -> Optional[Dict[str, Any]]:
         """执行行程生成的通用循环逻辑（重试、解析、指标记录）"""
-        for attempt in range(2):
-            try:
-                # 记录本次行程生成尝试的开始指标
-                self._metrics.record(
-                    "llm_generate_trip_start",
-                    {"attempt": attempt + 1, "prompt_len": len(prompt)},
-                )
-                # 记录尝试开始时间，用于计算耗时
-                start_ts = datetime.now()
-                print(f"[{_ts()}][LlmManager] 第{attempt + 1}次行程生成调用开始")
-                request_id = f"generation-{start_ts.strftime('%H%M%S%f')}"
-                cfg = self._generation_config
-                print(
-                    f"[{_ts()}][LlmManager] llm_http_request_start stage=trip_generation_invoke role=generation "
-                    f"provider={cfg.get('provider')} base_url={cfg.get('base_url')} model={cfg.get('model_name')} "
-                    f"request_id={request_id} attempt={attempt + 1}"
-                )
-                raw_response = self.generation_llm.invoke(prompt)
-                if hasattr(raw_response, "content"):
-                    response_text = raw_response.content
-                else:
-                    response_text = raw_response
+        attempt = 1
+        self._metrics.record(
+            "llm_generate_trip_start",
+            {"attempt": attempt, "prompt_len": len(prompt)},
+        )
+        start_ts = datetime.now()
+        print(f"[{_ts()}][LlmManager] 第{attempt}次行程生成调用开始")
+        request_id = f"generation-{start_ts.strftime('%H%M%S%f')}"
+        cfg = self._generation_config
+        print(
+            f"[{_ts()}][LlmManager] llm_http_request_start stage=trip_generation_invoke role=generation "
+            f"provider={cfg.get('provider')} base_url={cfg.get('base_url')} model={cfg.get('model_name')} "
+            f"request_id={request_id} attempt={attempt}"
+        )
+        raw_response = self.generation_llm.invoke(prompt)
+        if hasattr(raw_response, "content"):
+            response_text = raw_response.content
+        else:
+            response_text = raw_response
 
-                clean_response = self.extract_json_from_string(response_text)
+        cleaned_response_text = _strip_think_content(response_text)
+        _log_llm_output("trip_generation_response", cleaned_response_text)
+        clean_response = self.extract_json_from_string(cleaned_response_text)
+        trip_data = self.parser.parse(clean_response)
 
-                # 尝试解析
-                # self.parser.parse() 应该返回一个 TripPlan 实例 或一个 dict
-                trip_data = self.parser.parse(clean_response)
+        cost = (datetime.now() - start_ts).total_seconds()
+        print(
+            f"[{_ts()}][LlmManager] llm_http_request_end stage=trip_generation_invoke role=generation "
+            f"elapsed_s={cost:.2f} response_len={len(str(response_text))} request_id={request_id} attempt={attempt}"
+        )
+        print(f"[{_ts()}][LlmManager] 第{attempt}次生成成功，耗时 {cost:.2f}s")
+        self._metrics.record(
+            "llm_generate_trip_success",
+            {"attempt": attempt, "elapsed_ms": int(cost * 1000), "output_len": len(str(response_text))},
+        )
 
-                cost = (datetime.now() - start_ts).total_seconds()
-                print(
-                    f"[{_ts()}][LlmManager] llm_http_request_end stage=trip_generation_invoke role=generation "
-                    f"elapsed_s={cost:.2f} response_len={len(str(response_text))} request_id={request_id} attempt={attempt + 1}"
-                )
-                print(f"[{_ts()}][LlmManager] 第{attempt + 1}次生成成功，耗时 {cost:.2f}s")
-                # 记录生成成功指标，补充耗时与输出长度
-                self._metrics.record(
-                    "llm_generate_trip_success",
-                    {"attempt": attempt + 1, "elapsed_ms": int(cost * 1000), "output_len": len(str(response_text))},
-                )
-
-                # 🌟 Pydantic V2 安全处理：
-                # 如果返回的是 Pydantic 实例，使用 .model_dump() 转换为 dict
-                if hasattr(trip_data, 'model_dump') and callable(getattr(trip_data, 'model_dump')):
-                    return trip_data.model_dump()
-                # 如果返回的就是 dict，则直接返回
-                elif isinstance(trip_data, dict):
-                    return trip_data
-                else:
-                    # 处理未预期的返回类型
-                    raise TypeError(f"解析器返回了意外类型: {type(trip_data)}")
-
-            except Exception as e:
-                cost = (datetime.now() - start_ts).total_seconds()
-                print(f"[{_ts()}][LlmManager] 第{attempt + 1}次生成失败，耗时 {cost:.2f}s，错误={str(e)}")
-                # 构造统一错误 payload，便于 UI 与日志消费
-                error_payload = normalize_exception(
-                    e,
-                    code=ErrorCodes.LLM_FAILED,
-                    source="llm_generate_trip",
-                )
-                # 记录生成失败指标，附带标准化错误信息
-                self._metrics.record(
-                    "llm_generate_trip_error",
-                    {"attempt": attempt + 1, "elapsed_ms": int(cost * 1000), "error": error_payload},
-                )
-                if attempt == 1:
-                    return None
-        return None
+        if hasattr(trip_data, "model_dump") and callable(getattr(trip_data, "model_dump")):
+            return trip_data.model_dump()
+        if isinstance(trip_data, dict):
+            return trip_data
+        raise TypeError(f"解析器返回了意外类型: {type(trip_data)}")
 
     def generate_trip_pure(self, user_input: Dict[str, Any], context: List[str],
                            edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -1171,47 +1158,31 @@ class LlmManager:
         analysis_prompt = self._build_analysis_prompt(query, context, current_trip)
         print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 prompt 构建完成，query={query}")
 
-        try:
-            # 记录意图分析调用开始指标
-            self._metrics.record(
-                "llm_analyze_start",
-                {"prompt_len": len(analysis_prompt), "context_size": len(context or [])},
-            )
-            # 记录调用开始时间，用于后续统计耗时
-            start_ts = datetime.now()
-            print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 => LLM 调用开始")
-            request_id = f"analysis-{start_ts.strftime('%H%M%S%f')}"
-            raw_analysis_response = self.analysis_llm.invoke(analysis_prompt)
-            if hasattr(raw_analysis_response, "content"):
-                analysis_response = raw_analysis_response.content
-            else:
-                analysis_response = raw_analysis_response
+        self._metrics.record(
+            "llm_analyze_start",
+            {"prompt_len": len(analysis_prompt), "context_size": len(context or [])},
+        )
+        start_ts = datetime.now()
+        print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 => LLM 调用开始")
+        request_id = f"analysis-{start_ts.strftime('%H%M%S%f')}"
+        raw_analysis_response = self.analysis_llm.invoke(analysis_prompt)
+        if hasattr(raw_analysis_response, "content"):
+            analysis_response = raw_analysis_response.content
+        else:
+            analysis_response = raw_analysis_response
 
-            cost = (datetime.now() - start_ts).total_seconds()
-            print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 LLM 调用结束，耗时 {cost:.2f}s，原始响应长度={len(str(analysis_response))}")
+        cost = (datetime.now() - start_ts).total_seconds()
+        cleaned_response = _strip_think_content(analysis_response)
+        _log_llm_output("analyze_user_message_response", cleaned_response)
+        print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 LLM 调用结束，耗时 {cost:.2f}s，原始响应长度={len(str(analysis_response))}")
 
-            intent_data = self._parse_intent(analysis_response)
-            print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 解析出的意图数据={intent_data}")
-            # 记录意图分析成功指标
-            self._metrics.record(
-                "llm_analyze_success",
-                {"elapsed_ms": int(cost * 1000), "output_len": len(str(analysis_response))},
-            )
-            return intent_data
-        except Exception as e:
-            print(f"[{_ts()}][LlmManager] analyze_user_message 调用或解析失败: {str(e)}")
-            # 构造统一错误 payload，便于 UI 与日志消费
-            error_payload = normalize_exception(
-                e,
-                code=ErrorCodes.LLM_FAILED,
-                source="llm_analyze_user_message",
-            )
-            # 记录意图分析失败指标，附带标准化错误信息
-            self._metrics.record(
-                "llm_analyze_error",
-                {"error": error_payload},
-            )
-            return self._get_default_intent()
+        intent_data = self._parse_intent(cleaned_response)
+        print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 解析出的意图数据={intent_data}")
+        self._metrics.record(
+            "llm_analyze_success",
+            {"elapsed_ms": int(cost * 1000), "output_len": len(str(analysis_response))},
+        )
+        return intent_data
 
     def change_trip(self, query: str, context: List[Dict[str, str]] = None, current_trip: Dict = None) -> Dict[str, Any]:
         """

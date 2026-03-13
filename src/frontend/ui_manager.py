@@ -63,13 +63,13 @@ class UIManager:
 
     def _log_llm_output(self, stage: str, content: str) -> None:
         safe_content = content or ""
-        head_preview = safe_content[:800]
-        tail_preview = safe_content[-800:] if len(safe_content) > 800 else ""
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] llm_output stage={stage} len={len(safe_content)}")
-        if head_preview:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] llm_output_head stage={stage} >>> {head_preview}")
-        if tail_preview:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] llm_output_tail stage={stage} >>> {tail_preview}")
+        head_size = 180
+        tail_size = 180
+        if len(safe_content) <= head_size + tail_size + 5:
+            preview = safe_content
+        else:
+            preview = f"{safe_content[:head_size]}....{safe_content[-tail_size:]}"
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] llm_output stage={stage} len={len(safe_content)} preview={preview}")
 
     def _init_session_state(self) -> None:
         """
@@ -432,7 +432,9 @@ class UIManager:
                     llm = self.llm_manager.get_llm()
                     response = llm.invoke(prompt_text)
                     answer_text = response.content if hasattr(response, "content") else response
-                    ui_state["user_selected_answer"] = str(answer_text).strip()
+                    cleaned_text, _ = self._split_think_content(str(answer_text))
+                    self._log_llm_output("evidence_answer", cleaned_text)
+                    ui_state["user_selected_answer"] = str(cleaned_text).strip()
 
                 if ui_state.get("user_selected_answer"):
                     st.markdown("**回答（基于用户选择证据生成）**")

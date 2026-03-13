@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import re
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -16,6 +17,28 @@ from src.llm.tool_protocol import ToolCallResult
 from src.map.map_renderer import TripMap
 from src.observability import ErrorCodes, build_error_payload, normalize_exception, BudgetManager, ConstraintChecker
 from src.config import Config  # 读取全局配置预算
+
+
+def _strip_think_content(text: Any) -> str:
+    if text is None:
+        return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", str(text), flags=re.DOTALL)
+    cleaned = re.sub(r"</?think>", "", cleaned)
+    return cleaned.strip()
+
+
+def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
+    if text is None:
+        return ""
+    text_value = str(text)
+    if len(text_value) <= head + tail + 5:
+        return text_value
+    return f"{text_value[:head]}....{text_value[-tail:]}"
+
+
+def _log_llm_output(tag: str, cleaned_text: str) -> None:
+    preview = _format_log_text(cleaned_text)
+    print(f"[PlannerAgent] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
 
 
 class AgentGraphState(TypedDict):
@@ -185,38 +208,24 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
         sop_templates = [{"name": "default_trip", "tasks": [task.model_dump() for task in sop_plan.tasks]}]
         # 构建 prompt
         prompt = self._build_plan_prompt(user_intent, user_input, tool_registry, sop_templates, error_context=error_context)
-        try:
-            # [LOG] 调用大模型前打印信息
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 即将调用大模型......进行任务规划")
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 用户意图: {user_intent}")
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 用户输入: {json.dumps(user_input, ensure_ascii=False)}")
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] prompt\n: {prompt}")
-            # 调用分析模型
-            # 这里使用 analysis_llm 进行意图理解和计划生成
-            raw_response = self._llm_manager.get_analysis_llm().invoke(prompt)
-            
-            # 读取响应文本
-            response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
-            
-            # [LOG] 调用大模型后打印信息
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 大模型-任务规划完成")
-            # print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 原始响应长度: {len(str(response_text))}")
-            # print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 原始响应内容: {response_text}") # 内容可能较长，按需开启
+        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 即将调用大模型......进行任务规划")
+        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 用户意图: {user_intent}")
+        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 用户输入: {json.dumps(user_input, ensure_ascii=False)}")
+        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] prompt\n: {prompt}")
+        raw_response = self._llm_manager.get_analysis_llm().invoke(prompt)
+        
+        response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
+        cleaned_response_text = _strip_think_content(response_text)
+        _log_llm_output("plan_response", cleaned_response_text)
+        
+        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 大模型-任务规划完成")
 
-            # 解析计划
-            plan = self._parse_plan_response(str(response_text))
-            # 校验计划合法性
-            plan.validate_plan(tool_whitelist=set(tool_whitelist))
+        plan = self._parse_plan_response(str(cleaned_response_text))
+        plan.validate_plan(tool_whitelist=set(tool_whitelist))
 
-            tools = [t.tool for t in plan.tasks if t.type == "tool_call"]
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 规划完成，工具序列: {', '.join(tools)}\n")
-            return plan
-        except Exception as e:
-            # [LOG] 大模型调用或解析失败
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 计划生成失败: {e}，回退到 SOP 默认计划")
-            # 失败时回退 SOP
-            sop_plan.validate_plan(tool_whitelist=set(tool_whitelist))
-            return sop_plan
+        tools = [t.tool for t in plan.tasks if t.type == "tool_call"]
+        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 规划完成，工具序列: {', '.join(tools)}\n")
+        return plan
 
 
 class Reflector:

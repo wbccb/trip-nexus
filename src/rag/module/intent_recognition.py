@@ -3,6 +3,7 @@ from typing import Dict
 from functools import lru_cache
 from sentence_transformers import SentenceTransformer, util
 from langchain_core.prompts import ChatPromptTemplate
+import re
 
 from src.config import Config
 
@@ -20,6 +21,28 @@ else:
     @lru_cache(maxsize=1)
     def _get_sentence_transformer(model_name: str) -> SentenceTransformer:
         return SentenceTransformer(model_name)
+
+
+def _strip_think_content(text: str) -> str:
+    if text is None:
+        return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", str(text), flags=re.DOTALL)
+    cleaned = re.sub(r"</?think>", "", cleaned)
+    return cleaned.strip()
+
+
+def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
+    if text is None:
+        return ""
+    text_value = str(text)
+    if len(text_value) <= head + tail + 5:
+        return text_value
+    return f"{text_value[:head]}....{text_value[-tail:]}"
+
+
+def _log_llm_output(tag: str, cleaned_text: str) -> None:
+    preview = _format_log_text(cleaned_text)
+    print(f"[IntentRecognizer] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
 
 class IntentRecognizer:
     def __init__(self, llm):
@@ -116,18 +139,8 @@ class IntentRecognizer:
 
         chain = prompt | self.llm
         response = chain.invoke({"query": query})
-
-        try:
-            # Check if response is string or object (handling both OllamaLLM and ChatOllama)
-            content = response.content if hasattr(response, 'content') else response
-            # Remove potential markdown code blocks
-            content = content.replace("```json", "").replace("```", "").strip()
-            return json.loads(content)
-        except json.JSONDecodeError:
-            return {
-                "primary_intent": "general_knowledge",
-                "confidence": 0.7,
-                "needs_search": True,
-                "keywords": [query],
-                "rewritten_queries": [query]
-            }
+        content = response.content if hasattr(response, 'content') else response
+        cleaned_content = _strip_think_content(content)
+        cleaned_content = cleaned_content.replace("```json", "").replace("```", "").strip()
+        _log_llm_output("intent_response", cleaned_content)
+        return json.loads(cleaned_content)
