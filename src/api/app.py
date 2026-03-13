@@ -720,9 +720,11 @@ def send_chat(payload: ChatSendRequest) -> ChatSendResponse:
             result_payload = tool_call.get("result")
             if isinstance(result_payload, dict) and result_payload.get("success"):
                 response_text = f"工具结果：{result_payload.get('data')}"
+                print(f"目前用户的问题只需要调用工具返回即可，目前获取工具结果，准备返回数据: {response_text}")
         if not response_text:
             response_stream = llm_manager.stream_chat_response(payload.message, context_messages, current_trip)
             response_text = "".join([str(delta) for delta in response_stream])
+            print(f"目前用户的问题 => 对话模式，工具调用无结果或者不需要工具调用，准备返回数据: {response_text}")
     elif intent == "generate_trip":
         result = llm_manager._handle_trip_generation(intent_data, context_messages)
         response_text = result.get("response") or ""
@@ -739,9 +741,11 @@ def send_chat(payload: ChatSendRequest) -> ChatSendResponse:
         response_text = f"我理解您想{intent_data.get('summary', '进一步讨论行程')}. 请告诉我更多细节，比如目的地、旅行天数和您的偏好，我可以为您规划具体的行程。"
     if trip_data:
         storage.store_trip_data(session_id, trip_data)
+    # 去除思考链内容
+    cleaned_response = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
     assistant_message = Message(
         role=MessageType.ASSISTANT,
-        content=response_text,
+        content=cleaned_response,
         timestamp=datetime.now(),
         metadata={
             "intent": intent,

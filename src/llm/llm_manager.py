@@ -246,6 +246,7 @@ class LlmManager:
         bound_llm = self.analysis_llm.bind_tools(tools)
         print("准备触发大模型调用: functionCall获取当前需要使用的工具名")
         response = bound_llm.invoke(prompt)
+        print(f"[LLMManager] functionCall获取当前需要使用的工具名，!!!LLM触发 => 得到大模型原始响应: {response}")
 
         # 兼容不同模型返回结构，优先读取 tool_calls
         tool_calls = getattr(response, "tool_calls", None)
@@ -254,6 +255,7 @@ class LlmManager:
 
         # 模型未触发工具时直接返回，不进行额外兜底路由
         if not tool_calls:
+            print(f"[LLMManager] 从response拿不到tool_calls")
             return {
                 "needs_tool": False,
                 "decision": {"needs_tool": False, "tool_name": "", "params": {}, "source": "function_call"},
@@ -268,8 +270,11 @@ class LlmManager:
         if not isinstance(params, dict):
             params = {}
 
+        
+
         # 工具名为空时直接返回，避免误调用
         if not tool_name:
+            print(f"[LLMManager] 从tool_calls拿不到工具名: {json.dumps(first_call, ensure_ascii=False, default=str)}")
             return {
                 "needs_tool": False,
                 "decision": {"needs_tool": False, "tool_name": "", "params": {}, "source": "function_call"},
