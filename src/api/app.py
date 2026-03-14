@@ -4,6 +4,9 @@ import asyncio
 import json
 import time
 import re
+import os
+import sqlite3
+import threading
 from io import BytesIO
 from functools import lru_cache  # 用于缓存全局单例对象，减少重复初始化
 from typing import Any, Dict, List, Optional  # 提供类型注解，便于接口契约清晰
@@ -205,6 +208,43 @@ class TripReplanDayRequest(BaseModel):
 class TripReplanDayResponse(BaseModel):
     session_id: str = Field(..., description="会话ID")
     trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
+
+
+class FlowMetricItem(BaseModel):
+    message_id: str = Field(..., description="流式消息ID")
+    session_id: str = Field(..., description="会话ID")
+    user_id: str = Field(..., description="用户ID")
+    device_id: str = Field(..., description="设备ID")
+    mode: str = Field(..., description="执行模式")
+    intent: str = Field(..., description="识别意图")
+    status: str = Field(..., description="执行状态")
+    latency_ms: int = Field(0, description="端到端耗时毫秒")
+    tool_count: int = Field(0, description="工具调用次数")
+    rag_hit: bool = Field(False, description="是否命中知识增强")
+    agent_escalated: bool = Field(False, description="是否升级Agent")
+    context_count: int = Field(0, description="上下文条目数")
+    context_chars: int = Field(0, description="上下文字符数")
+    context_budget: Dict[str, Any] = Field(default_factory=dict, description="上下文预算配置")
+    escalation_reasons: List[str] = Field(default_factory=list, description="升级原因")
+    error: Optional[str] = Field(None, description="失败错误信息")
+    created_at: str = Field(..., description="记录时间")
+
+
+class FlowMetricsListResponse(BaseModel):
+    total: int = Field(0, description="满足条件的记录总数")
+    items: List[FlowMetricItem] = Field(default_factory=list, description="指标明细")
+
+
+class FlowMetricsSummaryResponse(BaseModel):
+    total: int = Field(0, description="满足条件的样本总数")
+    success_count: int = Field(0, description="成功样本数")
+    failed_count: int = Field(0, description="失败样本数")
+    avg_latency_ms: float = Field(0.0, description="平均耗时毫秒")
+    p50_latency_ms: float = Field(0.0, description="P50 耗时毫秒")
+    p90_latency_ms: float = Field(0.0, description="P90 耗时毫秒")
+    agent_escalated_rate: float = Field(0.0, description="Agent 升级比例")
+    rag_hit_rate: float = Field(0.0, description="RAG 命中比例")
+    avg_tool_count: float = Field(0.0, description="平均工具调用次数")
 
 
 @lru_cache(maxsize=1)
@@ -595,6 +635,319 @@ _FLOW_STREAM_TTL_SECONDS = 600
 _FLOW_CONTEXT_MAX_ITEMS = 12
 _FLOW_CONTEXT_ITEM_MAX_CHARS = 600
 _FLOW_CONTEXT_TOTAL_MAX_CHARS = 3200
+_FLOW_METRICS_DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "flow_metrics.db"))
+_flow_metrics_lock = threading.Lock()
+
+
+def _init_flow_metrics_table() -> None:
+    """初始化主流程指标表，确保落库查询能力可用。"""
+    with _flow_metrics_lock:
+        conn = sqlite3.connect(_FLOW_METRICS_DB_PATH, check_same_thread=False)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS flow_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    intent TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    latency_ms INTEGER NOT NULL DEFAULT 0,
+                    tool_count INTEGER NOT NULL DEFAULT 0,
+                    rag_hit INTEGER NOT NULL DEFAULT 0,
+                    agent_escalated INTEGER NOT NULL DEFAULT 0,
+                    context_count INTEGER NOT NULL DEFAULT 0,
+                    context_chars INTEGER NOT NULL DEFAULT 0,
+                    context_budget_json TEXT NOT NULL DEFAULT '{}',
+                    escalation_reasons_json TEXT NOT NULL DEFAULT '[]',
+                    error_text TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    """将任意值安全转换为整数，失败时返回默认值。"""
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    """将任意值安全转换为浮点数，失败时返回默认值。"""
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_json_loads(text: Any, fallback: Any) -> Any:
+    """将 JSON 字符串解析为对象，失败时返回兜底值。"""
+    try:
+        return json.loads(str(text or ""))
+    except Exception:
+        return fallback
+
+
+def _percentile(values: List[int], ratio: float) -> float:
+    """计算百分位值，输入为空时返回 0。"""
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    idx = int(round((len(sorted_values) - 1) * max(0.0, min(1.0, ratio))))
+    idx = max(0, min(len(sorted_values) - 1, idx))
+    return float(sorted_values[idx])
+
+
+def _record_flow_metrics(payload: Dict[str, Any]) -> None:
+    """持久化单次主流程执行指标，供后续明细与聚合查询。"""
+    _init_flow_metrics_table()
+    with _flow_metrics_lock:
+        conn = sqlite3.connect(_FLOW_METRICS_DB_PATH, check_same_thread=False)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO flow_metrics (
+                    message_id, session_id, user_id, device_id, mode, intent, status,
+                    latency_ms, tool_count, rag_hit, agent_escalated, context_count, context_chars,
+                    context_budget_json, escalation_reasons_json, error_text, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(payload.get("message_id") or ""),
+                    str(payload.get("session_id") or ""),
+                    str(payload.get("user_id") or ""),
+                    str(payload.get("device_id") or ""),
+                    str(payload.get("mode") or "fast"),
+                    str(payload.get("intent") or ""),
+                    str(payload.get("status") or "done"),
+                    _to_int(payload.get("latency_ms"), 0),
+                    _to_int(payload.get("tool_count"), 0),
+                    1 if bool(payload.get("rag_hit")) else 0,
+                    1 if bool(payload.get("agent_escalated")) else 0,
+                    _to_int(payload.get("context_count"), 0),
+                    _to_int(payload.get("context_chars"), 0),
+                    json.dumps(payload.get("context_budget") or {}, ensure_ascii=False),
+                    json.dumps(payload.get("escalation_reasons") or [], ensure_ascii=False),
+                    str(payload.get("error") or "") or None,
+                    datetime.now().isoformat(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _build_flow_metrics_filters_sql(
+    start_time: Optional[str],
+    end_time: Optional[str],
+    mode: Optional[str],
+    intent: Optional[str],
+    status: Optional[str],
+    user_id: Optional[str],
+    device_id: Optional[str],
+    session_id: Optional[str],
+    agent_escalated: Optional[bool],
+    rag_hit: Optional[bool],
+) -> tuple[str, List[Any]]:
+    """构建指标查询的 WHERE SQL 与参数列表。"""
+    clauses: List[str] = []
+    params: List[Any] = []
+    if start_time:
+        clauses.append("created_at >= ?")
+        params.append(start_time)
+    if end_time:
+        clauses.append("created_at <= ?")
+        params.append(end_time)
+    if mode:
+        clauses.append("mode = ?")
+        params.append(mode)
+    if intent:
+        clauses.append("intent = ?")
+        params.append(intent)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if user_id:
+        clauses.append("user_id = ?")
+        params.append(user_id)
+    if device_id:
+        clauses.append("device_id = ?")
+        params.append(device_id)
+    if session_id:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    if agent_escalated is not None:
+        clauses.append("agent_escalated = ?")
+        params.append(1 if agent_escalated else 0)
+    if rag_hit is not None:
+        clauses.append("rag_hit = ?")
+        params.append(1 if rag_hit else 0)
+    where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+    return where_sql, params
+
+
+def _query_flow_metrics_rows(
+    start_time: Optional[str],
+    end_time: Optional[str],
+    mode: Optional[str],
+    intent: Optional[str],
+    status: Optional[str],
+    user_id: Optional[str],
+    device_id: Optional[str],
+    session_id: Optional[str],
+    agent_escalated: Optional[bool],
+    rag_hit: Optional[bool],
+    limit: int,
+    offset: int,
+) -> tuple[int, List[Dict[str, Any]]]:
+    """查询指标明细并返回总量与分页结果。"""
+    _init_flow_metrics_table()
+    where_sql, params = _build_flow_metrics_filters_sql(
+        start_time,
+        end_time,
+        mode,
+        intent,
+        status,
+        user_id,
+        device_id,
+        session_id,
+        agent_escalated,
+        rag_hit,
+    )
+    with _flow_metrics_lock:
+        conn = sqlite3.connect(_FLOW_METRICS_DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(1) AS total FROM flow_metrics{where_sql}", params)
+            total_row = cursor.fetchone()
+            total = _to_int(total_row["total"] if total_row else 0, 0)
+            cursor.execute(
+                f"""
+                SELECT message_id, session_id, user_id, device_id, mode, intent, status,
+                       latency_ms, tool_count, rag_hit, agent_escalated, context_count, context_chars,
+                       context_budget_json, escalation_reasons_json, error_text, created_at
+                FROM flow_metrics
+                {where_sql}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                params + [max(1, limit), max(0, offset)],
+            )
+            rows = []
+            for row in cursor.fetchall():
+                row_data = dict(row)
+                rows.append(
+                    {
+                        "message_id": str(row_data.get("message_id") or ""),
+                        "session_id": str(row_data.get("session_id") or ""),
+                        "user_id": str(row_data.get("user_id") or ""),
+                        "device_id": str(row_data.get("device_id") or ""),
+                        "mode": str(row_data.get("mode") or "fast"),
+                        "intent": str(row_data.get("intent") or ""),
+                        "status": str(row_data.get("status") or "done"),
+                        "latency_ms": _to_int(row_data.get("latency_ms"), 0),
+                        "tool_count": _to_int(row_data.get("tool_count"), 0),
+                        "rag_hit": bool(_to_int(row_data.get("rag_hit"), 0)),
+                        "agent_escalated": bool(_to_int(row_data.get("agent_escalated"), 0)),
+                        "context_count": _to_int(row_data.get("context_count"), 0),
+                        "context_chars": _to_int(row_data.get("context_chars"), 0),
+                        "context_budget": _safe_json_loads(row_data.get("context_budget_json"), {}),
+                        "escalation_reasons": _safe_json_loads(row_data.get("escalation_reasons_json"), []),
+                        "error": row_data.get("error_text"),
+                        "created_at": str(row_data.get("created_at") or ""),
+                    }
+                )
+            return total, rows
+        finally:
+            conn.close()
+
+
+def _query_flow_metrics_summary(
+    start_time: Optional[str],
+    end_time: Optional[str],
+    mode: Optional[str],
+    intent: Optional[str],
+    status: Optional[str],
+    user_id: Optional[str],
+    device_id: Optional[str],
+    session_id: Optional[str],
+    agent_escalated: Optional[bool],
+    rag_hit: Optional[bool],
+) -> Dict[str, Any]:
+    """查询指标聚合摘要，输出成功率与时延分位信息。"""
+    _init_flow_metrics_table()
+    where_sql, params = _build_flow_metrics_filters_sql(
+        start_time,
+        end_time,
+        mode,
+        intent,
+        status,
+        user_id,
+        device_id,
+        session_id,
+        agent_escalated,
+        rag_hit,
+    )
+    with _flow_metrics_lock:
+        conn = sqlite3.connect(_FLOW_METRICS_DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT status, latency_ms, tool_count, rag_hit, agent_escalated
+                FROM flow_metrics
+                {where_sql}
+                """,
+                params,
+            )
+            rows = [dict(item) for item in cursor.fetchall()]
+        finally:
+            conn.close()
+    total = len(rows)
+    if total == 0:
+        return {
+            "total": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "avg_latency_ms": 0.0,
+            "p50_latency_ms": 0.0,
+            "p90_latency_ms": 0.0,
+            "agent_escalated_rate": 0.0,
+            "rag_hit_rate": 0.0,
+            "avg_tool_count": 0.0,
+        }
+    success_count = len([row for row in rows if str(row.get("status") or "") == "done"])
+    failed_count = total - success_count
+    latencies = [_to_int(row.get("latency_ms"), 0) for row in rows if _to_int(row.get("latency_ms"), 0) > 0]
+    tool_counts = [_to_int(row.get("tool_count"), 0) for row in rows]
+    escalated_count = len([row for row in rows if bool(_to_int(row.get("agent_escalated"), 0))])
+    rag_hit_count = len([row for row in rows if bool(_to_int(row.get("rag_hit"), 0))])
+    return {
+        "total": total,
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "avg_latency_ms": _to_float(sum(latencies) / len(latencies), 0.0) if latencies else 0.0,
+        "p50_latency_ms": _percentile(latencies, 0.5) if latencies else 0.0,
+        "p90_latency_ms": _percentile(latencies, 0.9) if latencies else 0.0,
+        "agent_escalated_rate": _to_float(escalated_count / total, 0.0),
+        "rag_hit_rate": _to_float(rag_hit_count / total, 0.0),
+        "avg_tool_count": _to_float(sum(tool_counts) / len(tool_counts), 0.0) if tool_counts else 0.0,
+    }
 
 
 async def _cleanup_flow_streams() -> None:
@@ -844,6 +1197,26 @@ async def _run_flow_stream(
         if trip_data:
             _get_storage().store_trip_data(session_id, trip_data)
         metrics["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
+        _record_flow_metrics(
+            {
+                "message_id": message_id,
+                "session_id": session_id,
+                "user_id": payload.user_id,
+                "device_id": payload.device_id,
+                "mode": flow_mode,
+                "intent": metrics.get("intent") or "",
+                "status": "done",
+                "latency_ms": metrics.get("latency_ms") or 0,
+                "tool_count": metrics.get("tool_count") or 0,
+                "rag_hit": bool(metrics.get("rag_hit")),
+                "agent_escalated": bool(metrics.get("agent_escalated")),
+                "context_count": metrics.get("context_count") or 0,
+                "context_chars": metrics.get("context_chars") or 0,
+                "context_budget": metrics.get("context_budget") or {},
+                "escalation_reasons": escalation_reasons,
+                "error": None,
+            }
+        )
 
         # 统一 finalize 终态事件，输出 trip_data 与关键指标
         last_sequence += 1
@@ -884,6 +1257,26 @@ async def _run_flow_stream(
                 "is_final": True,
                 "payload": {"error": str(exc)},
             },
+        )
+        _record_flow_metrics(
+            {
+                "message_id": message_id,
+                "session_id": session_id,
+                "user_id": payload.user_id,
+                "device_id": payload.device_id,
+                "mode": flow_mode,
+                "intent": str(metrics.get("intent") or ""),
+                "status": "failed",
+                "latency_ms": int((time.perf_counter() - started_at) * 1000),
+                "tool_count": metrics.get("tool_count") or 0,
+                "rag_hit": bool(metrics.get("rag_hit")),
+                "agent_escalated": bool(metrics.get("agent_escalated")),
+                "context_count": metrics.get("context_count") or 0,
+                "context_chars": metrics.get("context_chars") or 0,
+                "context_budget": metrics.get("context_budget") or {},
+                "escalation_reasons": escalation_reasons,
+                "error": str(exc),
+            }
         )
 
 
@@ -1103,6 +1496,68 @@ async def stream_main_flow(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )
+
+
+@app.get("/api/flow/metrics", response_model=FlowMetricsListResponse)
+def list_flow_metrics(
+    start_time: Optional[str] = Query(None, description="起始时间（ISO8601）"),
+    end_time: Optional[str] = Query(None, description="结束时间（ISO8601）"),
+    mode: Optional[str] = Query(None, description="执行模式 fast/deep"),
+    intent: Optional[str] = Query(None, description="意图筛选"),
+    status: Optional[str] = Query(None, description="状态筛选 done/failed"),
+    user_id: Optional[str] = Query(None, description="用户ID"),
+    device_id: Optional[str] = Query(None, description="设备ID"),
+    session_id: Optional[str] = Query(None, description="会话ID"),
+    agent_escalated: Optional[bool] = Query(None, description="是否升级Agent"),
+    rag_hit: Optional[bool] = Query(None, description="是否命中RAG"),
+    limit: int = Query(50, ge=1, le=500, description="分页条数"),
+    offset: int = Query(0, ge=0, description="分页偏移"),
+) -> FlowMetricsListResponse:
+    """查询主流程指标明细，支持按模式、意图、状态与时间范围过滤。"""
+    total, items = _query_flow_metrics_rows(
+        start_time=start_time,
+        end_time=end_time,
+        mode=mode,
+        intent=intent,
+        status=status,
+        user_id=user_id,
+        device_id=device_id,
+        session_id=session_id,
+        agent_escalated=agent_escalated,
+        rag_hit=rag_hit,
+        limit=limit,
+        offset=offset,
+    )
+    return FlowMetricsListResponse(total=total, items=[FlowMetricItem(**item) for item in items])
+
+
+@app.get("/api/flow/metrics/summary", response_model=FlowMetricsSummaryResponse)
+def summary_flow_metrics(
+    start_time: Optional[str] = Query(None, description="起始时间（ISO8601）"),
+    end_time: Optional[str] = Query(None, description="结束时间（ISO8601）"),
+    mode: Optional[str] = Query(None, description="执行模式 fast/deep"),
+    intent: Optional[str] = Query(None, description="意图筛选"),
+    status: Optional[str] = Query(None, description="状态筛选 done/failed"),
+    user_id: Optional[str] = Query(None, description="用户ID"),
+    device_id: Optional[str] = Query(None, description="设备ID"),
+    session_id: Optional[str] = Query(None, description="会话ID"),
+    agent_escalated: Optional[bool] = Query(None, description="是否升级Agent"),
+    rag_hit: Optional[bool] = Query(None, description="是否命中RAG"),
+) -> FlowMetricsSummaryResponse:
+    """查询主流程指标聚合摘要，输出成功率、时延分位与命中比例。"""
+    summary = _query_flow_metrics_summary(
+        start_time=start_time,
+        end_time=end_time,
+        mode=mode,
+        intent=intent,
+        status=status,
+        user_id=user_id,
+        device_id=device_id,
+        session_id=session_id,
+        agent_escalated=agent_escalated,
+        rag_hit=rag_hit,
+    )
+    return FlowMetricsSummaryResponse(**summary)
 
 
 @app.post("/api/map/render", response_model=MapRenderResponse)
