@@ -1,6 +1,6 @@
 [project]
 name = "ai-travel-planner"
-version = "0.0.4-RELEASE"
+version = "0.0.5-RELEASE"
 description = "AI旅游行程规划助手 - MVP版本"
 authors = [{name = "wbccb", email = "wbccb18814122@163.com"}]
 readme = "README.md"
