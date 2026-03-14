@@ -13,7 +13,6 @@ import {
   Typography,
   message,
 } from "antd"
-import AgentTab from "./components/AgentTab.jsx"
 import KnowledgeTab from "./components/KnowledgeTab.jsx"
 import SessionSider from "./components/SessionSider.jsx"
 import TripTab from "./components/TripTab.jsx"
@@ -24,7 +23,6 @@ import {
   DEFAULT_USER_ID,
   SESSION_STORAGE_KEY,
 } from "./constants/appConfig.js"
-import { useAgent } from "./hooks/useAgent.js"
 import { useKnowledge } from "./hooks/useKnowledge.js"
 import { useSessions } from "./hooks/useSessions.js"
 import { useTrip } from "./hooks/useTrip.js"
@@ -120,45 +118,6 @@ export default function App() {
       )
     )
   }, [])
-
-  // 应用 Agent 的上下文补丁
-  const applyAgentPatch = useCallback((patchOps) => {
-    // 校验 patch 列表
-    if (!Array.isArray(patchOps) || patchOps.length === 0) {
-      return
-    }
-    // 逐条应用 patch
-    patchOps.forEach((op) => {
-      // 校验 patch 结构
-      if (!op || typeof op.path !== "string") {
-        return
-      }
-      // 解析路径分段
-      const segments = op.path.split("/").filter(Boolean)
-      // 仅处理 shared_context 变更
-      if (segments[0] !== "shared_context") {
-        return
-      }
-      // 读取 task id
-      const taskId = segments[1]
-      // 读取输出 key
-      const key = segments.slice(2).join("/")
-      // 行程草案更新
-      if (taskId === "t4" && key === "draft_trip" && op.value) {
-        updateTripResult(op.value)
-        return
-      }
-    })
-  }, [updateTripResult])
-
-  const {
-    agentState,
-    agentForm,
-    agentConnecting,
-    handleRunAgent,
-    handleReconnectAgent,
-  } = useAgent({ onApplyPatch: applyAgentPatch })
-
   const loadChatHistory = useCallback(async (sessionId) => {
     if (!sessionId) {
       setChatMessages([])
@@ -448,19 +407,15 @@ export default function App() {
                   ),
                 },
                 {
-                  key: "agent",
-                  label: "Agent 状态",
+                  key: "mode",
+                  label: "执行模式",
                   children: (
-                    <AgentTab
-                      agentState={agentState}
-                      agentForm={agentForm}
-                      agentConnecting={agentConnecting}
-                      onRunAgent={handleRunAgent}
-                      onReconnectAgent={handleReconnectAgent}
-                    />
+                    <Card size="small" title="主流程模式">
+                      当前已切换为单主流程架构。请在“行程输入”中选择极速模式（fast）或深度模式（deep）。
+                    </Card>
                   ),
                 },
-              ]}
+              ]} 
             />
           </div>
           <div className="app-right">
@@ -537,6 +492,9 @@ export default function App() {
           </Form.Item>
           <Form.Item label="偏好" name="preference">
             <Input placeholder="例如：人文、美食" />
+          </Form.Item>
+          <Form.Item label="执行模式" name="mode" initialValue="fast">
+            <Input placeholder="fast 或 deep" />
           </Form.Item>
         </Form>
       </Modal>

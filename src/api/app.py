@@ -60,6 +60,10 @@ class TripGenerateRequest(BaseModel):
     knowledge_query: Optional[str] = Field(None, description="知识库检索查询（可选）")
 
 
+class FlowStreamRequest(TripGenerateRequest):
+    mode: Optional[str] = Field("fast", description="执行模式：fast/deep")
+
+
 class TripGenerateResponse(BaseModel):
     """行程生成响应体"""
     session_id: str = Field(..., description="会话ID")
@@ -465,6 +469,33 @@ def _build_agent_thread_id(user_id: str, device_id: str) -> str:
     return f"{user_id}-{device_id}-{timestamp_ms}"
 
 
+def _normalize_flow_mode(mode: Optional[str]) -> str:
+    value = str(mode or "fast").strip().lower()
+    if value not in {"fast", "deep"}:
+        return "fast"
+    return value
+
+
+def _detect_agent_escalation(
+    mode: str,
+    user_input: Dict[str, Any],
+    knowledge_query: Optional[str],
+    tool_result: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    reasons: List[str] = []
+    days_value = int(user_input.get("days") or 0)
+    if mode == "deep":
+        reasons.append("deep_mode")
+    if days_value >= 4:
+        reasons.append("multi_step_days")
+    if knowledge_query and str(knowledge_query).strip():
+        reasons.append("knowledge_enhanced_planning")
+    if isinstance(tool_result, dict):
+        if tool_result.get("needs_tool") and not ((tool_result.get("result") or {}).get("success")):
+            reasons.append("tool_retry_or_fallback")
+    return {"agent_escalated": len(reasons) > 0, "reasons": reasons}
+
+
 def _resolve_initial_state(thread_id: str, resume: bool) -> Optional[TripState]:
     return None
 
@@ -545,85 +576,206 @@ app.add_middleware(
     allow_headers=["*"],  # 允许所有请求头
 )
 
-_trip_streams: Dict[str, Dict[str, Any]] = {}
-_trip_streams_lock = asyncio.Lock()
-_TRIP_STREAM_TTL_SECONDS = 600
+_flow_streams: Dict[str, Dict[str, Any]] = {}
+_flow_streams_lock = asyncio.Lock()
+_FLOW_STREAM_TTL_SECONDS = 600
 
 
-async def _cleanup_trip_streams() -> None:
+async def _cleanup_flow_streams() -> None:
     now = time.time()
-    async with _trip_streams_lock:
+    async with _flow_streams_lock:
         expired = []
-        for key, payload in _trip_streams.items():
+        for key, payload in _flow_streams.items():
             updated_at = float(payload.get("updated_at") or now)
             done = bool(payload.get("done"))
             running = bool(payload.get("running"))
-            if done and not running and now - updated_at > _TRIP_STREAM_TTL_SECONDS:
+            if done and not running and now - updated_at > _FLOW_STREAM_TTL_SECONDS:
                 expired.append(key)
         for key in expired:
-            _trip_streams.pop(key, None)
+            _flow_streams.pop(key, None)
 
 
-async def _append_trip_event(message_id: str, event_payload: Dict[str, Any]) -> None:
-    async with _trip_streams_lock:
-        stream_state = _trip_streams.get(message_id)
+async def _append_flow_event(message_id: str, event_payload: Dict[str, Any]) -> None:
+    async with _flow_streams_lock:
+        stream_state = _flow_streams.get(message_id)
         if not stream_state:
             return
         stream_state["events"].append(event_payload)
         stream_state["updated_at"] = time.time()
-        if event_payload.get("event") in ("trip_data", "error"):
+        if bool(event_payload.get("is_final")) or event_payload.get("event") == "error":
             stream_state["done"] = True
             stream_state["running"] = False
 
 
-async def _run_trip_stream(
+async def _run_flow_stream(
     message_id: str,
     session_id: str,
     llm_manager: LlmManager,
-    user_input: Dict[str, Any],
-    context_texts: List[str],
+    payload: FlowStreamRequest,
 ) -> None:
-    response_chunks: List[str] = []
     last_sequence = 0
+    flow_mode = _normalize_flow_mode(payload.mode)
+    metrics: Dict[str, Any] = {
+        "tool_count": 0,
+        "rag_hit": False,
+        "agent_escalated": False,
+    }
+    trip_data: Optional[Dict[str, Any]] = None
+    escalation_reasons: List[str] = []
+    user_input = {
+        "destination": payload.destination,
+        "days": payload.days,
+        "budget": payload.budget,
+        "preference": payload.preference,
+    }
+    merged_context_texts = list(payload.context_texts or [])
     try:
-        stream = llm_manager.stream_trip_generation(user_input, context_texts)
-        for event in llm_manager.build_stream_events_from_stream(stream, message_id):
-            delta_text = event.get("content_delta") or ""
-            response_chunks.append(delta_text)
-            last_sequence = int(event.get("sequence") or last_sequence)
-            event_payload = {
-                "event": event.get("event"),
-                "sequence": event.get("sequence"),
-                "message_id": event.get("message_id"),
-                "content_delta": delta_text,
-                "is_final": event.get("is_final"),
+        last_sequence += 1
+        await _append_flow_event(
+            message_id,
+            {
+                "event": "start",
+                "sequence": last_sequence,
+                "message_id": message_id,
                 "session_id": session_id,
-            }
-            await _append_trip_event(message_id, event_payload)
-            await asyncio.sleep(0)
-        response_text = "".join(response_chunks)
-        trip_data = llm_manager.parse_trip_from_response_text(response_text)
+                "step": "intent",
+                "status": "running",
+                "mode": flow_mode,
+                "content_delta": "",
+                "is_final": False,
+                "payload": {},
+            },
+        )
+        kb_context_texts = _build_knowledge_context_texts(
+            payload.knowledge_base_id,
+            payload.destination,
+            payload.days,
+            payload.budget,
+            payload.preference,
+            payload.knowledge_query,
+        )
+        merged_context_texts.extend(kb_context_texts)
+        if kb_context_texts:
+            metrics["rag_hit"] = True
+
+        tool_query = llm_manager._build_tool_query(user_input=user_input, query=payload.knowledge_query or payload.destination)
+        tool_result: Dict[str, Any] = {"needs_tool": False}
+        if tool_query:
+            tool_result = llm_manager.call_tool_by_llm(tool_query, [])
+            if tool_result.get("needs_tool"):
+                metrics["tool_count"] = 1
+                result_payload = tool_result.get("result")
+                if isinstance(result_payload, dict) and result_payload.get("success"):
+                    merged_context_texts.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
+
+        escalation = _detect_agent_escalation(flow_mode, user_input, payload.knowledge_query, tool_result)
+        metrics["agent_escalated"] = bool(escalation.get("agent_escalated"))
+        escalation_reasons = list(escalation.get("reasons") or [])
+
+        if metrics["agent_escalated"]:
+            last_sequence += 1
+            await _append_flow_event(
+                message_id,
+                {
+                    "event": "delta",
+                    "sequence": last_sequence,
+                    "message_id": message_id,
+                    "session_id": session_id,
+                    "step": "agent",
+                    "status": "running",
+                    "mode": flow_mode,
+                    "content_delta": "进入深度规划流程",
+                    "is_final": False,
+                    "payload": {"reasons": escalation_reasons},
+                },
+            )
+            thread_id = _build_agent_thread_id(payload.user_id, payload.device_id)
+            final_state = run_agent_loop_sync(
+                llm_manager=llm_manager,
+                user_input=user_input,
+                thread_id=thread_id,
+                agent_config={"mode": flow_mode},
+                user_intent="generate_trip",
+                context=merged_context_texts,
+                resume=False,
+            )
+            if final_state and isinstance(final_state.final_payload, dict):
+                draft_trip = final_state.final_payload.get("draft_trip")
+                if isinstance(draft_trip, dict) and draft_trip:
+                    trip_data = draft_trip
+        else:
+            response_chunks: List[str] = []
+            stream = llm_manager.stream_trip_generation(user_input, merged_context_texts)
+            for event in llm_manager.build_stream_events_from_stream(stream, message_id):
+                raw_event = str(event.get("event") or "")
+                if raw_event not in {"start", "delta", "end"}:
+                    continue
+                if raw_event == "end":
+                    continue
+                delta_text = event.get("content_delta") or ""
+                if raw_event == "delta":
+                    response_chunks.append(delta_text)
+                last_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": raw_event,
+                        "sequence": last_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "generate",
+                        "status": "running",
+                        "mode": flow_mode,
+                        "content_delta": delta_text,
+                        "is_final": False,
+                        "payload": {},
+                    },
+                )
+                await asyncio.sleep(0)
+            response_text = "".join(response_chunks)
+            trip_data = llm_manager.parse_trip_from_response_text(response_text)
+
         if trip_data:
-            storage = _get_storage()
-            storage.store_trip_data(session_id, trip_data)
-        final_payload = {
-            "event": "trip_data",
-            "sequence": last_sequence + 1,
-            "message_id": message_id,
-            "session_id": session_id,
-            "trip_data": trip_data,
-            "content": response_text,
-        }
-        await _append_trip_event(message_id, final_payload)
+            _get_storage().store_trip_data(session_id, trip_data)
+
+        last_sequence += 1
+        await _append_flow_event(
+            message_id,
+            {
+                "event": "end",
+                "sequence": last_sequence,
+                "message_id": message_id,
+                "session_id": session_id,
+                "step": "finalize",
+                "status": "done",
+                "mode": flow_mode,
+                "content_delta": "",
+                "is_final": True,
+                "payload": {
+                    "trip_data": trip_data,
+                    "metrics": metrics,
+                    "agent_escalated": metrics["agent_escalated"],
+                    "escalation_reasons": escalation_reasons,
+                },
+            },
+        )
     except Exception as exc:
-        error_payload = {
-            "event": "error",
-            "sequence": last_sequence + 1,
-            "message_id": message_id,
-            "session_id": session_id,
-            "error": str(exc),
-        }
-        await _append_trip_event(message_id, error_payload)
+        last_sequence += 1
+        await _append_flow_event(
+            message_id,
+            {
+                "event": "error",
+                "sequence": last_sequence,
+                "message_id": message_id,
+                "session_id": session_id,
+                "step": "finalize",
+                "status": "failed",
+                "mode": flow_mode,
+                "content_delta": "",
+                "is_final": True,
+                "payload": {"error": str(exc)},
+            },
+        )
 
 
 @app.get("/api/health")
@@ -770,31 +922,7 @@ def send_chat(payload: ChatSendRequest) -> ChatSendResponse:
 
 @app.post("/api/trip/generate", response_model=TripGenerateResponse)
 def generate_trip(payload: TripGenerateRequest) -> TripGenerateResponse:
-    """行程生成主接口"""
-    if not payload.destination or payload.days <= 0:
-        raise HTTPException(status_code=400, detail="destination 和 days 为必填且 days 必须大于 0")
-    session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
-    user_input = {
-        "destination": payload.destination,
-        "days": payload.days,
-        "budget": payload.budget,
-        "preference": payload.preference,
-    }
-    llm_manager = _get_llm_manager()
-    kb_context_texts = _build_knowledge_context_texts(
-        payload.knowledge_base_id,
-        payload.destination,
-        payload.days,
-        payload.budget,
-        payload.preference,
-        payload.knowledge_query,
-    )
-    merged_context_texts = list(payload.context_texts or []) + kb_context_texts
-    trip_data = llm_manager.generate_trip(user_input, merged_context_texts)
-    if trip_data:
-        storage = _get_storage()
-        storage.store_trip_data(session_id, trip_data)
-    return TripGenerateResponse(session_id=session_id, trip_data=trip_data)
+    raise HTTPException(status_code=410, detail="旧接口已废弃，请使用 /api/flow/stream")
 
 
 @app.post("/api/trip/stream")
@@ -804,29 +932,24 @@ async def stream_trip_generation(
     message_id: Optional[str] = Query(None, description="流式消息ID"),
     last_sequence: Optional[int] = Query(None, description="断线续传序号"),
 ):
+    raise HTTPException(status_code=410, detail="旧接口已废弃，请使用 /api/flow/stream")
+
+
+@app.post("/api/flow/stream")
+async def stream_main_flow(
+    payload: FlowStreamRequest,
+    request: Request,
+    message_id: Optional[str] = Query(None, description="流式消息ID"),
+    last_sequence: Optional[int] = Query(None, description="断线续传序号"),
+):
     if not payload.destination or payload.days <= 0:
         raise HTTPException(status_code=400, detail="destination 和 days 为必填且 days 必须大于 0")
     session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
-    user_input = {
-        "destination": payload.destination,
-        "days": payload.days,
-        "budget": payload.budget,
-        "preference": payload.preference,
-    }
     llm_manager = _get_llm_manager()
-    kb_context_texts = _build_knowledge_context_texts(
-        payload.knowledge_base_id,
-        payload.destination,
-        payload.days,
-        payload.budget,
-        payload.preference,
-        payload.knowledge_query,
-    )
-    merged_context_texts = list(payload.context_texts or []) + kb_context_texts
-    await _cleanup_trip_streams()
-    async with _trip_streams_lock:
-        stream_id = message_id or f"trip-{datetime.now().strftime('%H%M%S%f')}"
-        stream_state = _trip_streams.get(stream_id)
+    await _cleanup_flow_streams()
+    async with _flow_streams_lock:
+        stream_id = message_id or f"flow-{datetime.now().strftime('%H%M%S%f')}"
+        stream_state = _flow_streams.get(stream_id)
         if not stream_state:
             stream_state = {
                 "message_id": stream_id,
@@ -837,18 +960,17 @@ async def stream_trip_generation(
                 "created_at": time.time(),
                 "updated_at": time.time(),
             }
-            _trip_streams[stream_id] = stream_state
+            _flow_streams[stream_id] = stream_state
         else:
             session_id = stream_state.get("session_id") or session_id
         if not stream_state.get("running") and not stream_state.get("done"):
             stream_state["running"] = True
             asyncio.create_task(
-                _run_trip_stream(
+                _run_flow_stream(
                     stream_id,
                     session_id,
                     llm_manager,
-                    user_input,
-                    merged_context_texts,
+                    payload,
                 )
             )
     header_sequence = request.headers.get("Last-Event-ID")
@@ -863,7 +985,7 @@ async def stream_trip_generation(
         while True:
             if await request.is_disconnected():
                 break
-            async with _trip_streams_lock:
+            async with _flow_streams_lock:
                 events = [
                     event
                     for event in stream_state.get("events", [])
@@ -874,7 +996,7 @@ async def stream_trip_generation(
                 for event in events:
                     current_sequence = int(event.get("sequence") or current_sequence)
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                    if event.get("event") in ("trip_data", "error"):
+                    if bool(event.get("is_final")):
                         return
             else:
                 if done:
@@ -964,36 +1086,9 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
     return TripReplanDayResponse(session_id=session_id, trip_data=merged_trip)
 
 
-def _run_agent_background(
-    thread_id: str,
-    user_input: Dict[str, Any],
-    agent_config: Dict[str, Any],
-    user_intent: str,
-    resume: bool,
-) -> None:
-    llm_manager = _get_llm_manager()
-    run_agent_loop_sync(
-        llm_manager=llm_manager,
-        user_input=user_input,
-        thread_id=thread_id,
-        agent_config=agent_config,
-        user_intent=user_intent,
-        resume=resume,
-    )
-
-
 @app.post("/api/agent/run", response_model=AgentRunResponse)
-def run_agent(payload: AgentRunRequest, background_tasks: BackgroundTasks) -> AgentRunResponse:
-    thread_id = payload.thread_id or _build_agent_thread_id(payload.user_id, payload.device_id)
-    background_tasks.add_task(
-        _run_agent_background,
-        thread_id,
-        payload.user_input or {},
-        payload.agent_config or {},
-        payload.user_intent or "generate_trip",
-        payload.resume,
-    )
-    return AgentRunResponse(thread_id=thread_id, status="started")
+def run_agent(payload: AgentRunRequest) -> AgentRunResponse:
+    raise HTTPException(status_code=410, detail="旧接口已废弃，Agent 已内嵌到 /api/flow/stream")
 
 
 @app.get("/api/agent/stream")
@@ -1002,30 +1097,7 @@ async def stream_agent_events(
     thread_id: str = Query(..., description="执行线程ID"),
     last_sequence: Optional[int] = Query(None, description="断线续传序号"),
 ):
-    header_sequence = request.headers.get("Last-Event-ID")
-    try:
-        header_sequence_value = int(header_sequence) if header_sequence else None
-    except Exception:
-        header_sequence_value = None
-    start_sequence = header_sequence_value if header_sequence_value is not None else last_sequence
-
-    async def event_generator():
-        current_sequence = int(start_sequence or 0)
-        while True:
-            if await request.is_disconnected():
-                break
-            events = event_bus.list(thread_id=thread_id, after_sequence=current_sequence, limit=200)
-            if events:
-                for event in events:
-                    payload = _build_stream_payload(event)
-                    current_sequence = int(payload.get("sequence") or current_sequence)
-                    yield _format_sse(payload)
-                    if payload.get("event") == "loop_end":
-                        return
-            else:
-                await asyncio.sleep(0.5)
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    raise HTTPException(status_code=410, detail="旧接口已废弃，Agent 事件已并入 /api/flow/stream")
 
 
 @app.get("/api/knowledge/bases", response_model=KnowledgeBaseListResponse)

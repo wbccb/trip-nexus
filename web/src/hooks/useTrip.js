@@ -1,8 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import { message } from "antd";
-// 引入行程生成接口与流式接口
 import {
-  generateTrip,
   replanTripDay,
   streamTripGeneration,
   updateTripData,
@@ -90,6 +88,7 @@ export function useTrip({
           destination: values.destination,
           // 天数
           days: values.days,
+          mode: values.mode || "fast",
           // 预算
           budget: values.budget || "",
           // 偏好
@@ -114,87 +113,35 @@ export function useTrip({
         } = streamOptions || {};
         // 初始化累计文本
         let accumulatedText = "";
-        // 记录是否触发流事件
-        let hasStreamEvent = false;
         // 暂存会话 ID
         let streamSessionId = null;
         // 暂存行程结果
         let streamTripData = null;
-        // 记录流式错误
-        let streamError = null;
-        try {
-          // 调用流式接口
-          await streamTripGeneration(payload, (event) => {
-            // 标记已收到流事件
-            hasStreamEvent = true;
-            // 读取事件类型
-            const eventType = event?.event || "";
-            // 读取增量文本
-            const deltaText = event?.content_delta || "";
-            // 流开始事件
-            if (eventType === "start") {
-              // 触发开始回调
-              if (onStreamStart) {
-                // 传递事件
-                onStreamStart(event);
-              }
-            }
-            // 流增量事件
-            if (eventType === "delta") {
-              // 追加增量文本
-              accumulatedText += deltaText;
-              // 触发增量回调
-              if (onStreamDelta) {
-                // 传递最新文本
-                onStreamDelta(accumulatedText, event);
-              }
-            }
-            // 流结束事件
-            if (eventType === "end") {
-              // 触发结束回调
-              if (onStreamEnd) {
-                // 传递最终文本
-                onStreamEnd(accumulatedText, event);
-              }
-            }
-            // 行程数据事件
-            if (eventType === "trip_data") {
-              // 暂存会话 ID
-              streamSessionId = event?.session_id || null;
-              // 暂存行程数据
-              streamTripData = event?.trip_data || null;
-              // 触发行程回调
-              if (onTripData) {
-                // 传递行程数据
-                onTripData(streamTripData, event);
-              }
-            }
-          });
-        } catch (error) {
-          // 记录流式错误
-          streamError = error;
-        }
-        // 若流式失败则回退同步接口
-        if (streamError || !hasStreamEvent) {
-          // 调用同步接口
-          const data = await generateTrip(payload);
-          // 更新会话 ID
-          if (data?.session_id) {
-            // 同步会话 ID
-            setActiveSessionId(data.session_id);
-            // 持久化会话 ID
-            localStorage.setItem(SESSION_STORAGE_KEY, data.session_id);
+        await streamTripGeneration(payload, (event) => {
+          const eventType = event?.event || "";
+          const deltaText = event?.content_delta || "";
+          const step = event?.step || "";
+          if (eventType === "start" && onStreamStart) {
+            onStreamStart(event);
           }
-          // 更新行程结果
-          setTripResult(data?.trip_data || null);
-          // 刷新会话列表
-          if (refreshSessions) {
-            // 等待刷新完成
-            await refreshSessions();
+          if (eventType === "delta") {
+            accumulatedText += deltaText;
+            if (onStreamDelta) {
+              onStreamDelta(accumulatedText, event);
+            }
           }
-          // 提前返回
-          return;
-        }
+          if (eventType === "end" && step === "finalize") {
+            streamSessionId = event?.session_id || null;
+            const eventPayload = event?.payload || {};
+            streamTripData = eventPayload?.trip_data || null;
+            if (onTripData) {
+              onTripData(streamTripData, event);
+            }
+            if (onStreamEnd) {
+              onStreamEnd(accumulatedText, event);
+            }
+          }
+        });
         // 若拿到会话 ID 则更新
         if (streamSessionId) {
           // 更新会话 ID

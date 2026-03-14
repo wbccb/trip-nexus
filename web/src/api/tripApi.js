@@ -21,7 +21,7 @@ export async function streamTripGeneration(payload, onEvent, options = {}) {
     : 800;
   let attempt = 0;
   while (attempt <= maxRetries) {
-    const url = new URL(`${API_BASE}/api/trip/stream`);
+    const url = new URL(`${API_BASE}/api/flow/stream`);
     if (currentMessageId) {
       url.searchParams.set("message_id", currentMessageId);
     }
