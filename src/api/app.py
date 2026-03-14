@@ -44,8 +44,8 @@ class SessionItem(BaseModel):
     update_time: str = Field(..., description="最后更新时间")
 
 
-class TripGenerateRequest(BaseModel):
-    """行程生成请求体"""
+class FlowRequestBase(BaseModel):
+    """主流程请求基础模型，描述一次规划任务的核心输入。"""
     user_id: str = Field(..., description="用户唯一ID")
     device_id: str = Field(..., description="设备唯一ID")
     session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
@@ -58,15 +58,9 @@ class TripGenerateRequest(BaseModel):
     knowledge_query: Optional[str] = Field(None, description="知识库检索查询（可选）")
 
 
-class FlowStreamRequest(TripGenerateRequest):
+class FlowStreamRequest(FlowRequestBase):
     """主流程流式请求体，扩展执行模式字段。"""
     mode: Optional[str] = Field("fast", description="执行模式：fast/deep")
-
-
-class TripGenerateResponse(BaseModel):
-    """行程生成响应体"""
-    session_id: str = Field(..., description="会话ID")
-    trip_data: Optional[Dict[str, Any]] = Field(None, description="结构化行程数据")
 
 
 class TripDataResponse(BaseModel):
@@ -210,21 +204,6 @@ class TripReplanDayRequest(BaseModel):
 class TripReplanDayResponse(BaseModel):
     session_id: str = Field(..., description="会话ID")
     trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
-
-
-class AgentRunRequest(BaseModel):
-    user_id: str = Field(..., description="用户唯一ID")
-    device_id: str = Field(..., description="设备唯一ID")
-    thread_id: Optional[str] = Field(None, description="执行线程ID")
-    user_intent: Optional[str] = Field("generate_trip", description="用户意图")
-    user_input: Dict[str, Any] = Field(default_factory=dict, description="用户输入")
-    agent_config: Dict[str, Any] = Field(default_factory=dict, description="Agent 配置")
-    resume: bool = Field(False, description="是否从快照恢复")
-
-
-class AgentRunResponse(BaseModel):
-    thread_id: str = Field(..., description="执行线程ID")
-    status: str = Field(..., description="启动状态")
 
 
 @lru_cache(maxsize=1)
@@ -898,21 +877,6 @@ def send_chat(payload: ChatSendRequest) -> ChatSendResponse:
     )
 
 
-@app.post("/api/trip/generate", response_model=TripGenerateResponse)
-def generate_trip(payload: TripGenerateRequest) -> TripGenerateResponse:
-    raise HTTPException(status_code=410, detail="旧接口已废弃，请使用 /api/flow/stream")
-
-
-@app.post("/api/trip/stream")
-async def stream_trip_generation(
-    payload: TripGenerateRequest,
-    request: Request,
-    message_id: Optional[str] = Query(None, description="流式消息ID"),
-    last_sequence: Optional[int] = Query(None, description="断线续传序号"),
-):
-    raise HTTPException(status_code=410, detail="旧接口已废弃，请使用 /api/flow/stream")
-
-
 @app.post("/api/flow/stream")
 async def stream_main_flow(
     payload: FlowStreamRequest,
@@ -1063,20 +1027,6 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
     merged_trip["daily_plan"] = current_daily_plan
     storage.store_trip_data(session_id, merged_trip)
     return TripReplanDayResponse(session_id=session_id, trip_data=merged_trip)
-
-
-@app.post("/api/agent/run", response_model=AgentRunResponse)
-def run_agent(payload: AgentRunRequest) -> AgentRunResponse:
-    raise HTTPException(status_code=410, detail="旧接口已废弃，Agent 已内嵌到 /api/flow/stream")
-
-
-@app.get("/api/agent/stream")
-async def stream_agent_events(
-    request: Request,
-    thread_id: str = Query(..., description="执行线程ID"),
-    last_sequence: Optional[int] = Query(None, description="断线续传序号"),
-):
-    raise HTTPException(status_code=410, detail="旧接口已废弃，Agent 事件已并入 /api/flow/stream")
 
 
 @app.get("/api/knowledge/bases", response_model=KnowledgeBaseListResponse)

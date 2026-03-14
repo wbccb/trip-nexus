@@ -1,4 +1,3 @@
-import { API_BASE, apiPost } from "./httpClient.js";
 export {
   getSessionHistory,
   getSessionTrip,
@@ -7,15 +6,14 @@ export {
   sendChatMessage,
   startSession,
 } from "./sessionApi.js";
-// 行程相关接口导出
+// 主流程与地图相关接口导出
 export {
-  generateTrip,
-  renderTripGeojson,
-  renderTripMap,
-  replanTripDay,
-  streamTripGeneration,
-  updateTripData,
-} from "./tripApi.js";
+  renderFlowGeojson,
+  renderFlowMap,
+  replanFlowDay,
+  streamMainFlow,
+  updateFlowTripData,
+} from "./flowApi.js";
 export {
   createKnowledgeBase,
   deleteKnowledgeBase,
@@ -25,12 +23,3 @@ export {
   uploadKnowledgeDocument,
 } from "./knowledgeApi.js";
 export { API_BASE, apiPost } from "./httpClient.js";
-
-export async function runAgent(payload) {
-  return apiPost("/api/agent/run", payload);
-}
-
-export function buildAgentStreamUrl(threadId, lastSequence) {
-  const sequenceValue = Number.isFinite(lastSequence) ? lastSequence : 0;
-  return `${API_BASE}/api/agent/stream?thread_id=${encodeURIComponent(threadId)}&last_sequence=${sequenceValue}`;
-}

@@ -59,10 +59,10 @@ export default function App() {
     uploadingKnowledge,
   } = useKnowledge()
   const {
-    handleTripSubmit,
-    handleReplanDay,
+    handleFlowSubmit,
+    handleFlowReplanDay,
     loadingTrip,
-    persistTripResult,
+    persistFlowTripResult,
     tripDays,
     tripResult,
     updateTripResult,
@@ -213,8 +213,8 @@ export default function App() {
     }
   }
 
-  // 处理行程表单提交
-  const handleTripFormSubmit = async (values) => {
+  // 处理主流程表单提交
+  const handleFlowFormSubmit = async (values) => {
     // 生成提示词文本
     const prompt = promptTemplate
       // 替换目的地
@@ -257,7 +257,7 @@ export default function App() {
     // 初始化流式文本
     let streamingText = ""
     // 调用行程生成（流式）
-    await handleTripSubmit(values, {
+    await handleFlowSubmit(values, {
       // 流开始回调
       onStreamStart: () => {
         // 更新为加载提示
@@ -378,9 +378,9 @@ export default function App() {
                       onSelectPoi={handleSelectPoi}
                       onTripChange={async (nextTrip) => {
                         updateTripResult(nextTrip)
-                        await persistTripResult(nextTrip)
+                        await persistFlowTripResult(nextTrip)
                       }}
-                      onReplanDay={handleReplanDay}
+                      onReplanDay={handleFlowReplanDay}
                     />
                   ),
                 },
@@ -477,7 +477,7 @@ export default function App() {
         okText="生成行程"
         confirmLoading={loadingTrip}
       >
-        <Form form={tripForm} layout="vertical" onFinish={handleTripFormSubmit}>
+        <Form form={tripForm} layout="vertical" onFinish={handleFlowFormSubmit}>
           <Form.Item
             label="目的地"
             name="destination"

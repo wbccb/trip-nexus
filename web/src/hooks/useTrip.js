@@ -1,9 +1,9 @@
 import { useCallback, useMemo, useState } from "react";
 import { message } from "antd";
 import {
-  replanTripDay,
-  streamTripGeneration,
-  updateTripData,
+  replanFlowDay,
+  streamMainFlow,
+  updateFlowTripData,
 } from "../api/index.js";
 import {
   DEFAULT_DEVICE_ID,
@@ -26,7 +26,8 @@ export function useTrip({
     setTripResult(data || null);
   }, []);
 
-  const persistTripResult = useCallback(
+  // 持久化主流程产物：将当前行程结果保存到后端会话
+  const persistFlowTripResult = useCallback(
     async (nextTrip, sessionOverride) => {
       if (!nextTrip) {
         return;
@@ -37,7 +38,7 @@ export function useTrip({
         session_id: sessionOverride || activeSessionId,
         trip_data: nextTrip,
       };
-      const data = await updateTripData(payload);
+      const data = await updateFlowTripData(payload);
       if (data?.session_id && data.session_id !== activeSessionId) {
         setActiveSessionId(data.session_id);
         localStorage.setItem(SESSION_STORAGE_KEY, data.session_id);
@@ -46,7 +47,8 @@ export function useTrip({
     [activeSessionId, setActiveSessionId],
   );
 
-  const handleReplanDay = useCallback(
+  // 单日重排：触发主流程的指定天重规划能力
+  const handleFlowReplanDay = useCallback(
     async (day) => {
       if (!day) {
         return null;
@@ -57,7 +59,7 @@ export function useTrip({
         session_id: activeSessionId,
         day,
       };
-      const data = await replanTripDay(payload);
+      const data = await replanFlowDay(payload);
       if (data?.session_id && data.session_id !== activeSessionId) {
         setActiveSessionId(data.session_id);
         localStorage.setItem(SESSION_STORAGE_KEY, data.session_id);
@@ -70,8 +72,8 @@ export function useTrip({
     [activeSessionId, setActiveSessionId],
   );
 
-  // 提交行程表单（支持流式）
-  const handleTripSubmit = useCallback(
+  // 主流程提交：发起流式规划并消费统一 SSE 事件
+  const handleFlowSubmit = useCallback(
     async (values, streamOptions = {}) => {
       try {
         // 标记加载状态
@@ -117,7 +119,7 @@ export function useTrip({
         let streamSessionId = null;
         // 暂存行程结果
         let streamTripData = null;
-        await streamTripGeneration(payload, (event) => {
+        await streamMainFlow(payload, (event) => {
           const eventType = event?.event || "";
           const deltaText = event?.content_delta || "";
           const step = event?.step || "";
@@ -177,12 +179,12 @@ export function useTrip({
   );
 
   return {
-    handleTripSubmit,
+    handleFlowSubmit,
     loadingTrip,
     tripDays,
     tripResult,
-    persistTripResult,
-    handleReplanDay,
+    persistFlowTripResult,
+    handleFlowReplanDay,
     updateTripResult,
   };
 }

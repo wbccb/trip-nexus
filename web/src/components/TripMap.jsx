@@ -4,7 +4,7 @@ import { DeckGL } from "@deck.gl/react"
 import { ScatterplotLayer, LineLayer, TextLayer } from "@deck.gl/layers"
 import { WebMercatorViewport } from "@deck.gl/core"
 import MapView from "react-map-gl/maplibre"
-import { renderTripGeojson } from "../api/index.js"
+import { renderFlowGeojson } from "../api/index.js"
 
 const logMap = (msg, data = {}) => {
   console.log(`[TripMap] ${msg}`, data)
@@ -73,7 +73,7 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
       setMapError("")
       
       logMap("请求地图 GeoJSON", { destination: currentTrip.destination })
-      const data = await renderTripGeojson({ trip_data: currentTrip })
+      const data = await renderFlowGeojson({ trip_data: currentTrip })
       
       if (mapRequestTokenRef.current !== token) {
         logMap("忽略过期的地图请求", { token, currentToken: mapRequestTokenRef.current })
