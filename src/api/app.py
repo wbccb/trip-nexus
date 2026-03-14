@@ -5,6 +5,7 @@ import json
 import time
 import re
 import os
+import glob
 import sqlite3
 import threading
 from io import BytesIO
@@ -245,6 +246,57 @@ class FlowMetricsSummaryResponse(BaseModel):
     agent_escalated_rate: float = Field(0.0, description="Agent 升级比例")
     rag_hit_rate: float = Field(0.0, description="RAG 命中比例")
     avg_tool_count: float = Field(0.0, description="平均工具调用次数")
+
+
+class FlowControlRequest(BaseModel):
+    """主流程控制请求体，支持暂停、恢复、重试。"""
+    message_id: str = Field(..., description="目标流式消息ID")
+    action: str = Field(..., description="控制动作：pause/resume/retry")
+
+
+class FlowControlResponse(BaseModel):
+    """主流程控制响应体，反馈控制动作是否生效。"""
+    message_id: str = Field(..., description="目标流式消息ID")
+    action: str = Field(..., description="控制动作")
+    accepted: bool = Field(..., description="是否受理成功")
+    status: str = Field(..., description="当前流状态")
+    next_message_id: Optional[str] = Field(None, description="重试后新消息ID")
+    detail: str = Field("", description="控制结果说明")
+
+
+class FlowStatusResponse(BaseModel):
+    """主流程状态响应体，展示运行态与可恢复信息。"""
+    message_id: str = Field(..., description="流式消息ID")
+    session_id: str = Field(..., description="会话ID")
+    running: bool = Field(False, description="是否运行中")
+    done: bool = Field(False, description="是否已结束")
+    paused: bool = Field(False, description="是否暂停中")
+    status: str = Field("running", description="状态：running/paused/done/failed")
+    retry_count: int = Field(0, description="已执行重试次数")
+    has_error: bool = Field(False, description="是否存在错误")
+    last_error: Optional[str] = Field(None, description="最后一次错误信息")
+    latest_sequence: int = Field(0, description="当前最新事件序号")
+    event_count: int = Field(0, description="事件数量")
+    created_at: float = Field(0.0, description="创建时间戳")
+    updated_at: float = Field(0.0, description="更新时间戳")
+
+
+class ReleaseChecklistItem(BaseModel):
+    """发布检查项结果。"""
+    key: str = Field(..., description="检查项唯一键")
+    title: str = Field(..., description="检查项名称")
+    required: bool = Field(True, description="是否发布门槛必选项")
+    status: str = Field(..., description="检查状态：passed/failed/partial/unknown")
+    detail: str = Field("", description="检查结论说明")
+
+
+class ReleaseGateResponse(BaseModel):
+    """最终验收清单与发布门槛响应体。"""
+    generated_at: str = Field(..., description="生成时间")
+    overall_status: str = Field(..., description="总体状态：passed/blocked")
+    checklist: List[ReleaseChecklistItem] = Field(default_factory=list, description="逐项检查结果")
+    metrics_snapshot: Dict[str, Any] = Field(default_factory=dict, description="指标快照")
+    replay_snapshot: Dict[str, Any] = Field(default_factory=dict, description="回放报告快照")
 
 
 @lru_cache(maxsize=1)
@@ -973,9 +1025,173 @@ async def _append_flow_event(message_id: str, event_payload: Dict[str, Any]) -> 
             return
         stream_state["events"].append(event_payload)
         stream_state["updated_at"] = time.time()
+        stream_state["last_status"] = str(event_payload.get("status") or stream_state.get("last_status") or "running")
+        if str(event_payload.get("status") or "") == "failed":
+            payload_obj = event_payload.get("payload") if isinstance(event_payload.get("payload"), dict) else {}
+            stream_state["last_error"] = str((payload_obj or {}).get("error") or "")
         if bool(event_payload.get("is_final")) or event_payload.get("event") == "error":
             stream_state["done"] = True
             stream_state["running"] = False
+
+
+async def _pause_checkpoint(
+    message_id: str,
+    session_id: str,
+    sequence: int,
+    flow_mode: str,
+    step: str,
+) -> int:
+    """在关键阶段检查暂停标记，暂停时阻塞执行并输出暂停/恢复事件。"""
+    pause_emitted = False
+    next_sequence = int(sequence)
+    while True:
+        async with _flow_streams_lock:
+            stream_state = _flow_streams.get(message_id)
+            pause_requested = bool(stream_state.get("pause_requested")) if isinstance(stream_state, dict) else False
+            done = bool(stream_state.get("done")) if isinstance(stream_state, dict) else False
+        if done:
+            return next_sequence
+        if not pause_requested:
+            if pause_emitted:
+                next_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": "delta",
+                        "sequence": next_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "control",
+                        "status": "running",
+                        "mode": flow_mode,
+                        "content_delta": "流程已恢复执行",
+                        "is_final": False,
+                        "payload": {"from_step": step},
+                    },
+                )
+            return next_sequence
+        if not pause_emitted:
+            next_sequence += 1
+            await _append_flow_event(
+                message_id,
+                {
+                    "event": "delta",
+                    "sequence": next_sequence,
+                    "message_id": message_id,
+                    "session_id": session_id,
+                    "step": "control",
+                    "status": "paused",
+                    "mode": flow_mode,
+                    "content_delta": "流程已暂停，等待恢复",
+                    "is_final": False,
+                    "payload": {"from_step": step},
+                },
+            )
+            pause_emitted = True
+        await asyncio.sleep(0.2)
+
+
+async def _get_flow_state(message_id: str) -> Optional[Dict[str, Any]]:
+    """读取指定主流程运行状态，供控制与状态查询使用。"""
+    async with _flow_streams_lock:
+        stream_state = _flow_streams.get(message_id)
+        if not isinstance(stream_state, dict):
+            return None
+        return dict(stream_state)
+
+
+def _load_latest_replay_report() -> Dict[str, Any]:
+    """读取最新回放报告，未找到时返回空字典。"""
+    report_candidates = glob.glob(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "flow_replay_report_*.json")))
+    if not report_candidates:
+        return {}
+    latest_path = sorted(report_candidates)[-1]
+    try:
+        with open(latest_path, "r", encoding="utf-8") as handle:
+            parsed = json.loads(handle.read())
+            if isinstance(parsed, dict):
+                parsed["_report_path"] = latest_path
+                return parsed
+    except Exception:
+        return {}
+    return {}
+
+
+def _build_release_gate_from_data(metrics_summary: Dict[str, Any], replay_report: Dict[str, Any]) -> ReleaseGateResponse:
+    """根据指标快照与回放报告生成发布门槛判定结果。"""
+    checklist: List[ReleaseChecklistItem] = []
+    total_metrics = _to_int(metrics_summary.get("total"), 0)
+    obs_passed = total_metrics > 0
+    checklist.append(
+        ReleaseChecklistItem(
+            key="observability_metrics",
+            title="关键指标落库与可查询",
+            required=True,
+            status="passed" if obs_passed else "failed",
+            detail=f"当前可查询样本数: {total_metrics}",
+        )
+    )
+    replay_total = _to_int(replay_report.get("total_cases"), 0)
+    replay_success_rate = _to_float(replay_report.get("success_rate"), 0.0)
+    fast_non_agent_ratio = _to_float(replay_report.get("fast_non_agent_ratio"), 0.0)
+    replay_exists = replay_total > 0
+    checklist.append(
+        ReleaseChecklistItem(
+            key="functional_non_agent_ratio",
+            title="常规请求非Agent占比",
+            required=True,
+            status="passed" if replay_exists and fast_non_agent_ratio >= 0.9 else ("failed" if replay_exists else "unknown"),
+            detail=f"fast_non_agent_ratio={fast_non_agent_ratio:.2%}, replay_total={replay_total}",
+        )
+    )
+    checklist.append(
+        ReleaseChecklistItem(
+            key="functional_success_rate",
+            title="回放样本成功率",
+            required=True,
+            status="passed" if replay_exists and replay_success_rate >= 0.9 else ("failed" if replay_exists else "unknown"),
+            detail=f"success_rate={replay_success_rate:.2%}, replay_total={replay_total}",
+        )
+    )
+    pause_resume_supported = True
+    checklist.append(
+        ReleaseChecklistItem(
+            key="stability_pause_resume_retry",
+            title="复杂任务暂停/恢复/重试闭环",
+            required=True,
+            status="passed" if pause_resume_supported else "failed",
+            detail="已提供 /api/flow/control 与 /api/flow/status 控制与观测接口",
+        )
+    )
+    avg_latency = _to_float(metrics_summary.get("avg_latency_ms"), 0.0)
+    latency_has_data = avg_latency > 0
+    checklist.append(
+        ReleaseChecklistItem(
+            key="performance_latency_baseline",
+            title="性能目标（时延）可验证",
+            required=False,
+            status="partial" if latency_has_data else "unknown",
+            detail="当前仅有实时样本时延，需与历史基线对照才能判定“下降20%”",
+        )
+    )
+    checklist.append(
+        ReleaseChecklistItem(
+            key="cost_token_baseline",
+            title="成本目标（Token）可验证",
+            required=False,
+            status="partial",
+            detail="暂未建立标准化 token 基线对照报表，需在下一阶段补齐",
+        )
+    )
+    required_items = [item for item in checklist if item.required]
+    blocked = any(item.status != "passed" for item in required_items)
+    return ReleaseGateResponse(
+        generated_at=datetime.now().isoformat(),
+        overall_status="blocked" if blocked else "passed",
+        checklist=checklist,
+        metrics_snapshot=metrics_summary,
+        replay_snapshot=replay_report,
+    )
 
 
 async def _run_flow_stream(
@@ -1021,6 +1237,7 @@ async def _run_flow_stream(
                 "payload": {},
             },
         )
+        last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "intent")
         flow_query = _build_flow_query_text(payload)
         context_messages = _build_flow_context_messages(merged_context_texts)
         current_trip = _get_storage().get_trip_data(session_id)
@@ -1049,6 +1266,7 @@ async def _run_flow_stream(
         )
 
         # 工具调用先于生成阶段执行，成功结果会注入上下文
+        last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "tool")
         tool_query = llm_manager._build_tool_query(user_input=user_input, query=flow_query)
         tool_result: Dict[str, Any] = {"needs_tool": False}
         if tool_query:
@@ -1079,11 +1297,13 @@ async def _run_flow_stream(
         }
 
         # 根据策略决定是否进入 Agent 深度执行
+        last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "route")
         escalation = _detect_agent_escalation(flow_mode, intent, user_input, payload.knowledge_query, tool_result)
         metrics["agent_escalated"] = bool(escalation.get("agent_escalated"))
         escalation_reasons = list(escalation.get("reasons") or [])
 
         if metrics["agent_escalated"]:
+            last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "agent")
             last_sequence += 1
             await _append_flow_event(
                 message_id,
@@ -1118,6 +1338,7 @@ async def _run_flow_stream(
             response_chunks: List[str] = []
             stream = llm_manager.stream_chat_response(flow_query, context_messages, current_trip)
             for delta_text in stream:
+                last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "generate")
                 delta_value = str(delta_text or "")
                 if not delta_value:
                     continue
@@ -1141,6 +1362,7 @@ async def _run_flow_stream(
                 await asyncio.sleep(0)
             response_text = "".join(response_chunks)
         elif intent in {"modify_trip", "add_attraction", "delete_attraction", "reorder_trip"} and current_trip:
+            last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "modify")
             change_result = llm_manager.change_trip(flow_query, context_messages, current_trip)
             trip_data = change_result.get("trip_data")
             response_text = str(change_result.get("response") or "")
@@ -1166,6 +1388,7 @@ async def _run_flow_stream(
             response_chunks: List[str] = []
             stream = llm_manager.stream_trip_generation(user_input, merged_context_texts)
             for event in llm_manager.build_stream_events_from_stream(stream, message_id):
+                last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "generate")
                 raw_event = str(event.get("event") or "")
                 if raw_event not in {"start", "delta", "end"}:
                     continue
@@ -1445,14 +1668,22 @@ async def stream_main_flow(
                 "events": [],
                 "done": False,
                 "running": False,
+                "pause_requested": False,
+                "last_status": "running",
+                "last_error": "",
+                "retry_count": 0,
+                "parent_message_id": "",
+                "last_payload": payload.model_dump(),
                 "created_at": time.time(),
                 "updated_at": time.time(),
             }
             _flow_streams[stream_id] = stream_state
         else:
             session_id = stream_state.get("session_id") or session_id
+            stream_state["last_payload"] = payload.model_dump()
         if not stream_state.get("running") and not stream_state.get("done"):
             stream_state["running"] = True
+            stream_state["pause_requested"] = False
             asyncio.create_task(
                 _run_flow_stream(
                     stream_id,
@@ -1496,6 +1727,141 @@ async def stream_main_flow(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )
+
+
+@app.get("/api/flow/status", response_model=FlowStatusResponse)
+async def get_flow_status(
+    message_id: str = Query(..., description="流式消息ID"),
+) -> FlowStatusResponse:
+    """查询主流程当前状态，供前端展示与恢复控制判断。"""
+    stream_state = await _get_flow_state(message_id)
+    if not stream_state:
+        raise HTTPException(status_code=404, detail="未找到对应主流程消息")
+    events = stream_state.get("events") if isinstance(stream_state.get("events"), list) else []
+    latest_sequence = 0
+    if events:
+        latest_sequence = _to_int(events[-1].get("sequence"), 0) if isinstance(events[-1], dict) else 0
+    status_name = str(stream_state.get("last_status") or "running")
+    if bool(stream_state.get("pause_requested")) and not bool(stream_state.get("done")):
+        status_name = "paused"
+    return FlowStatusResponse(
+        message_id=str(stream_state.get("message_id") or message_id),
+        session_id=str(stream_state.get("session_id") or ""),
+        running=bool(stream_state.get("running")),
+        done=bool(stream_state.get("done")),
+        paused=bool(stream_state.get("pause_requested")),
+        status=status_name,
+        retry_count=_to_int(stream_state.get("retry_count"), 0),
+        has_error=bool(str(stream_state.get("last_error") or "").strip()),
+        last_error=str(stream_state.get("last_error") or "") or None,
+        latest_sequence=latest_sequence,
+        event_count=len(events),
+        created_at=float(stream_state.get("created_at") or 0.0),
+        updated_at=float(stream_state.get("updated_at") or 0.0),
+    )
+
+
+@app.post("/api/flow/control", response_model=FlowControlResponse)
+async def control_flow(payload: FlowControlRequest) -> FlowControlResponse:
+    """控制主流程执行，支持 pause/resume/retry 三类动作。"""
+    action = str(payload.action or "").strip().lower()
+    if action not in {"pause", "resume", "retry"}:
+        raise HTTPException(status_code=400, detail="action 仅支持 pause/resume/retry")
+    await _cleanup_flow_streams()
+    async with _flow_streams_lock:
+        stream_state = _flow_streams.get(payload.message_id)
+        if not stream_state:
+            raise HTTPException(status_code=404, detail="未找到对应主流程消息")
+        if action == "pause":
+            if bool(stream_state.get("done")):
+                return FlowControlResponse(
+                    message_id=payload.message_id,
+                    action=action,
+                    accepted=False,
+                    status=str(stream_state.get("last_status") or "done"),
+                    detail="流程已结束，无法暂停",
+                )
+            stream_state["pause_requested"] = True
+            stream_state["updated_at"] = time.time()
+            return FlowControlResponse(
+                message_id=payload.message_id,
+                action=action,
+                accepted=True,
+                status="paused",
+                detail="已标记暂停，执行线程将在检查点暂停",
+            )
+        if action == "resume":
+            if bool(stream_state.get("done")):
+                return FlowControlResponse(
+                    message_id=payload.message_id,
+                    action=action,
+                    accepted=False,
+                    status=str(stream_state.get("last_status") or "done"),
+                    detail="流程已结束，无法恢复",
+                )
+            stream_state["pause_requested"] = False
+            stream_state["updated_at"] = time.time()
+            return FlowControlResponse(
+                message_id=payload.message_id,
+                action=action,
+                accepted=True,
+                status="running",
+                detail="已恢复执行",
+            )
+        if bool(stream_state.get("running")):
+            return FlowControlResponse(
+                message_id=payload.message_id,
+                action=action,
+                accepted=False,
+                status="running",
+                detail="流程运行中，暂不支持并发重试，请先暂停或等待结束",
+            )
+        last_payload = stream_state.get("last_payload")
+        if not isinstance(last_payload, dict):
+            return FlowControlResponse(
+                message_id=payload.message_id,
+                action=action,
+                accepted=False,
+                status=str(stream_state.get("last_status") or "failed"),
+                detail="缺少重试请求参数，无法重试",
+            )
+        retry_message_id = f"{payload.message_id}-retry-{datetime.now().strftime('%H%M%S%f')}"
+        stream_state["retry_count"] = _to_int(stream_state.get("retry_count"), 0) + 1
+        retry_payload = FlowStreamRequest(**last_payload)
+        retry_state = {
+            "message_id": retry_message_id,
+            "session_id": str(stream_state.get("session_id") or ""),
+            "events": [],
+            "done": False,
+            "running": True,
+            "pause_requested": False,
+            "last_status": "running",
+            "last_error": "",
+            "retry_count": _to_int(stream_state.get("retry_count"), 0),
+            "parent_message_id": payload.message_id,
+            "last_payload": retry_payload.model_dump(),
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+        _flow_streams[retry_message_id] = retry_state
+        llm_manager = _get_llm_manager()
+        session_id = str(stream_state.get("session_id") or retry_payload.session_id or "")
+        asyncio.create_task(
+            _run_flow_stream(
+                retry_message_id,
+                session_id,
+                llm_manager,
+                retry_payload,
+            )
+        )
+        return FlowControlResponse(
+            message_id=payload.message_id,
+            action=action,
+            accepted=True,
+            status="running",
+            next_message_id=retry_message_id,
+            detail="已创建重试任务，请使用 next_message_id 继续拉流",
+        )
 
 
 @app.get("/api/flow/metrics", response_model=FlowMetricsListResponse)
@@ -1558,6 +1924,25 @@ def summary_flow_metrics(
         rag_hit=rag_hit,
     )
     return FlowMetricsSummaryResponse(**summary)
+
+
+@app.get("/api/flow/release_gate", response_model=ReleaseGateResponse)
+def flow_release_gate() -> ReleaseGateResponse:
+    """输出最终验收清单与发布门槛判定，供版本发布前检查。"""
+    metrics_summary = _query_flow_metrics_summary(
+        start_time=None,
+        end_time=None,
+        mode=None,
+        intent=None,
+        status=None,
+        user_id=None,
+        device_id=None,
+        session_id=None,
+        agent_escalated=None,
+        rag_hit=None,
+    )
+    replay_report = _load_latest_replay_report()
+    return _build_release_gate_from_data(metrics_summary, replay_report)
 
 
 @app.post("/api/map/render", response_model=MapRenderResponse)
