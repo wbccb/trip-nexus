@@ -239,27 +239,27 @@ class TripMap:
         all_coords: List[Tuple[float, float]] = []
         day_items = sorted(
             daily_plans_grouped.items(),
-            key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]),
+            key=lambda x: int(str(x[0])) if str(x[0]).isdigit() else str(x[0]),
         )
-        for day_str, items in day_items:
-            try:
-                day_idx = int(day_str) - 1
-            except ValueError:
-                continue
+        for day_idx, (day_str, items) in enumerate(day_items):
             coords_list: List[Tuple[float, float]] = []
             overlap_counter: Dict[Tuple[float, float], int] = {}
             for idx, item in enumerate(items):
                 address = item.get("address")
                 attraction = item.get("attraction", "未知景点")
+                if address:
+                    query_address = address
+                elif attraction:
+                    query_address = f"{dest}{attraction}"
+                else:
+                    query_address = dest
                 lat = item.get("latitude")
                 lon = item.get("longitude")
                 if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and not (lat == 0 and lon == 0):
                     coords = (float(lat), float(lon))
                 else:
-                    if not address:
-                        continue
                     coords = self._get_coordinates(
-                        address,
+                        query_address,
                         city_name=dest,
                         attraction_name=attraction,
                         fallback=center_coords,
@@ -282,7 +282,7 @@ class TripMap:
                             "day": day_str,
                             "order": idx + 1,
                             "attraction": attraction,
-                            "address": address,
+                            "address": address or "",
                             "time": item.get("time"),
                             "transport": item.get("transport"),
                             "duration": item.get("duration"),

@@ -222,11 +222,10 @@ export default function TripTab({
     [onSelectPoi],
   )
   const handleCardClick = useCallback(
-    (poiId, dayKey, index, item) => {
+    (poiId) => {
       handleSelectPoi(poiId)
-      handleOpenEdit(dayKey, index, item)
     },
-    [handleOpenEdit, handleSelectPoi],
+    [handleSelectPoi],
   )
   const handleEditOk = useCallback(async () => {
     if (!editingItem || !draftTrip?.daily_plan) {
@@ -328,7 +327,7 @@ export default function TripTab({
                                   }}
                                   itemRef={(node) => setCardRef(itemId, node)}
                                   isSelected={selectedPoiId === itemId}
-                                  onCardClick={() => handleCardClick(itemId, dayKey, index, item)}
+                                  onCardClick={() => handleCardClick(itemId)}
                                   onEdit={() => handleOpenEdit(dayKey, index, item)}
                                   onDelete={() => handleDeleteItem(dayKey, index)}
                                 />
