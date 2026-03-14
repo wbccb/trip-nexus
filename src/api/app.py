@@ -53,6 +53,7 @@ class FlowRequestBase(BaseModel):
     days: int = Field(..., description="行程天数")
     budget: Optional[str] = Field(None, description="预算（可选）")
     preference: Optional[str] = Field(None, description="偏好（可选）")
+    message: Optional[str] = Field(None, description="用户自然语言任务描述（可选）")
     context_texts: List[str] = Field(default_factory=list, description="上下文文本列表")
     knowledge_base_id: Optional[str] = Field(None, description="知识库ID（可选）")
     knowledge_query: Optional[str] = Field(None, description="知识库检索查询（可选）")
@@ -457,6 +458,7 @@ def _normalize_flow_mode(mode: Optional[str]) -> str:
 
 def _detect_agent_escalation(
     mode: str,
+    intent: str,
     user_input: Dict[str, Any],
     knowledge_query: Optional[str],
     tool_result: Optional[Dict[str, Any]],
@@ -466,6 +468,8 @@ def _detect_agent_escalation(
     days_value = int(user_input.get("days") or 0)
     if mode == "deep":
         reasons.append("deep_mode")
+    if intent in {"modify_trip", "reorder_trip", "add_attraction", "delete_attraction"}:
+        reasons.append("complex_intent")
     if days_value >= 4:
         reasons.append("multi_step_days")
     if knowledge_query and str(knowledge_query).strip():
@@ -474,6 +478,66 @@ def _detect_agent_escalation(
         if tool_result.get("needs_tool") and not ((tool_result.get("result") or {}).get("success")):
             reasons.append("tool_retry_or_fallback")
     return {"agent_escalated": len(reasons) > 0, "reasons": reasons}
+
+
+def _build_flow_query_text(payload: FlowStreamRequest) -> str:
+    """构建主流程查询文本，优先使用 message，缺失时回退结构化拼接。"""
+    message_value = str(getattr(payload, "message", "") or "").strip()
+    if message_value:
+        return message_value
+    parts: List[str] = []
+    destination = str(payload.destination or "").strip()
+    if destination:
+        parts.append(f"目的地 {destination}")
+    if int(payload.days or 0) > 0:
+        parts.append(f"{int(payload.days)} 天")
+    budget = str(payload.budget or "").strip()
+    if budget:
+        parts.append(f"预算 {budget}")
+    preference = str(payload.preference or "").strip()
+    if preference:
+        parts.append(f"偏好 {preference}")
+    knowledge_query = str(payload.knowledge_query or "").strip()
+    if knowledge_query:
+        parts.append(f"知识需求 {knowledge_query}")
+    return "，".join(parts) or destination
+
+
+def _build_flow_context_messages(context_texts: List[str]) -> List[Dict[str, str]]:
+    """将上下文文本转换为分析模型可消费的角色消息结构。"""
+    normalized: List[Dict[str, str]] = []
+    for text in context_texts or []:
+        content = str(text or "").strip()
+        if not content:
+            continue
+        normalized.append({"role": "user", "content": content})
+        if len(normalized) >= _FLOW_CONTEXT_MAX_ITEMS:
+            break
+    return normalized
+
+
+def _merge_context_with_budget(context_texts: List[str]) -> List[str]:
+    """对主流程上下文做去重与证据预算裁剪，避免冗余与超长输入。"""
+    deduped: List[str] = []
+    seen: set[str] = set()
+    total_chars = 0
+    for raw_text in context_texts or []:
+        text = str(raw_text or "").strip()
+        if not text:
+            continue
+        normalized_key = " ".join(text.split()).lower()
+        if normalized_key in seen:
+            continue
+        bounded_text = text[:_FLOW_CONTEXT_ITEM_MAX_CHARS]
+        next_total = total_chars + len(bounded_text)
+        if next_total > _FLOW_CONTEXT_TOTAL_MAX_CHARS:
+            break
+        seen.add(normalized_key)
+        deduped.append(bounded_text)
+        total_chars = next_total
+        if len(deduped) >= _FLOW_CONTEXT_MAX_ITEMS:
+            break
+    return deduped
 
 
 def _row_to_session_item(row: Any) -> Dict[str, str]:
@@ -528,6 +592,9 @@ app.add_middleware(
 _flow_streams: Dict[str, Dict[str, Any]] = {}
 _flow_streams_lock = asyncio.Lock()
 _FLOW_STREAM_TTL_SECONDS = 600
+_FLOW_CONTEXT_MAX_ITEMS = 12
+_FLOW_CONTEXT_ITEM_MAX_CHARS = 600
+_FLOW_CONTEXT_TOTAL_MAX_CHARS = 3200
 
 
 async def _cleanup_flow_streams() -> None:
@@ -566,6 +633,7 @@ async def _run_flow_stream(
 ) -> None:
     """执行单主流程编排：工具与RAG增强、条件升级 Agent、统一流式事件输出。"""
     last_sequence = 0
+    started_at = time.perf_counter()
     flow_mode = _normalize_flow_mode(payload.mode)
     metrics: Dict[str, Any] = {
         "tool_count": 0,
@@ -581,6 +649,7 @@ async def _run_flow_stream(
         "preference": payload.preference,
     }
     merged_context_texts = list(payload.context_texts or [])
+    response_text = ""
     try:
         # 初始化主流程 start 事件，通知前端进入统一状态机
         last_sequence += 1
@@ -599,6 +668,43 @@ async def _run_flow_stream(
                 "payload": {},
             },
         )
+        flow_query = _build_flow_query_text(payload)
+        context_messages = _build_flow_context_messages(merged_context_texts)
+        current_trip = _get_storage().get_trip_data(session_id)
+        intent_data = llm_manager.analyze_user_message(flow_query, context_messages, current_trip)
+        intent = str(intent_data.get("intent") or "generate_trip")
+        metrics["intent"] = intent
+        last_sequence += 1
+        await _append_flow_event(
+            message_id,
+            {
+                "event": "delta",
+                "sequence": last_sequence,
+                "message_id": message_id,
+                "session_id": session_id,
+                "step": "intent",
+                "status": "done",
+                "mode": flow_mode,
+                "content_delta": f"意图识别完成：{intent}",
+                "is_final": False,
+                "payload": {
+                    "intent": intent,
+                    "summary": intent_data.get("summary"),
+                    "needs_more_info": bool(intent_data.get("needs_more_info")),
+                },
+            },
+        )
+
+        # 工具调用先于生成阶段执行，成功结果会注入上下文
+        tool_query = llm_manager._build_tool_query(user_input=user_input, query=flow_query)
+        tool_result: Dict[str, Any] = {"needs_tool": False}
+        if tool_query:
+            tool_result = llm_manager.call_tool_by_llm(tool_query, context_messages)
+            if tool_result.get("needs_tool"):
+                metrics["tool_count"] = 1
+                result_payload = tool_result.get("result")
+                if isinstance(result_payload, dict) and result_payload.get("success"):
+                    merged_context_texts.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
         kb_context_texts = _build_knowledge_context_texts(
             payload.knowledge_base_id,
             payload.destination,
@@ -610,20 +716,17 @@ async def _run_flow_stream(
         merged_context_texts.extend(kb_context_texts)
         if kb_context_texts:
             metrics["rag_hit"] = True
-
-        # 工具调用先于生成阶段执行，成功结果会注入上下文
-        tool_query = llm_manager._build_tool_query(user_input=user_input, query=payload.knowledge_query or payload.destination)
-        tool_result: Dict[str, Any] = {"needs_tool": False}
-        if tool_query:
-            tool_result = llm_manager.call_tool_by_llm(tool_query, [])
-            if tool_result.get("needs_tool"):
-                metrics["tool_count"] = 1
-                result_payload = tool_result.get("result")
-                if isinstance(result_payload, dict) and result_payload.get("success"):
-                    merged_context_texts.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
+        merged_context_texts = _merge_context_with_budget(merged_context_texts)
+        metrics["context_count"] = len(merged_context_texts)
+        metrics["context_chars"] = sum([len(item) for item in merged_context_texts])
+        metrics["context_budget"] = {
+            "max_items": _FLOW_CONTEXT_MAX_ITEMS,
+            "item_max_chars": _FLOW_CONTEXT_ITEM_MAX_CHARS,
+            "total_max_chars": _FLOW_CONTEXT_TOTAL_MAX_CHARS,
+        }
 
         # 根据策略决定是否进入 Agent 深度执行
-        escalation = _detect_agent_escalation(flow_mode, user_input, payload.knowledge_query, tool_result)
+        escalation = _detect_agent_escalation(flow_mode, intent, user_input, payload.knowledge_query, tool_result)
         metrics["agent_escalated"] = bool(escalation.get("agent_escalated"))
         escalation_reasons = list(escalation.get("reasons") or [])
 
@@ -658,6 +761,53 @@ async def _run_flow_stream(
                 draft_trip = final_state.final_payload.get("draft_trip")
                 if isinstance(draft_trip, dict) and draft_trip:
                     trip_data = draft_trip
+        elif intent == "general_conversation":
+            response_chunks: List[str] = []
+            stream = llm_manager.stream_chat_response(flow_query, context_messages, current_trip)
+            for delta_text in stream:
+                delta_value = str(delta_text or "")
+                if not delta_value:
+                    continue
+                response_chunks.append(delta_value)
+                last_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": "delta",
+                        "sequence": last_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "generate",
+                        "status": "running",
+                        "mode": flow_mode,
+                        "content_delta": delta_value,
+                        "is_final": False,
+                        "payload": {},
+                    },
+                )
+                await asyncio.sleep(0)
+            response_text = "".join(response_chunks)
+        elif intent in {"modify_trip", "add_attraction", "delete_attraction", "reorder_trip"} and current_trip:
+            change_result = llm_manager.change_trip(flow_query, context_messages, current_trip)
+            trip_data = change_result.get("trip_data")
+            response_text = str(change_result.get("response") or "")
+            if response_text:
+                last_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": "delta",
+                        "sequence": last_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "generate",
+                        "status": "running",
+                        "mode": flow_mode,
+                        "content_delta": response_text,
+                        "is_final": False,
+                        "payload": {"intent": intent},
+                    },
+                )
         else:
             # 常规模式：直接走行程文本流并在末尾解析为结构化 trip_data
             response_chunks: List[str] = []
@@ -693,6 +843,7 @@ async def _run_flow_stream(
 
         if trip_data:
             _get_storage().store_trip_data(session_id, trip_data)
+        metrics["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
 
         # 统一 finalize 终态事件，输出 trip_data 与关键指标
         last_sequence += 1
@@ -710,6 +861,7 @@ async def _run_flow_stream(
                 "is_final": True,
                 "payload": {
                     "trip_data": trip_data,
+                    "response_text": response_text,
                     "metrics": metrics,
                     "agent_escalated": metrics["agent_escalated"],
                     "escalation_reasons": escalation_reasons,

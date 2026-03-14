@@ -80,6 +80,17 @@ export default function App() {
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false)
   const [isTripModalOpen, setIsTripModalOpen] = useState(false)
   const [selectedPoiId, setSelectedPoiId] = useState("")
+  const [flowRuntimeStatus, setFlowRuntimeStatus] = useState({
+    intent: "",
+    latencyMs: 0,
+    contextCount: 0,
+    contextChars: 0,
+    contextBudget: {
+      max_items: 0,
+      item_max_chars: 0,
+      total_max_chars: 0,
+    },
+  })
   const [tripForm] = Form.useForm()
 
   const sessionTitle = useMemo(() => {
@@ -215,6 +226,17 @@ export default function App() {
 
   // 处理主流程表单提交
   const handleFlowFormSubmit = async (values) => {
+    setFlowRuntimeStatus({
+      intent: "",
+      latencyMs: 0,
+      contextCount: 0,
+      contextChars: 0,
+      contextBudget: {
+        max_items: 0,
+        item_max_chars: 0,
+        total_max_chars: 0,
+      },
+    })
     // 生成提示词文本
     const prompt = promptTemplate
       // 替换目的地
@@ -264,14 +286,33 @@ export default function App() {
         updateChatMessageById(assistantMessageId, "行程生成中...")
       },
       // 流增量回调
-      onStreamDelta: (nextText) => {
+      onStreamDelta: (nextText, event) => {
         // 缓存最新文本
         streamingText = nextText || ""
+        if (event?.step === "intent" && event?.payload?.intent) {
+          setFlowRuntimeStatus((prev) => ({
+            ...prev,
+            intent: String(event.payload.intent || ""),
+          }))
+        }
         // 更新聊天内容
         updateChatMessageById(assistantMessageId, streamingText || "行程生成中...")
       },
       // 流结束回调
-      onStreamEnd: () => {
+      onStreamEnd: (_, event) => {
+        const metrics = event?.payload?.metrics || {}
+        setFlowRuntimeStatus((prev) => ({
+          ...prev,
+          intent: String(metrics?.intent || prev.intent || ""),
+          latencyMs: Number(metrics?.latency_ms || 0),
+          contextCount: Number(metrics?.context_count || 0),
+          contextChars: Number(metrics?.context_chars || 0),
+          contextBudget: {
+            max_items: Number(metrics?.context_budget?.max_items || 0),
+            item_max_chars: Number(metrics?.context_budget?.item_max_chars || 0),
+            total_max_chars: Number(metrics?.context_budget?.total_max_chars || 0),
+          },
+        }))
         // 若无流内容则使用默认提示
         if (!streamingText) {
           // 更新聊天内容
@@ -412,7 +453,21 @@ export default function App() {
                   label: "执行模式",
                   children: (
                     <Card size="small" title="主流程模式">
-                      当前已切换为单主流程架构。请在“行程输入”中选择极速模式（fast）或深度模式（deep）。
+                      <div>当前已切换为单主流程架构。请在“行程输入”中选择极速模式（fast）或深度模式（deep）。</div>
+                      <div>intent：{flowRuntimeStatus.intent || "暂无"}</div>
+                      <div>latency：{flowRuntimeStatus.latencyMs > 0 ? `${flowRuntimeStatus.latencyMs} ms` : "暂无"}</div>
+                      <div>
+                        context budget（items）：
+                        {flowRuntimeStatus.contextCount > 0 || flowRuntimeStatus.contextBudget.max_items > 0
+                          ? `${flowRuntimeStatus.contextCount}/${flowRuntimeStatus.contextBudget.max_items || "-"}`
+                          : "暂无"}
+                      </div>
+                      <div>
+                        context budget（chars）：
+                        {flowRuntimeStatus.contextChars > 0 || flowRuntimeStatus.contextBudget.total_max_chars > 0
+                          ? `${flowRuntimeStatus.contextChars}/${flowRuntimeStatus.contextBudget.total_max_chars || "-"}`
+                          : "暂无"}
+                      </div>
                     </Card>
                   ),
                 },
