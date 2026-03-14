@@ -8,7 +8,7 @@ from io import BytesIO
 from functools import lru_cache  # 用于缓存全局单例对象，减少重复初始化
 from typing import Any, Dict, List, Optional  # 提供类型注解，便于接口契约清晰
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile  # FastAPI 框架与错误处理
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile  # FastAPI 框架与错误处理
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware  # 允许前端跨域访问
 from pydantic import BaseModel, Field  # 数据模型与字段校验
@@ -23,8 +23,6 @@ from src.map.map_renderer import TripMap
 from src.rag.rag_main import AIRetrievalPipeline  # 知识库检索流水线
 from src.rag.store.vector_store import VectorStore
 from src.agent import run_agent_loop_sync
-from src.agent.event_bus import event_bus
-from src.agent.plan_models import TripState
 
 
 class StartSessionRequest(BaseModel):
@@ -61,6 +59,7 @@ class TripGenerateRequest(BaseModel):
 
 
 class FlowStreamRequest(TripGenerateRequest):
+    """主流程流式请求体，扩展执行模式字段。"""
     mode: Optional[str] = Field("fast", description="执行模式：fast/deep")
 
 
@@ -470,6 +469,7 @@ def _build_agent_thread_id(user_id: str, device_id: str) -> str:
 
 
 def _normalize_flow_mode(mode: Optional[str]) -> str:
+    """规范化主流程模式，非法值统一回退到 fast。"""
     value = str(mode or "fast").strip().lower()
     if value not in {"fast", "deep"}:
         return "fast"
@@ -482,6 +482,7 @@ def _detect_agent_escalation(
     knowledge_query: Optional[str],
     tool_result: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    """根据模式、任务复杂度、知识增强与工具结果判定是否升级 Agent。"""
     reasons: List[str] = []
     days_value = int(user_input.get("days") or 0)
     if mode == "deep":
@@ -494,37 +495,6 @@ def _detect_agent_escalation(
         if tool_result.get("needs_tool") and not ((tool_result.get("result") or {}).get("success")):
             reasons.append("tool_retry_or_fallback")
     return {"agent_escalated": len(reasons) > 0, "reasons": reasons}
-
-
-def _resolve_initial_state(thread_id: str, resume: bool) -> Optional[TripState]:
-    return None
-
-
-def _build_stream_payload(event: Dict[str, Any]) -> Dict[str, Any]:
-    kind = event.get("kind") or ""
-    detail = event.get("detail") if isinstance(event.get("detail"), dict) else {}
-    status = "running"
-    if kind == "task_end":
-        status = "done" if detail.get("success", True) else "failed"
-    elif kind in ["paused"]:
-        status = "paused"
-    elif kind in ["error"]:
-        status = "failed"
-    elif kind in ["loop_end"]:
-        status = str(detail.get("status") or "done")
-    return {
-        "event": kind,
-        "sequence": int(event.get("sequence") or 0),
-        "thread_id": event.get("thread_id") or "",
-        "node": event.get("node"),
-        "status": status,
-        "payload": detail or {},
-    }
-
-
-def _format_sse(event_payload: Dict[str, Any]) -> str:
-    payload_text = json.dumps(event_payload, ensure_ascii=False)
-    return f"id: {event_payload.get('sequence')}\nevent: {event_payload.get('event')}\ndata: {payload_text}\n\n"
 
 
 def _row_to_session_item(row: Any) -> Dict[str, str]:
@@ -582,6 +552,7 @@ _FLOW_STREAM_TTL_SECONDS = 600
 
 
 async def _cleanup_flow_streams() -> None:
+    """清理已结束且超过保留期的流式会话缓存。"""
     now = time.time()
     async with _flow_streams_lock:
         expired = []
@@ -596,6 +567,7 @@ async def _cleanup_flow_streams() -> None:
 
 
 async def _append_flow_event(message_id: str, event_payload: Dict[str, Any]) -> None:
+    """向指定流会话追加事件，并在终态时关闭运行标记。"""
     async with _flow_streams_lock:
         stream_state = _flow_streams.get(message_id)
         if not stream_state:
@@ -613,6 +585,7 @@ async def _run_flow_stream(
     llm_manager: LlmManager,
     payload: FlowStreamRequest,
 ) -> None:
+    """执行单主流程编排：工具与RAG增强、条件升级 Agent、统一流式事件输出。"""
     last_sequence = 0
     flow_mode = _normalize_flow_mode(payload.mode)
     metrics: Dict[str, Any] = {
@@ -630,6 +603,7 @@ async def _run_flow_stream(
     }
     merged_context_texts = list(payload.context_texts or [])
     try:
+        # 初始化主流程 start 事件，通知前端进入统一状态机
         last_sequence += 1
         await _append_flow_event(
             message_id,
@@ -658,6 +632,7 @@ async def _run_flow_stream(
         if kb_context_texts:
             metrics["rag_hit"] = True
 
+        # 工具调用先于生成阶段执行，成功结果会注入上下文
         tool_query = llm_manager._build_tool_query(user_input=user_input, query=payload.knowledge_query or payload.destination)
         tool_result: Dict[str, Any] = {"needs_tool": False}
         if tool_query:
@@ -668,6 +643,7 @@ async def _run_flow_stream(
                 if isinstance(result_payload, dict) and result_payload.get("success"):
                     merged_context_texts.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
 
+        # 根据策略决定是否进入 Agent 深度执行
         escalation = _detect_agent_escalation(flow_mode, user_input, payload.knowledge_query, tool_result)
         metrics["agent_escalated"] = bool(escalation.get("agent_escalated"))
         escalation_reasons = list(escalation.get("reasons") or [])
@@ -704,6 +680,7 @@ async def _run_flow_stream(
                 if isinstance(draft_trip, dict) and draft_trip:
                     trip_data = draft_trip
         else:
+            # 常规模式：直接走行程文本流并在末尾解析为结构化 trip_data
             response_chunks: List[str] = []
             stream = llm_manager.stream_trip_generation(user_input, merged_context_texts)
             for event in llm_manager.build_stream_events_from_stream(stream, message_id):
@@ -738,6 +715,7 @@ async def _run_flow_stream(
         if trip_data:
             _get_storage().store_trip_data(session_id, trip_data)
 
+        # 统一 finalize 终态事件，输出 trip_data 与关键指标
         last_sequence += 1
         await _append_flow_event(
             message_id,
@@ -942,6 +920,7 @@ async def stream_main_flow(
     message_id: Optional[str] = Query(None, description="流式消息ID"),
     last_sequence: Optional[int] = Query(None, description="断线续传序号"),
 ):
+    """单主流程唯一流式入口：启动或续传并输出统一 SSE 事件序列。"""
     if not payload.destination or payload.days <= 0:
         raise HTTPException(status_code=400, detail="destination 和 days 为必填且 days 必须大于 0")
     session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)

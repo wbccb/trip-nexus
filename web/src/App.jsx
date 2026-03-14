@@ -8,6 +8,7 @@ import {
   InputNumber,
   Layout,
   Modal,
+  Select,
   Spin,
   Tabs,
   Typography,
@@ -494,7 +495,12 @@ export default function App() {
             <Input placeholder="例如：人文、美食" />
           </Form.Item>
           <Form.Item label="执行模式" name="mode" initialValue="fast">
-            <Input placeholder="fast 或 deep" />
+            <Select
+              options={[
+                { label: "极速模式（fast）", value: "fast" },
+                { label: "深度模式（deep）", value: "deep" },
+              ]}
+            />
           </Form.Item>
         </Form>
       </Modal>
