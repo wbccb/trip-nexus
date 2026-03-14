@@ -1,116 +1,84 @@
-# TripNexus
-An AI-planned travel product
+# TripNexus ✈️
 
+TripNexus 是一个基于大语言模型（LLM）与多智能体（Agent）架构构建的智能旅行规划系统。本项目通过结合流式交互、FunctionCall 工具调用、LangGraph 状态编排以及 RAG 检索增强技术，为用户提供从意图识别、路线规划、私有知识库参考到地图可视化的端到端 AI 智能管家体验。
 
-## 版本
+## 🌟 核心能力
 
-### v0.0.1
-1. frontend: 用户可以手动输入地点、天数、预算进行【行程生成】
-2. rag: 用户可以输入链接进行爬虫获取数据，去除冗杂标签，切割后转化为向量存入向量数据库中
-3. llm: 根据用户的输入 + rag数据生成prompt，进行本地Ollama的模型调用
-4. map: 根据llm转化为地图数据进行Marker的添加显示 + 文字显示llm的行程规划列表
+* **智能行程规划与编辑**：支持结构化行程的生成，以及基于自然语言的增、删、改、重新排布。
+* **原生工具调用 (FunctionCall)**：统一协议调用天气查询、地理编码、POI（兴趣点）搜索等本地/外部 API。
+* **高阶 RAG 检索增强**：结合多源搜索引擎与本地知识库，引入“证据预算 (Evidence Budget)”机制，精准防范上下文溢出。
+* **Agent 状态编排**：基于 LangGraph 实现 `Planner -> Scheduler -> Executor -> Reflector` 的计划与执行循环，支持断点续传（Checkpoint）与人工介入（HITL）。
+* **极致流式交互**：采用 SSE (Server-Sent Events) 协议，支持大模型文本与前端 UI 状态树的增量渲染与断线重连。
 
-### v0.0.2
-1. frontend: 实现前端对话式更新行程
-2. rag: 爬虫优化，提高数据采集稳定性
-3. llm: LLM 双模式支持（线上 + 本地）
-4. map: 多地图切换 + POI 样式定制:基于 CSS Sprite+SVG，实现轻量、清晰的分类渲染 + POI 层级渲染：通过四叉树实现按需渲染，避免遮挡与卡顿
+---
 
-## 环境初始化
+## 🏗️ 系统架构
 
-```shell
-pyenv local 3.12.0
-# 创建虚拟环境
-python -m venv venv
-# 激活环境
-source venv/bin/activate
-# 安装核心依赖
-pip install -r requirements.txt
-```
+项目采用前后端分离架构设计，主链路为 **React 前端 + Python API 后端**。
 
-> 如果使用`PyCharm`，需要设置`Python Interpreter` -> `/xxxx/TripNexus/venv/bin/python`
+* **前端 (Frontend)**：`/web`，基于 React + Vite 构建。负责 UI 交互、地图渲染（高德/CartoDB）、流式事件解析与状态可视化（如 Agent 节点状态、知识库管理等）。
+* **后端 (Backend)**：`/src`，基于 Python 构建。API 入口为 `src/api/app.py`，负责 LLM 路由、上下文管理、RAG 检索与 Agent 执行逻辑。
+* **存储层 (Storage)**：Redis（2小时短期记忆/缓存） + MySQL（会话与行程持久化） + Chroma（向量知识库）。
 
+---
 
-## 预下载 all-MiniLM-L6-v2（SentenceTransformer）
+## 🚀 主要运行流程
 
-1. 在项目内创建缓存目录
+1.  **用户输入**：前端 UI 收集用户聊天消息或指令。
+2.  **意图识别**：LLM 对输入进行意图分类与核心参数抽取。
+3.  **记忆融合**：系统检索历史对话，维护短期/长期记忆，优化 Token 预算。
+4.  **检索增强**：触发 RAG 链路，检索私有知识库或进行外网多源搜索获取辅助信息。
+5.  **工具与生成**：模型通过 FunctionCall 调用天气/POI等工具，生成或修改结构化行程。
+6.  **前端渲染**：通过 SSE 将生成过程流式推送到前端，同步渲染聊天气泡与地图路线。
+7.  **数据持久化**：会话状态、行程数据落库保存。
 
-```shell
-mkdir -p model_cache
-```
+---
 
-4. 可选：显式设置缓存目录（如需自定义路径）
+## 🧩 核心模块解析
 
-```shell
-export MODEL_CACHE_DIR="$(pwd)/model_cache"
-```
+### 1. LLM 管理与 FunctionCall (`src/llm/`)
+负责管理 Ollama 与 OpenAI 兼容模型，处理结构化提示词与清洗 JSON 输出。
 
-5. 触发预下载（会将 all-MiniLM-L6-v2 缓存到 model_cache）
+* **动态路由与工具调用**：云端模型优先走原生 `bind_tools` (FunctionCall)，本地模型安全降级为大模型意图路由（`decide_tool_call`）。模型仅负责“选择工具并生成参数”，实际由后端本地代码执行后注入上下文。
+* **流式输出适配 (`LlmStreamingAdapter`)**：将模型原生 `stream` 输出封装为标准化的 `start/delta/end` 事件序列，失败时自动降级为 `invoke`，保障链路高可用。
 
-```shell
-PYTHONPATH=. python -c "from src.config import Config; from sentence_transformers import SentenceTransformer; SentenceTransformer(Config.SENTENCE_BERT_MODEL)"
-```
+### 2. Agent 计划与执行循环 (`src/agent/`)
+摒弃了简单的线性链，采用基于 LangGraph 的可控状态机编排。
 
-6. 验证缓存目录（可选）
+* **执行拓扑**：Planner（规划） -> Scheduler（调度） -> Executor（执行） -> Reflector（反思）。
+* **控制机制**：支持通过 Checkpoint 按 `thread_id` 恢复状态；在工具执行失败等场景支持 Human-in-the-loop（人工介入），前端可选择跳过（skip）、覆盖（override）或重试（retry）。
 
-```shell
-ls -la ./model_cache
-```
+### 3. RAG 检索链路 (`src/rag/`)
+构建了端到端的 `AIRetrievalPipeline`，无需搜索时直接绕过，提升响应速度。
 
+* **多源聚合**：SearXNG 聚合搜索 + DuckDuckGo 备选，结合 ThreadPool 并发抓取网页正文。
+* **证据预算 (Evidence Budget)**：对摘要 (Summary) 和正文 (Body) 进行 Top K 截断与字符预算控制，动态回填分数与元数据。
+* **私有知识库**：支持 PDF/Markdown/TXT 文件的高维向量化入库（Chroma），支持与行程生成请求联动。
 
+### 4. 对话上下文与存储 (`src/frontend/context/`)
+* **分级记忆**：核心实体提取（最高优先级） -> 最近3轮对话 -> 长期摘要 -> 早期对话。
+* **存储实现**：提供 `prod_storage` (Redis+MySQL) 与 `test_storage` (内存+SQLite) 两套实现，保证测试与生产环境接口一致。
 
+### 5. 可观测性与稳定性保障 (`src/observability/`)
+* 针对多源搜索与抓取链路加入并发限制、全局超时与熔断机制。
+* 实现全链路日志与关键步骤打点（耗时、Token消耗、错误码），并具备统一的错误规范用于前端 UI 可视化提示。
 
-## 安装本地模型
+---
 
-安装`Ollama`的`deepseek-r1:7b`并且运行模型
+## 🔌 协议与状态流转
 
-## 前端运行
+* **SSE 传输协议**：前后端通过 Server-Sent Events 连接。后端推送包含 `id/event/data` 的标准帧，其中 `data` 承载自定义 JSON 状态树（包含 sequence、nodes、payload 等）。
+* **断线续传**：基于 `last_sequence` 与数据库事件表，前端在重连时携带最后序号，后端按序恢复下发，确保状态不乱序。
+* **单向数据流**：前端**完全事件驱动**，不进行本地推断。例如 `replan` 动作由后端下发事件清空前端队列，将节点状态重置为 `planned`，等待新计划填充。
 
-```shell
-streamlit run main.py
-```
+---
 
+## 📂 目录导航参考
 
-```shell
-cd web
+* 前端布局与交互：[`web/README.md`](web/README.md)
+* 后端 API 入口：[`src/api/app.py`](src/api/app.py)
+* 大模型核心逻辑：[`src/llm/llm_manager.py`](src/llm/llm_manager.py)
+* RAG 检索主流程：[`src/rag/rag_main.py`](src/rag/rag_main.py)
+* Agent 编排逻辑：[`src/agent/agent_loop.py`](src/agent/agent_loop.py)
 
-pnpm run dev
-```
-
-## 后端运行（FastAPI）
-
-```shell
-PYTHONPATH=. uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --reload
-```
-
-### 检查运行状态
-```shell
-lsof -n -iTCP:8000 -sTCP:LISTEN
-# 拿到pid端口：检查端口健康状态
-ps -p 32792,32808 -o pid,ppid,command
-```
-
-```shell
-# 测试后端健康状态
-curl -s -v http://127.0.0.1:8000/api/health
-```
-
-### 前端请求说明
-前端默认请求 `http://127.0.0.1:8000`，如需修改可设置：
-
-```shell
-export VITE_API_BASE="http://127.0.0.1:1234"
-```
-
-## Agent 调试页面
-
-运行命令（与主页面一致）：
-
-```shell
-streamlit run main.py --server.headless true
-```
-
-访问地址：
-
-- 主页面：http://localhost:8501/
-- Agent 调试页面：http://localhost:8501/agent
+---
