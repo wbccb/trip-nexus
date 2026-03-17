@@ -16,10 +16,15 @@ export {
 } from "./flowApi.js";
 export {
   createKnowledgeBase,
+  deleteKnowledgeSource,
   deleteKnowledgeBase,
   generateKnowledgeAnswer,
+  getKnowledgeDebugSnapshot,
+  ingestKnowledgeUrl,
   listKnowledgeBases,
+  listKnowledgeSources,
   searchKnowledge,
+  updateKnowledgeSource,
   uploadKnowledgeDocument,
 } from "./knowledgeApi.js";
 export { API_BASE, apiPost } from "./httpClient.js";

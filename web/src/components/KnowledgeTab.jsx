@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react"
-import { Button, Card, Checkbox, Divider, Input, InputNumber, List, Popconfirm, Select, Space, Spin, Tabs, Tag, Typography, Upload } from "antd"
+import { Alert, Button, Card, Checkbox, Collapse, Divider, Input, InputNumber, List, Modal, Popconfirm, Radio, Select, Space, Spin, Tabs, Tag, Typography, Upload } from "antd"
 import { generateKnowledgeAnswer } from "../api/index.js"
 
 const EMPTY_EVIDENCE = {}
@@ -15,17 +15,32 @@ function isSelectedMapEqual(prevMap, nextMap) {
 
 export default function KnowledgeTab({
   knowledgeBases,
+  knowledgeDebugSnapshot,
   knowledgeGenerateQuery,
   knowledgeQuery,
   knowledgeResult,
+  knowledgeScope,
+  knowledgeSources,
+  lastFlowKnowledgeDebug,
+  sourceStats,
+  loadingKnowledgeDebugSnapshot,
+  loadingKnowledgeSources,
+  ingestingKnowledge,
+  lastIngestResult,
   loadingKnowledge,
   loadingKnowledgeBases,
   onChangeGenerateQuery,
+  onChangeKnowledgeScope,
   onChangeQuery,
   onCreateKnowledgeBase,
   onDeleteKnowledgeBase,
+  onDeleteKnowledgeSource,
+  onIngestKnowledgeUrl,
+  onLoadKnowledgeDebugSnapshot,
+  onRefreshKnowledgeSources,
   onSearch,
   onSelectKnowledgeBase,
+  onUpdateKnowledgeSource,
   onUploadKnowledgeDocument,
   selectedKnowledgeBaseId,
   uploadingKnowledge,
@@ -37,10 +52,70 @@ export default function KnowledgeTab({
   const [selectedMap, setSelectedMap] = useState({})
   const [answer, setAnswer] = useState("")
   const [loadingAnswer, setLoadingAnswer] = useState(false)
+  const [ingestUrl, setIngestUrl] = useState("")
+  const [ingestMode, setIngestMode] = useState("auto")
+  const [manualText, setManualText] = useState("")
+  const [ocrText, setOcrText] = useState("")
+  const [debugModalOpen, setDebugModalOpen] = useState(false)
+  const [loadingDebugModal, setLoadingDebugModal] = useState(false)
+  const [editSourceOpen, setEditSourceOpen] = useState(false)
+  const [editingSource, setEditingSource] = useState(null)
+  const [editingSourceUrl, setEditingSourceUrl] = useState("")
+  const [editingSourceContent, setEditingSourceContent] = useState("")
+  const [updatingSource, setUpdatingSource] = useState(false)
   const evidence = useMemo(() => knowledgeResult?.evidence || EMPTY_EVIDENCE, [knowledgeResult?.evidence])
+  const normalizedKnowledgeSources = useMemo(
+    () => (Array.isArray(knowledgeSources) ? knowledgeSources : []),
+    [knowledgeSources]
+  )
+  // 社交来源列表单独展示在“社交链接导入”区域，初始化优先按“有链接”识别，避免历史数据 source_type 不标准导致列表空白。
+  const socialSources = useMemo(
+    () =>
+      normalizedKnowledgeSources.filter((item) => {
+        const sourceType = String(item?.source_type || "").trim().toLowerCase()
+        const sourcePlatform = String(item?.source_platform || "").trim().toLowerCase()
+        const sourceUrl = String(item?.source_url || "").trim()
+        return (
+          Boolean(sourceUrl) ||
+          sourceType === "url" ||
+          sourceType === "manual" ||
+          sourceType === "ocr" ||
+          sourcePlatform === "xiaohongshu" ||
+          sourcePlatform === "weibo" ||
+          sourcePlatform === "bilibili"
+        )
+      }),
+    [normalizedKnowledgeSources]
+  )
+  const visibleSocialSources = useMemo(
+    () =>
+      socialSources.length > 0
+        ? socialSources
+        : normalizedKnowledgeSources.filter((item) => String(item?.source_url || "").trim()),
+    [socialSources, normalizedKnowledgeSources]
+  )
+  const effectiveKnowledgeDebug = useMemo(() => {
+    if (lastFlowKnowledgeDebug) {
+      return lastFlowKnowledgeDebug
+    }
+    if (!knowledgeResult) {
+      return null
+    }
+    const knowledgeDebug = knowledgeResult?.knowledge_debug || {}
+    const sourceEvidence = Array.isArray(knowledgeResult?.source_evidence)
+      ? knowledgeResult.source_evidence
+      : []
+    return {
+      knowledge_scope: String(knowledgeDebug?.knowledge_scope || knowledgeScope || ""),
+      allow_public_fusion: Boolean(knowledgeDebug?.allow_public_fusion),
+      kb_context_count: Number(knowledgeDebug?.kb_context_count || 0),
+      source_evidence_count: Number(knowledgeDebug?.source_evidence_count || sourceEvidence.length || 0),
+      source_evidence: sourceEvidence,
+    }
+  }, [knowledgeResult, knowledgeScope, lastFlowKnowledgeDebug])
   const knowledgeBaseOptions = Array.isArray(knowledgeBases)
     ? knowledgeBases.map((item) => ({
-        label: `${item.name} (${item.knowledge_base_id})`,
+        label: `${item.name} (${item.knowledge_base_id}) · ${item.document_count || 0}分块 · ${item.last_updated_at ? `更新:${item.last_updated_at.slice(0, 16).replace("T", " ")}` : "未更新"}`,
         value: item.knowledge_base_id,
       }))
     : []
@@ -85,6 +160,24 @@ export default function KnowledgeTab({
       return prev === nextAnswer ? prev : nextAnswer
     })
   }, [knowledgeResult, summaryEntries, bodyEntries])
+
+  useEffect(() => {
+    if (!selectedKnowledgeBaseId || !onRefreshKnowledgeSources) {
+      return
+    }
+    // 每次进入或切换知识库时主动刷新来源，保证重载后社交列表立即可见。
+    onRefreshKnowledgeSources(selectedKnowledgeBaseId)
+  }, [onRefreshKnowledgeSources, selectedKnowledgeBaseId])
+
+  useEffect(() => {
+    console.info("[knowledge-tab] social-list-state", {
+      selectedKnowledgeBaseId: String(selectedKnowledgeBaseId || ""),
+      knowledgeSourcesCount: normalizedKnowledgeSources.length,
+      socialSourcesCount: socialSources.length,
+      visibleSocialSourcesCount: visibleSocialSources.length,
+      firstVisibleSourceId: String(visibleSocialSources[0]?.source_id || ""),
+    })
+  }, [normalizedKnowledgeSources, selectedKnowledgeBaseId, socialSources, visibleSocialSources])
 
   const filterEntries = (entries) => {
     const keyword = filterKeyword.trim()
@@ -151,6 +244,65 @@ export default function KnowledgeTab({
     }
   }
 
+  const handleIngestUrl = async () => {
+    if (!onIngestKnowledgeUrl) {
+      return
+    }
+    const result = await onIngestKnowledgeUrl({
+      url: ingestUrl,
+      mode: ingestMode,
+      manual_text: manualText,
+      ocr_text: ocrText,
+    })
+    if (result?.success) {
+      setManualText("")
+      setOcrText("")
+      if (result.ingest_status !== "failed") {
+        setIngestUrl("")
+      }
+    }
+  }
+
+  const handleOpenDebugModal = async () => {
+    if (!onLoadKnowledgeDebugSnapshot) {
+      return
+    }
+    setDebugModalOpen(true)
+    try {
+      setLoadingDebugModal(true)
+      await onLoadKnowledgeDebugSnapshot()
+    } finally {
+      setLoadingDebugModal(false)
+    }
+  }
+
+  const handleOpenEditSource = (item) => {
+    setEditingSource(item || null)
+    setEditingSourceUrl(String(item?.source_url || ""))
+    setEditingSourceContent(String(item?.parsed_content_preview || ""))
+    setEditSourceOpen(true)
+  }
+
+  const handleUpdateSourceContent = async () => {
+    if (!onUpdateKnowledgeSource || !editingSource?.source_id) {
+      return
+    }
+    try {
+      setUpdatingSource(true)
+      await onUpdateKnowledgeSource(editingSource.source_id, {
+        content: editingSourceContent,
+        source_url: editingSourceUrl,
+      })
+      setEditSourceOpen(false)
+    } finally {
+      setUpdatingSource(false)
+    }
+  }
+
+  const debugKnowledgeBases = Array.isArray(knowledgeDebugSnapshot?.items)
+    ? knowledgeDebugSnapshot.items
+    : []
+
   const renderEvidenceList = (entries) => {
     const filteredEntries = filterEntries(entries)
     return (
@@ -160,6 +312,20 @@ export default function KnowledgeTab({
         renderItem={(item, index) => {
           const confidenceValue = Number.isFinite(item?.confidence) ? Number(item.confidence) : null
           const sourceValue = item?.source || ""
+          const sourceTypeValue = String(item?.source_type || "").toLowerCase()
+          const sourcePlatformValue = String(item?.source_platform || "").toLowerCase()
+          const isPrivateEvidence = Boolean(sourceTypeValue) || String(sourceValue).startsWith("private://")
+          const isUploadSource = ["pdf", "markdown", "txt"].includes(sourceTypeValue)
+          const isSocialSource = ["url", "manual", "ocr"].includes(sourceTypeValue)
+          const sourceCategoryLabel = isPrivateEvidence
+            ? isUploadSource
+              ? "私有·上传文件"
+              : isSocialSource
+                ? "私有·社交导入"
+                : "私有·其他来源"
+            : "公网检索"
+          const sourceCategoryColor = isPrivateEvidence ? (isSocialSource ? "magenta" : "cyan") : "geekblue"
+          const engineValue = String(item?.engine || "")
           return (
             <List.Item className="evidence-item">
               <div className="evidence-item-header">
@@ -175,6 +341,9 @@ export default function KnowledgeTab({
                   证据 {index + 1}
                 </Checkbox>
                 <Space size="small">
+                  <Tag color={sourceCategoryColor}>{sourceCategoryLabel}</Tag>
+                  {sourcePlatformValue && <Tag>{sourcePlatformValue}</Tag>}
+                  {engineValue && <Tag color="gold">引擎 {engineValue}</Tag>}
                   {item?._isCandidate && <Tag color="purple">候选</Tag>}
                   {confidenceValue !== null && <Tag color="blue">置信度 {confidenceValue.toFixed(2)}</Tag>}
                 </Space>
@@ -200,38 +369,46 @@ export default function KnowledgeTab({
 
   return (
     <div className="knowledge-layout">
-      <Card title="旅行灵感检索" className="panel-card">
+      <Card title="知识库管理" className="panel-card">
         <Space direction="vertical" className="full-width">
-          <Card size="small" title="知识库管理" className="evidence-card">
+          <Space.Compact className="full-width">
+            <Input
+              placeholder="新知识库名称"
+              value={knowledgeBaseName}
+              onChange={(event) => setKnowledgeBaseName(event.target.value)}
+            />
+            <Button onClick={handleCreateKnowledgeBase}>创建</Button>
+          </Space.Compact>
+          <Space size="small" wrap>
+            <Select
+              className="knowledge-base-select"
+              placeholder="选择知识库"
+              value={selectedKnowledgeBaseId || undefined}
+              options={knowledgeBaseOptions}
+              loading={loadingKnowledgeBases}
+              onChange={(value) => onSelectKnowledgeBase && onSelectKnowledgeBase(value)}
+            />
+            <Popconfirm
+              title="确认删除当前知识库？"
+              onConfirm={() => onDeleteKnowledgeBase && onDeleteKnowledgeBase(selectedKnowledgeBaseId)}
+              okText="删除"
+              cancelText="取消"
+            >
+              <Button danger disabled={!selectedKnowledgeBaseId}>
+                删除
+              </Button>
+            </Popconfirm>
+            <Button onClick={handleOpenDebugModal} loading={loadingDebugModal || loadingKnowledgeDebugSnapshot}>
+              调试数据
+            </Button>
+          </Space>
+        </Space>
+      </Card>
+      <Card title="数据来源" className="panel-card">
+        <Space direction="vertical" className="full-width">
+          <Card size="small" title="文档上传（来源类型：upload）" className="evidence-card">
             <Space direction="vertical" className="full-width" size="small">
-              <Space.Compact className="full-width">
-                <Input
-                  placeholder="新知识库名称"
-                  value={knowledgeBaseName}
-                  onChange={(event) => setKnowledgeBaseName(event.target.value)}
-                />
-                <Button onClick={handleCreateKnowledgeBase}>创建</Button>
-              </Space.Compact>
-              <Space size="small" wrap>
-                <Select
-                  className="knowledge-base-select"
-                  placeholder="选择知识库"
-                  value={selectedKnowledgeBaseId || undefined}
-                  options={knowledgeBaseOptions}
-                  loading={loadingKnowledgeBases}
-                  onChange={(value) => onSelectKnowledgeBase && onSelectKnowledgeBase(value)}
-                />
-                <Popconfirm
-                  title="确认删除当前知识库？"
-                  onConfirm={() => onDeleteKnowledgeBase && onDeleteKnowledgeBase(selectedKnowledgeBaseId)}
-                  okText="删除"
-                  cancelText="取消"
-                >
-                  <Button danger disabled={!selectedKnowledgeBaseId}>
-                    删除
-                  </Button>
-                </Popconfirm>
-              </Space>
+              <Typography.Text type="secondary">上传后的数据会写入当前知识库并参与私有检索。</Typography.Text>
               <Upload
                 showUploadList={false}
                 beforeUpload={(file) => {
@@ -248,10 +425,143 @@ export default function KnowledgeTab({
               </Upload>
             </Space>
           </Card>
+          <Card size="small" title="社交链接导入（来源类型：social_url/manual/ocr）" className="evidence-card">
+            <Space direction="vertical" className="full-width" size="small">
+              <Input
+                placeholder="粘贴公开可访问链接"
+                value={ingestUrl}
+                onChange={(event) => setIngestUrl(event.target.value)}
+              />
+              <Radio.Group
+                value={ingestMode}
+                onChange={(event) => setIngestMode(event.target.value)}
+                options={[
+                  { label: "自动解析", value: "auto" },
+                  { label: "手动导入", value: "manual" },
+                ]}
+              />
+              {(ingestMode === "manual" || lastIngestResult?.ingest_status === "failed") && (
+                <Space direction="vertical" className="full-width" size="small">
+                  <Input.TextArea
+                    rows={4}
+                    placeholder="手动粘贴正文（解析失败时建议粘贴）"
+                    value={manualText}
+                    onChange={(event) => setManualText(event.target.value)}
+                  />
+                  <Input.TextArea
+                    rows={3}
+                    placeholder="可选：粘贴 OCR 文本"
+                    value={ocrText}
+                    onChange={(event) => setOcrText(event.target.value)}
+                  />
+                </Space>
+              )}
+              <Button type="primary" onClick={handleIngestUrl} loading={ingestingKnowledge} disabled={!selectedKnowledgeBaseId}>
+                导入社交内容
+              </Button>
+              <Space size="small" wrap>
+                <Tag color={ingestingKnowledge ? "processing" : "default"}>{ingestingKnowledge ? "解析中" : "待导入"}</Tag>
+                {lastIngestResult?.ingest_status === "parsed" && <Tag color="success">解析成功</Tag>}
+                {lastIngestResult?.ingest_status === "fallback" && <Tag color="warning">降级成功</Tag>}
+                {lastIngestResult?.ingest_status === "failed" && <Tag color="error">解析失败</Tag>}
+              </Space>
+              {lastIngestResult?.ingest_status === "failed" && (
+                <Alert type="warning" showIcon message="解析失败，建议切换手动导入模式并粘贴文本/OCR 内容" />
+              )}
+              {lastIngestResult?.parsed_content_preview && (
+                <Card size="small" title="本次解析正文预览">
+                  <Space direction="vertical" className="full-width" size={4}>
+                    <Tag>字符数 {lastIngestResult?.parsed_content_chars || 0}</Tag>
+                    <Input.TextArea
+                      value={lastIngestResult?.parsed_content_preview || ""}
+                      autoSize={{ minRows: 4, maxRows: 12 }}
+                      readOnly
+                    />
+                  </Space>
+                </Card>
+              )}
+            </Space>
+          </Card>
+        </Space>
+      </Card>
+      <Card title="当前知识库来源列表" className="panel-card">
+        <Space direction="vertical" className="full-width" size="small">
+          <Space size="small" wrap>
+            <Tag>总数 {sourceStats?.total || 0}</Tag>
+            <Tag color="success">parsed {sourceStats?.parsed || 0}</Tag>
+            <Tag color="warning">fallback {sourceStats?.fallback || 0}</Tag>
+            <Tag color="error">failed {sourceStats?.failed || 0}</Tag>
+          </Space>
+          <Spin spinning={loadingKnowledgeSources}>
+            <List
+              className="knowledge-source-list"
+              dataSource={knowledgeSources || []}
+              locale={{ emptyText: "暂无来源记录" }}
+              renderItem={(item) => (
+                <List.Item
+                  actions={[
+                    <Button
+                      key={`edit-${item.source_id}`}
+                      size="small"
+                      onClick={() => handleOpenEditSource(item)}
+                    >
+                      修改
+                    </Button>,
+                    <Popconfirm
+                      key={`delete-${item.source_id}`}
+                      title="确认删除该来源及分块？"
+                      onConfirm={() => onDeleteKnowledgeSource && onDeleteKnowledgeSource(item.source_id)}
+                      okText="删除"
+                      cancelText="取消"
+                    >
+                      <Button size="small" danger>
+                        删除
+                      </Button>
+                    </Popconfirm>,
+                  ]}
+                >
+                  <Space direction="vertical" size={2} className="full-width">
+                    <Space size="small" wrap>
+                      <Tag>{item.source_type || "unknown"}</Tag>
+                      <Tag>{item.source_platform || "unknown"}</Tag>
+                      <Tag color={item.ingest_status === "parsed" ? "success" : item.ingest_status === "fallback" ? "warning" : "error"}>
+                        {item.ingest_status || "unknown"}
+                      </Tag>
+                      <Tag>chunks {item.chunks_count || 0}</Tag>
+                      <Tag>chars {item.parsed_content_chars || 0}</Tag>
+                    </Space>
+                    <Typography.Text type="secondary">source_id: {item.source_id || "-"}</Typography.Text>
+                    {item.source_url ? (
+                      <a href={item.source_url} target="_blank" rel="noreferrer">
+                        {item.source_url}
+                      </a>
+                    ) : (
+                      <Typography.Text type="secondary">无原始链接</Typography.Text>
+                    )}
+                    <Typography.Text type="secondary">
+                      {(item.parsed_content_preview || "").slice(0, 140) || "暂无正文预览"}
+                    </Typography.Text>
+                  </Space>
+                </List.Item>
+              )}
+            />
+          </Spin>
+        </Space>
+      </Card>
+      <Card title="检索知识库" className="panel-card">
+        <Space direction="vertical" className="full-width">
           <Input
             placeholder="行程生成时的知识库检索条件（可选）"
             value={knowledgeGenerateQuery}
             onChange={(event) => onChangeGenerateQuery && onChangeGenerateQuery(event.target.value)}
+          />
+          <Select
+            value={knowledgeScope || "private_plus_public"}
+            options={[
+              { label: "仅使用私有知识", value: "private_only" },
+              { label: "私有+公网融合", value: "private_plus_public" },
+            ]}
+            onChange={(value) => onChangeKnowledgeScope && onChangeKnowledgeScope(value)}
           />
           <Input
             placeholder="输入要检索的问题或主题"
@@ -262,6 +572,43 @@ export default function KnowledgeTab({
             开始检索
           </Button>
         </Space>
+      </Card>
+      <Card size="small" title="私有知识命中调试" className="panel-card">
+        {!effectiveKnowledgeDebug && <Typography.Text type="secondary">暂无调试信息（主流程或知识库检索后显示）</Typography.Text>}
+        {effectiveKnowledgeDebug && (
+          <Space size="small" wrap>
+            <Tag>scope {effectiveKnowledgeDebug?.knowledge_scope || "-"}</Tag>
+            <Tag color={effectiveKnowledgeDebug?.allow_public_fusion ? "blue" : "default"}>
+              {effectiveKnowledgeDebug?.allow_public_fusion ? "公网工具已开启" : "仅私有知识"}
+            </Tag>
+            <Tag color="success">私有片段 {effectiveKnowledgeDebug?.kb_context_count || 0}</Tag>
+            <Tag color="purple">来源 {effectiveKnowledgeDebug?.source_evidence_count || 0}</Tag>
+          </Space>
+        )}
+        {Array.isArray(effectiveKnowledgeDebug?.source_evidence) && effectiveKnowledgeDebug.source_evidence.length > 0 && (
+          <List
+            size="small"
+            dataSource={effectiveKnowledgeDebug.source_evidence}
+            renderItem={(item) => (
+              <List.Item>
+                <Space size="small" wrap>
+                  <Tag>{item?.source_type || "unknown"}</Tag>
+                  <Tag>{item?.source_platform || "unknown"}</Tag>
+                  <Tag color={item?.ingest_status === "parsed" ? "success" : item?.ingest_status === "fallback" ? "warning" : "error"}>
+                    {item?.ingest_status || "unknown"}
+                  </Tag>
+                  {item?.source_url ? (
+                    <a href={item.source_url} target="_blank" rel="noreferrer">
+                      {item.source_url}
+                    </a>
+                  ) : (
+                    <Typography.Text type="secondary">无来源链接</Typography.Text>
+                  )}
+                </Space>
+              </List.Item>
+            )}
+          />
+        )}
       </Card>
       <Card title="检索结果" className="panel-card">
         <Spin spinning={loadingKnowledge}>
@@ -322,6 +669,102 @@ export default function KnowledgeTab({
           )}
         </Spin>
       </Card>
+      <Modal
+        title="修改社交来源正文"
+        open={editSourceOpen}
+        onCancel={() => setEditSourceOpen(false)}
+        onOk={handleUpdateSourceContent}
+        okText="保存修改"
+        cancelText="取消"
+        confirmLoading={updatingSource}
+      >
+        <Space direction="vertical" className="full-width" size="small">
+          <Input
+            value={editingSourceUrl}
+            onChange={(event) => setEditingSourceUrl(event.target.value)}
+            placeholder="来源链接（可选）"
+          />
+          <Input.TextArea
+            value={editingSourceContent}
+            onChange={(event) => setEditingSourceContent(event.target.value)}
+            autoSize={{ minRows: 6, maxRows: 14 }}
+            placeholder="请输入更新后的正文内容"
+          />
+        </Space>
+      </Modal>
+      <Modal
+        title="知识库调试快照"
+        open={debugModalOpen}
+        onCancel={() => setDebugModalOpen(false)}
+        footer={null}
+        width={920}
+      >
+        <Spin spinning={loadingDebugModal || loadingKnowledgeDebugSnapshot}>
+          <Space direction="vertical" className="full-width" size="middle">
+            <Typography.Text type="secondary">
+              快照时间：{knowledgeDebugSnapshot?.generated_at || "-"}
+            </Typography.Text>
+            {debugKnowledgeBases.length === 0 && <div className="empty-tip">暂无知识库调试数据</div>}
+            {debugKnowledgeBases.map((kb) => (
+              <Card
+                key={kb.knowledge_base_id}
+                size="small"
+                title={`${kb.name} (${kb.knowledge_base_id})`}
+                extra={<Tag>分块 {kb.document_count || 0}</Tag>}
+              >
+                <Space size="small" wrap>
+                  <Tag>集合 {kb.collection_name || "-"}</Tag>
+                  <Tag>来源 {kb.source_count || 0}</Tag>
+                  <Tag>更新时间 {kb.last_updated_at || "-"}</Tag>
+                </Space>
+                <Collapse
+                  style={{ marginTop: 8 }}
+                  items={(Array.isArray(kb.sources) ? kb.sources : []).map((source) => ({
+                    key: source.source_id,
+                    label: `${source.source_type || "unknown"} · ${source.source_platform || "unknown"} · ${source.ingest_status || "unknown"} · chunks ${source.chunks_count || 0}`,
+                    children: (
+                      <Space direction="vertical" className="full-width" size="small">
+                        <Typography.Text>source_id: {source.source_id || "-"}</Typography.Text>
+                        <Typography.Text>source_url: {source.source_url || "-"}</Typography.Text>
+                        <Typography.Text>ingested_at: {source.ingested_at || "-"}</Typography.Text>
+                        <Typography.Text>ingest_error_code: {source.ingest_error_code || "-"}</Typography.Text>
+                        <Space size="small" wrap>
+                          <Tag>解析字符 {source.parsed_content_chars || 0}</Tag>
+                          <Tag>分块数 {source.chunks_count || 0}</Tag>
+                        </Space>
+                        <Input.TextArea
+                          value={source.parsed_content_preview || ""}
+                          autoSize={{ minRows: 5, maxRows: 12 }}
+                          readOnly
+                        />
+                        <List
+                          size="small"
+                          dataSource={Array.isArray(source.chunks) ? source.chunks : []}
+                          locale={{ emptyText: "暂无分块内容" }}
+                          renderItem={(chunk) => (
+                            <List.Item>
+                              <Space direction="vertical" className="full-width" size={2}>
+                                <Typography.Text>
+                                  chunk {chunk?.chunk_index || "-"} / {chunk?.chunk_total || "-"} · chunk_id: {chunk?.chunk_id || "-"} · chars: {chunk?.content_chars || 0}
+                                </Typography.Text>
+                                <Input.TextArea
+                                  value={chunk?.content || ""}
+                                  autoSize={{ minRows: 6, maxRows: 16 }}
+                                  readOnly
+                                />
+                              </Space>
+                            </List.Item>
+                          )}
+                        />
+                      </Space>
+                    ),
+                  }))}
+                />
+              </Card>
+            ))}
+          </Space>
+        </Spin>
+      </Modal>
     </div>
   )
 }

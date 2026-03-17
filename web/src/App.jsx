@@ -44,18 +44,32 @@ export default function App() {
   const {
     handleCreateKnowledgeBase,
     handleDeleteKnowledgeBase,
+    handleDeleteKnowledgeSource,
+    handleIngestKnowledgeUrl,
     handleKnowledgeSearch,
+    handleLoadKnowledgeDebugSnapshot,
+    handleUpdateKnowledgeSource,
     handleUploadKnowledgeDocument,
+    ingestingKnowledge,
     knowledgeBases,
+    knowledgeDebugSnapshot,
     knowledgeGenerateQuery,
     knowledgeQuery,
     knowledgeResult,
+    knowledgeScope,
+    knowledgeSources,
+    lastIngestResult,
     loadingKnowledge,
     loadingKnowledgeBases,
+    loadingKnowledgeDebugSnapshot,
+    loadingKnowledgeSources,
+    refreshKnowledgeSources,
     selectedKnowledgeBaseId,
     setKnowledgeGenerateQuery,
     setKnowledgeQuery,
+    setKnowledgeScope,
     setSelectedKnowledgeBaseId,
+    sourceStats,
     uploadingKnowledge,
   } = useKnowledge()
   const {
@@ -69,6 +83,7 @@ export default function App() {
   } = useTrip({
     activeSessionId,
     knowledgeGenerateQuery,
+    knowledgeScope,
     refreshSessions: loadSessions,
     selectedKnowledgeBaseId,
     setActiveSessionId,
@@ -91,6 +106,7 @@ export default function App() {
       total_max_chars: 0,
     },
   })
+  const [lastFlowKnowledgeDebug, setLastFlowKnowledgeDebug] = useState(null)
   const [tripForm] = Form.useForm()
 
   const sessionTitle = useMemo(() => {
@@ -301,6 +317,22 @@ export default function App() {
       // 流结束回调
       onStreamEnd: (_, event) => {
         const metrics = event?.payload?.metrics || {}
+        const sourceEvidence = Array.isArray(event?.payload?.source_evidence)
+          ? event.payload.source_evidence
+          : []
+        const knowledgeDebug = event?.payload?.knowledge_debug || {}
+        setLastFlowKnowledgeDebug({
+          knowledge_scope: String(knowledgeDebug?.knowledge_scope || metrics?.knowledge_scope || ""),
+          allow_public_fusion: Boolean(knowledgeDebug?.allow_public_fusion),
+          kb_context_count: Number(knowledgeDebug?.kb_context_count || 0),
+          source_evidence_count: Number(knowledgeDebug?.source_evidence_count || sourceEvidence.length || 0),
+          source_evidence: sourceEvidence,
+        })
+        if (sourceEvidence.length > 0) {
+          message.success(`主流程命中私有知识 ${sourceEvidence.length} 条来源`)
+        } else if (knowledgeScope === "private_plus_public" && selectedKnowledgeBaseId) {
+          message.info("主流程未命中私有知识，请点击旅行灵感中的调试按钮查看导入内容")
+        }
         setFlowRuntimeStatus((prev) => ({
           ...prev,
           intent: String(metrics?.intent || prev.intent || ""),
@@ -405,7 +437,7 @@ export default function App() {
           </div>
           <div className="app-main">
             <Tabs
-              defaultActiveKey="trip"
+              defaultActiveKey="knowledge"
               items={[
                 {
                   key: "trip",
@@ -431,50 +463,42 @@ export default function App() {
                   children: (
                     <KnowledgeTab
                       knowledgeBases={knowledgeBases}
+                      knowledgeDebugSnapshot={knowledgeDebugSnapshot}
                       knowledgeGenerateQuery={knowledgeGenerateQuery}
                       knowledgeQuery={knowledgeQuery}
                       knowledgeResult={knowledgeResult}
+                      knowledgeScope={knowledgeScope}
+                      knowledgeSources={knowledgeSources}
+                      lastFlowKnowledgeDebug={lastFlowKnowledgeDebug}
+                      sourceStats={sourceStats}
+                      loadingKnowledgeDebugSnapshot={loadingKnowledgeDebugSnapshot}
+                      loadingKnowledgeSources={loadingKnowledgeSources}
+                      ingestingKnowledge={ingestingKnowledge}
+                      lastIngestResult={lastIngestResult}
                       loadingKnowledge={loadingKnowledge}
                       loadingKnowledgeBases={loadingKnowledgeBases}
                       onCreateKnowledgeBase={handleCreateKnowledgeBase}
                       onDeleteKnowledgeBase={handleDeleteKnowledgeBase}
+                      onDeleteKnowledgeSource={handleDeleteKnowledgeSource}
+                      onIngestKnowledgeUrl={handleIngestKnowledgeUrl}
+                      onLoadKnowledgeDebugSnapshot={handleLoadKnowledgeDebugSnapshot}
+                      onRefreshKnowledgeSources={refreshKnowledgeSources}
+                      onUpdateKnowledgeSource={handleUpdateKnowledgeSource}
                       onSelectKnowledgeBase={setSelectedKnowledgeBaseId}
                       onUploadKnowledgeDocument={handleUploadKnowledgeDocument}
                       onChangeGenerateQuery={setKnowledgeGenerateQuery}
                       onChangeQuery={setKnowledgeQuery}
+                      onChangeKnowledgeScope={setKnowledgeScope}
                       onSearch={handleKnowledgeSearch}
                       selectedKnowledgeBaseId={selectedKnowledgeBaseId}
                       uploadingKnowledge={uploadingKnowledge}
                     />
                   ),
-                },
-                {
-                  key: "mode",
-                  label: "执行模式",
-                  children: (
-                    <Card size="small" title="主流程模式">
-                      <div>当前已切换为单主流程架构。请在“行程输入”中选择极速模式（fast）或深度模式（deep）。</div>
-                      <div>intent：{flowRuntimeStatus.intent || "暂无"}</div>
-                      <div>latency：{flowRuntimeStatus.latencyMs > 0 ? `${flowRuntimeStatus.latencyMs} ms` : "暂无"}</div>
-                      <div>
-                        context budget（items）：
-                        {flowRuntimeStatus.contextCount > 0 || flowRuntimeStatus.contextBudget.max_items > 0
-                          ? `${flowRuntimeStatus.contextCount}/${flowRuntimeStatus.contextBudget.max_items || "-"}`
-                          : "暂无"}
-                      </div>
-                      <div>
-                        context budget（chars）：
-                        {flowRuntimeStatus.contextChars > 0 || flowRuntimeStatus.contextBudget.total_max_chars > 0
-                          ? `${flowRuntimeStatus.contextChars}/${flowRuntimeStatus.contextBudget.total_max_chars || "-"}`
-                          : "暂无"}
-                      </div>
-                    </Card>
-                  ),
-                },
+                }
               ]} 
             />
           </div>
-          <div className="app-right">
+          {/* <div className="app-right">
             <Card title="地图概览" className="panel-card map-card">
               {!tripResult && (
                 <div className="map-placeholder map-large">
@@ -501,7 +525,7 @@ export default function App() {
                 </div>
               )}
             </Card>
-          </div>
+          </div> */}
         </div>
       </Content>
       <Drawer
@@ -548,14 +572,6 @@ export default function App() {
           </Form.Item>
           <Form.Item label="偏好" name="preference">
             <Input placeholder="例如：人文、美食" />
-          </Form.Item>
-          <Form.Item label="执行模式" name="mode" initialValue="fast">
-            <Select
-              options={[
-                { label: "极速模式（fast）", value: "fast" },
-                { label: "深度模式（deep）", value: "deep" },
-              ]}
-            />
           </Form.Item>
         </Form>
       </Modal>

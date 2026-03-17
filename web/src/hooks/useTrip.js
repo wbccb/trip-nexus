@@ -15,6 +15,7 @@ import { normalizeTripDays } from "../utils/tripUtils.js";
 export function useTrip({
   activeSessionId,
   knowledgeGenerateQuery,
+  knowledgeScope,
   selectedKnowledgeBaseId,
   refreshSessions,
   setActiveSessionId,
@@ -24,6 +25,17 @@ export function useTrip({
   const tripDays = useMemo(() => normalizeTripDays(tripResult), [tripResult]);
   const updateTripResult = useCallback((data) => {
     setTripResult(data || null);
+  }, []);
+  const buildDefaultKnowledgeQuery = useCallback((values) => {
+    const destination = String(values?.destination || "").trim();
+    const preference = String(values?.preference || "").trim();
+    if (!destination && !preference) {
+      return "";
+    }
+    if (!preference) {
+      return `目的地:${destination} 行程建议`;
+    }
+    return `目的地:${destination} 偏好:${preference} 行程建议`;
   }, []);
 
   // 持久化主流程产物：将当前行程结果保存到后端会话
@@ -100,7 +112,8 @@ export function useTrip({
           // 知识库 ID
           knowledge_base_id: selectedKnowledgeBaseId || null,
           // 知识库检索查询
-          knowledge_query: knowledgeGenerateQuery || "",
+          knowledge_query: knowledgeGenerateQuery || buildDefaultKnowledgeQuery(values),
+          knowledge_scope: knowledgeScope || "private_plus_public",
         };
         // 解构流式回调
         const {
@@ -171,7 +184,9 @@ export function useTrip({
     },
     [
       activeSessionId,
+      buildDefaultKnowledgeQuery,
       knowledgeGenerateQuery,
+      knowledgeScope,
       refreshSessions,
       selectedKnowledgeBaseId,
       setActiveSessionId,

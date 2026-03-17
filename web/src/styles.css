@@ -257,12 +257,13 @@ body {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  align-items: flex-start !important;
 }
 
 .evidence-item-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 12px;
 }
 

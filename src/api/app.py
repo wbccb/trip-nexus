@@ -2,12 +2,17 @@
 from datetime import datetime
 import asyncio
 import json
+import hashlib
+from langchain_core.documents.base import Document
 import time
 import re
+import logging
 import os
 import glob
 import sqlite3
 import threading
+from urllib.parse import urlparse
+from uuid import uuid4
 from io import BytesIO
 from functools import lru_cache  # 用于缓存全局单例对象，减少重复初始化
 from typing import Any, Dict, List, Optional  # 提供类型注解，便于接口契约清晰
@@ -25,8 +30,11 @@ from src.frontend.context.storage import get_conversation_storage  # 获取会�
 from src.llm.llm_manager import LlmManager  # 行程生成核心管理器
 from src.map.map_renderer import TripMap
 from src.rag.rag_main import AIRetrievalPipeline  # 知识库检索流水线
+from src.rag.network.crawler import ContentCrawler
 from src.rag.store.vector_store import VectorStore
 from src.agent import run_agent_loop_sync
+
+logger = logging.getLogger(__name__)
 
 
 class StartSessionRequest(BaseModel):
@@ -61,6 +69,7 @@ class FlowRequestBase(BaseModel):
     context_texts: List[str] = Field(default_factory=list, description="上下文文本列表")
     knowledge_base_id: Optional[str] = Field(None, description="知识库ID（可选）")
     knowledge_query: Optional[str] = Field(None, description="知识库检索查询（可选）")
+    knowledge_scope: Optional[str] = Field("private_plus_public", description="知识范围 private_only/private_plus_public")
 
 
 class FlowStreamRequest(FlowRequestBase):
@@ -82,6 +91,8 @@ class KnowledgeSearchRequest(BaseModel):
     """知识库检索请求体"""
     query: str = Field(..., description="检索问题或主题")
     generate_answer: bool = Field(False, description="是否直接生成回答")
+    knowledge_base_id: Optional[str] = Field(None, description="知识库ID（可选）")
+    knowledge_scope: Optional[str] = Field("private_plus_public", description="知识范围 private_only/private_plus_public")
 
 
 class KnowledgeSearchResponse(BaseModel):
@@ -89,6 +100,8 @@ class KnowledgeSearchResponse(BaseModel):
     query: str = Field(..., description="检索问题")
     evidence: Dict[str, Any] = Field(..., description="证据结构化结果")
     answer: Optional[str] = Field(None, description="可选回答")
+    source_evidence: List[Dict[str, Any]] = Field(default_factory=list, description="私有来源证据列表")
+    knowledge_debug: Dict[str, Any] = Field(default_factory=dict, description="检索调试信息")
 
 
 class KnowledgeAnswerRequest(BaseModel):
@@ -125,6 +138,10 @@ class KnowledgeBaseItem(BaseModel):
     knowledge_base_id: str = Field(..., description="知识库ID")
     name: str = Field(..., description="知识库名称")
     collection_name: str = Field(..., description="向量集合名")
+    document_count: int = Field(0, description="知识条目分块数量")
+    source_count: int = Field(0, description="知识来源数量")
+    source_types: List[str] = Field(default_factory=list, description="来源类型列表")
+    last_updated_at: Optional[str] = Field(None, description="最后更新时间")
 
 
 class KnowledgeBaseListResponse(BaseModel):
@@ -137,6 +154,117 @@ class KnowledgeUploadResponse(BaseModel):
     knowledge_base_id: str = Field(..., description="知识库ID")
     filename: str = Field(..., description="原始文件名")
     chunks: int = Field(..., description="入库分块数")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="来源元数据")
+    parsed_content_preview: str = Field("", description="解析正文预览")
+    parsed_content_chars: int = Field(0, description="解析正文字符数")
+
+
+class KnowledgeIngestUrlRequest(BaseModel):
+    url: str = Field(..., description="待导入链接")
+    mode: str = Field("auto", description="导入模式 auto/manual")
+    manual_text: Optional[str] = Field(None, description="手动粘贴文本")
+    ocr_text: Optional[str] = Field(None, description="OCR 提取文本")
+
+
+class KnowledgeIngestUrlResponse(BaseModel):
+    success: bool = Field(..., description="是否导入成功")
+    ingest_status: str = Field(..., description="导入状态 parsed/fallback/failed")
+    chunks_count: int = Field(0, description="入库分块数")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="来源元数据")
+    parsed_content_preview: str = Field("", description="解析正文预览")
+    parsed_content_chars: int = Field(0, description="解析正文字符数")
+
+
+class KnowledgeSourceItem(BaseModel):
+    source_id: str = Field(..., description="来源唯一标识")
+    source_type: str = Field(..., description="来源类型")
+    source_platform: str = Field(..., description="来源平台")
+    source_url: str = Field(..., description="来源链接")
+    author: Optional[str] = Field(None, description="作者")
+    ingest_mode: str = Field(..., description="导入模式")
+    ingest_status: str = Field(..., description="导入状态")
+    ingest_error_code: Optional[str] = Field(None, description="导入失败码")
+    ingested_at: Optional[str] = Field(None, description="导入时间")
+    expires_at: Optional[str] = Field(None, description="过期时间")
+    chunks_count: int = Field(0, description="分块数")
+    parsed_content_preview: str = Field("", description="解析正文预览")
+    parsed_content_chars: int = Field(0, description="解析正文字符数")
+
+
+class KnowledgeSourceStats(BaseModel):
+    total: int = Field(0, description="来源总数")
+    parsed: int = Field(0, description="解析成功数量")
+    fallback: int = Field(0, description="降级导入数量")
+    failed: int = Field(0, description="失败数量")
+
+
+class KnowledgeSourceListResponse(BaseModel):
+    knowledge_base_id: str = Field(..., description="知识库ID")
+    items: List[KnowledgeSourceItem] = Field(default_factory=list, description="来源列表")
+    stats: KnowledgeSourceStats = Field(default_factory=KnowledgeSourceStats, description="来源状态统计")
+
+
+class KnowledgeSourceDeleteResponse(BaseModel):
+    knowledge_base_id: str = Field(..., description="知识库ID")
+    source_id: str = Field(..., description="来源唯一标识")
+    success: bool = Field(..., description="是否删除成功")
+    deleted_chunks: int = Field(0, description="删除分块数")
+
+
+class KnowledgeSourceUpdateRequest(BaseModel):
+    content: str = Field(..., description="更新后的来源正文内容")
+    source_url: Optional[str] = Field(None, description="可选来源链接，传入时会覆盖原链接")
+
+
+class KnowledgeSourceUpdateResponse(BaseModel):
+    knowledge_base_id: str = Field(..., description="知识库ID")
+    source_id: str = Field(..., description="来源唯一标识")
+    success: bool = Field(..., description="是否更新成功")
+    chunks_count: int = Field(0, description="更新后分块数")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="更新后的来源元数据")
+    parsed_content_preview: str = Field("", description="解析正文预览")
+    parsed_content_chars: int = Field(0, description="解析正文字符数")
+
+
+class KnowledgeDebugChunkItem(BaseModel):
+    chunk_id: str = Field(..., description="分块ID")
+    content: str = Field(..., description="分块内容")
+    content_chars: int = Field(0, description="分块字符数")
+    chunk_index: int = Field(0, description="分块序号")
+    chunk_total: int = Field(0, description="来源总分块数")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="分块元数据")
+
+
+class KnowledgeDebugSourceItem(BaseModel):
+    source_id: str = Field(..., description="来源唯一标识")
+    source_type: str = Field(..., description="来源类型")
+    source_platform: str = Field(..., description="来源平台")
+    source_url: str = Field(..., description="来源链接")
+    author: Optional[str] = Field(None, description="作者")
+    ingest_mode: str = Field(..., description="导入模式")
+    ingest_status: str = Field(..., description="导入状态")
+    ingest_error_code: Optional[str] = Field(None, description="导入失败码")
+    ingested_at: Optional[str] = Field(None, description="导入时间")
+    expires_at: Optional[str] = Field(None, description="过期时间")
+    chunks_count: int = Field(0, description="分块数")
+    parsed_content_preview: str = Field("", description="解析正文预览")
+    parsed_content_chars: int = Field(0, description="解析正文字符数")
+    chunks: List[KnowledgeDebugChunkItem] = Field(default_factory=list, description="分块调试数据")
+
+
+class KnowledgeDebugBaseItem(BaseModel):
+    knowledge_base_id: str = Field(..., description="知识库ID")
+    name: str = Field(..., description="知识库名称")
+    collection_name: str = Field(..., description="向量集合名")
+    document_count: int = Field(0, description="知识条目分块数量")
+    source_count: int = Field(0, description="知识来源数量")
+    last_updated_at: Optional[str] = Field(None, description="最后更新时间")
+    sources: List[KnowledgeDebugSourceItem] = Field(default_factory=list, description="来源与分块调试数据")
+
+
+class KnowledgeDebugSnapshotResponse(BaseModel):
+    generated_at: str = Field(..., description="快照生成时间")
+    items: List[KnowledgeDebugBaseItem] = Field(default_factory=list, description="知识库调试快照列表")
 
 
 class ChatHistoryItem(BaseModel):
@@ -367,6 +495,7 @@ def _get_map_renderer() -> TripMap:
 
 KNOWLEDGE_COLLECTION_PREFIX = "kb_"
 KNOWLEDGE_REGISTRY_COLLECTION = "knowledge_registry"
+SOCIAL_SOURCE_PLATFORMS = {"xiaohongshu", "weibo", "bilibili"}
 
 
 @lru_cache(maxsize=1)
@@ -487,6 +616,241 @@ def _extract_text_from_upload(filename: str, content_bytes: bytes) -> str:
     raise HTTPException(status_code=400, detail="仅支持 PDF/Markdown/纯文本文件")
 
 
+def _detect_source_type_by_filename(filename: str) -> str:
+    """根据上传文件名推断来源类型。"""
+    lower_name = str(filename or "").lower()
+    if lower_name.endswith(".pdf"):
+        return "pdf"
+    if lower_name.endswith(".md") or lower_name.endswith(".markdown"):
+        return "markdown"
+    return "txt"
+
+
+def _resolve_knowledge_base_collection(knowledge_base_id: str) -> Dict[str, str]:
+    """校验知识库并返回标准化后的知识库与集合信息。"""
+    normalized_id = _normalize_knowledge_base_id(knowledge_base_id)
+    collection_name = _to_collection_name(normalized_id)
+    store = _get_knowledge_store()
+    existing = set(store.list_collections())
+    if collection_name not in existing:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    return {
+        "knowledge_base_id": normalized_id,
+        "collection_name": collection_name,
+    }
+
+
+def _infer_source_platform(source_url: str) -> str:
+    """根据来源链接域名推断平台标识。"""
+    hostname = str(urlparse(str(source_url or "")).hostname or "").lower()
+    if "xiaohongshu" in hostname or "xhslink" in hostname:
+        return "xiaohongshu"
+    if "weibo" in hostname:
+        return "weibo"
+    if "bilibili" in hostname or "b23.tv" in hostname:
+        return "bilibili"
+    return "unknown"
+
+
+def _build_source_metadata(
+    knowledge_base_id: str,
+    source_url: str,
+    source_type: str,
+    source_platform: str,
+    ingest_mode: str,
+    ingest_status: str,
+    source_id: Optional[str] = None,
+    author: Optional[str] = None,
+    ingest_error_code: Optional[str] = None,
+    expires_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """构造来源 metadata，统一字段协议。"""
+    return {
+        "knowledge_base_id": knowledge_base_id,
+        "source_id": source_id or f"src_{uuid4().hex}",
+        "source_type": source_type,
+        "source_platform": source_platform if source_platform in SOCIAL_SOURCE_PLATFORMS else (source_platform or "unknown"),
+        "source_url": source_url,
+        "author": author or None,
+        "ingest_mode": ingest_mode,
+        "ingest_status": ingest_status,
+        "ingest_error_code": ingest_error_code or None,
+        "ingested_at": datetime.now().isoformat(),
+        "expires_at": expires_at or None,
+    }
+
+
+def _build_text_preview(text: str, max_chars: int = 180) -> str:
+    """构造统一文本预览，便于日志观察解析结果。"""
+    normalized_text = str(text or "").replace("\n", " ").strip()
+    if not normalized_text:
+        return ""
+    if len(normalized_text) <= max_chars:
+        return normalized_text
+    return f"{normalized_text[:max_chars]}..."
+
+
+def _load_collection_source_entries(collection_name: str) -> List[Dict[str, Any]]:
+    """读取知识库集合中的来源条目并按 source_id 聚合。"""
+    store = _get_knowledge_store()
+    try:
+        store.switch_collection(collection_name, create_if_missing=False)
+        payload = store.vector_db.get(include=["metadatas"])
+    except Exception as exc:
+        logger.error(
+            "knowledge_source_entries_load_failed collection=%s error=%s",
+            collection_name,
+            str(exc),
+        )
+        return []
+    metadata_rows = payload.get("metadatas") if isinstance(payload, dict) else []
+    id_rows = payload.get("ids") if isinstance(payload, dict) else []
+    if not isinstance(metadata_rows, list):
+        metadata_rows = []
+    if not isinstance(id_rows, list):
+        id_rows = []
+    source_map: Dict[str, Dict[str, Any]] = {}
+    legacy_source_rows = 0
+    for index, metadata in enumerate(metadata_rows):
+        if not isinstance(metadata, dict):
+            continue
+        source_id = str(metadata.get("source_id") or "").strip()
+        if not source_id:
+            fallback_source = str(metadata.get("source_url") or metadata.get("source") or "").strip()
+            if fallback_source:
+                source_id = f"legacy_{hashlib.md5(fallback_source.encode('utf-8')).hexdigest()[:16]}"
+            else:
+                source_id = f"legacy_{index}"
+            legacy_source_rows += 1
+        if not source_id:
+            continue
+        ingest_status = str(metadata.get("ingest_status") or "parsed").strip() or "parsed"
+        current_entry = source_map.get(source_id)
+        if not current_entry:
+            current_entry = {
+                "source_id": source_id,
+                "source_type": str(metadata.get("source_type") or "txt"),
+                "source_platform": str(metadata.get("source_platform") or "unknown"),
+                "source_url": str(metadata.get("source_url") or metadata.get("source") or ""),
+                "author": metadata.get("author"),
+                "ingest_mode": str(metadata.get("ingest_mode") or "auto"),
+                "ingest_status": ingest_status,
+                "ingest_error_code": metadata.get("ingest_error_code"),
+                "ingested_at": metadata.get("ingested_at"),
+                "expires_at": metadata.get("expires_at"),
+                "chunks_count": 0,
+                "parsed_content_preview": str(metadata.get("parsed_content_preview") or ""),
+                "parsed_content_chars": int(metadata.get("parsed_content_chars") or 0),
+                "chunk_ids": [],
+            }
+            source_map[source_id] = current_entry
+        if not str(current_entry.get("parsed_content_preview") or "") and str(metadata.get("parsed_content_preview") or ""):
+            current_entry["parsed_content_preview"] = str(metadata.get("parsed_content_preview") or "")
+        if int(current_entry.get("parsed_content_chars") or 0) <= 0 and int(metadata.get("parsed_content_chars") or 0) > 0:
+            current_entry["parsed_content_chars"] = int(metadata.get("parsed_content_chars") or 0)
+        current_entry["chunks_count"] = int(current_entry.get("chunks_count") or 0) + 1
+        if index < len(id_rows):
+            current_entry["chunk_ids"].append(str(id_rows[index]))
+    if legacy_source_rows > 0:
+        logger.info(
+            "knowledge_source_entries_legacy_fallback collection=%s legacy_rows=%s total_rows=%s",
+            collection_name,
+            legacy_source_rows,
+            len(metadata_rows),
+        )
+    return sorted(
+        list(source_map.values()),
+        key=lambda item: str(item.get("ingested_at") or ""),
+        reverse=True,
+    )
+
+
+def _load_collection_debug_entries(collection_name: str) -> List[Dict[str, Any]]:
+    """读取知识库集合调试快照并按 source_id 聚合分块内容。"""
+    store = _get_knowledge_store()
+    try:
+        store.switch_collection(collection_name, create_if_missing=False)
+        payload = store.vector_db.get(include=["metadatas", "documents"])
+    except Exception:
+        return []
+    metadata_rows = payload.get("metadatas") if isinstance(payload, dict) else []
+    id_rows = payload.get("ids") if isinstance(payload, dict) else []
+    document_rows = payload.get("documents") if isinstance(payload, dict) else []
+    if not isinstance(metadata_rows, list):
+        metadata_rows = []
+    if not isinstance(id_rows, list):
+        id_rows = []
+    if not isinstance(document_rows, list):
+        document_rows = []
+    source_map: Dict[str, Dict[str, Any]] = {}
+    for index, metadata in enumerate(metadata_rows):
+        if not isinstance(metadata, dict):
+            continue
+        source_id = str(metadata.get("source_id") or "").strip()
+        if not source_id:
+            source_id = f"unknown_{index}"
+        ingest_status = str(metadata.get("ingest_status") or "parsed").strip() or "parsed"
+        current_entry = source_map.get(source_id)
+        if not current_entry:
+            current_entry = {
+                "source_id": source_id,
+                "source_type": str(metadata.get("source_type") or "txt"),
+                "source_platform": str(metadata.get("source_platform") or "unknown"),
+                "source_url": str(metadata.get("source_url") or metadata.get("source") or ""),
+                "author": metadata.get("author"),
+                "ingest_mode": str(metadata.get("ingest_mode") or "auto"),
+                "ingest_status": ingest_status,
+                "ingest_error_code": metadata.get("ingest_error_code"),
+                "ingested_at": metadata.get("ingested_at"),
+                "expires_at": metadata.get("expires_at"),
+                "chunks_count": 0,
+                "parsed_content_preview": str(metadata.get("parsed_content_preview") or ""),
+                "parsed_content_chars": int(metadata.get("parsed_content_chars") or 0),
+                "chunks": [],
+            }
+            source_map[source_id] = current_entry
+        chunk_id = str(id_rows[index]) if index < len(id_rows) else f"chunk_{index}"
+        chunk_content = str(document_rows[index] or "") if index < len(document_rows) else ""
+        current_entry["chunks_count"] = int(current_entry.get("chunks_count") or 0) + 1
+        current_entry["chunks"].append(
+            {
+                "chunk_id": chunk_id,
+                "content": chunk_content,
+                "content_chars": len(chunk_content),
+                "chunk_index": int(metadata.get("chunk_index") or (current_entry.get("chunks_count") or 0)),
+                "chunk_total": int(metadata.get("chunk_total") or 0),
+                "metadata": metadata,
+            }
+        )
+    return sorted(
+        list(source_map.values()),
+        key=lambda item: str(item.get("ingested_at") or ""),
+        reverse=True,
+    )
+
+
+def _build_knowledge_base_item(record: Dict[str, str]) -> KnowledgeBaseItem:
+    """将 registry 记录转换为知识库列表项并补充统计信息。"""
+    collection_name = str(record.get("collection_name") or "")
+    source_entries = _load_collection_source_entries(collection_name) if collection_name else []
+    source_types = sorted({str(item.get("source_type") or "") for item in source_entries if str(item.get("source_type") or "").strip()})
+    last_updated_at = None
+    ingest_times = [str(item.get("ingested_at") or "").strip() for item in source_entries]
+    ingest_times = [value for value in ingest_times if value]
+    if ingest_times:
+        last_updated_at = max(ingest_times)
+    document_count = sum([int(item.get("chunks_count") or 0) for item in source_entries])
+    return KnowledgeBaseItem(
+        knowledge_base_id=str(record.get("knowledge_base_id") or ""),
+        name=str(record.get("name") or ""),
+        collection_name=collection_name,
+        document_count=document_count,
+        source_count=len(source_entries),
+        source_types=source_types,
+        last_updated_at=last_updated_at,
+    )
+
+
 def _build_knowledge_context_texts(
     knowledge_base_id: Optional[str],
     destination: str,
@@ -506,14 +870,165 @@ def _build_knowledge_context_texts(
     store.switch_collection(collection_name, create_if_missing=False)
     query_text = _build_kb_query(destination, days, budget, preference, knowledge_query)
     related_docs = store.similarity_search(query_text, k=4)
+    logger.info(
+        "knowledge_context_search kb=%s query=%s hits=%s",
+        knowledge_base_id,
+        query_text,
+        len(related_docs),
+    )
     context_texts: List[str] = []
-    for doc in related_docs:
-        source = str((doc.metadata or {}).get("source") or "私有知识库")
+    for index, doc in enumerate(related_docs):
+        metadata = doc.metadata or {}
+        source = str(metadata.get("source") or metadata.get("source_url") or "私有知识库")
+        source_type = str(metadata.get("source_type") or "unknown")
+        source_platform = str(metadata.get("source_platform") or "unknown")
+        ingest_status = str(metadata.get("ingest_status") or "parsed")
         snippet = str(doc.page_content or "").strip()
         if not snippet:
             continue
-        context_texts.append(f"私有知识库参考（来源:{source}）：{snippet[:800]}")
+        logger.info(
+            "knowledge_context_hit kb=%s index=%s source_id=%s source_type=%s ingest_status=%s preview=%s",
+            knowledge_base_id,
+            index,
+            str(metadata.get("source_id") or ""),
+            source_type,
+            ingest_status,
+            _build_text_preview(snippet, 220),
+        )
+        context_texts.append(
+            f"私有知识库参考（来源:{source}，类型:{source_type}，平台:{source_platform}，导入状态:{ingest_status}）：{snippet[:800]}"
+        )
     return context_texts
+
+
+def _normalize_knowledge_scope(knowledge_scope: Optional[str]) -> str:
+    scope = str(knowledge_scope or "private_plus_public").strip().lower()
+    if scope not in {"private_only", "private_plus_public"}:
+        raise HTTPException(status_code=400, detail="knowledge_scope 仅支持 private_only/private_plus_public")
+    return scope
+
+
+def _build_empty_evidence() -> Dict[str, Any]:
+    return {
+        "summary": {"items": [], "candidates": [], "used_chars": 0, "budget_chars": 0},
+        "body": {"items": [], "candidates": [], "used_chars": 0, "budget_chars": 0},
+        "budget": {"summary_max_chars": 0, "body_max_chars": 0},
+    }
+
+
+def _is_social_private_source(metadata: Dict[str, Any]) -> bool:
+    source_type = str(metadata.get("source_type") or "").strip().lower()
+    source_platform = str(metadata.get("source_platform") or "").strip().lower()
+    return source_type in {"url", "manual", "ocr"} or source_platform in SOCIAL_SOURCE_PLATFORMS
+
+
+def _build_private_knowledge_evidence(knowledge_base_id: str, query: str) -> Dict[str, Any]:
+    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+    store = _get_knowledge_store()
+    store.switch_collection(kb_info["collection_name"], create_if_missing=False)
+    related_docs = store.similarity_search(query, k=14)
+    social_docs: List[Document] = []
+    other_docs: List[Document] = []
+    for doc in related_docs:
+        if not isinstance(doc, Document):
+            continue
+        metadata = doc.metadata or {}
+        if _is_social_private_source(metadata):
+            social_docs.append(doc)
+        else:
+            other_docs.append(doc)
+    ordered_docs = (social_docs + other_docs)[:10]
+    summary_items: List[Dict[str, Any]] = []
+    body_items: List[Dict[str, Any]] = []
+    for index, doc in enumerate(ordered_docs):
+        metadata = doc.metadata or {}
+        text = str(doc.page_content or "").strip()
+        if not text:
+            continue
+        source_url = str(metadata.get("source_url") or metadata.get("source") or "").strip()
+        source = source_url or f"private://{kb_info['knowledge_base_id']}/{index + 1}"
+        title = str(metadata.get("title") or metadata.get("source_type") or f"私有知识片段 {index + 1}")
+        summary_text = text[:220]
+        body_text = text[:1200]
+        confidence = 1.0
+        summary_items.append(
+            {
+                "source": source,
+                "title": title,
+                "text": summary_text,
+                "score": confidence,
+                "confidence": confidence,
+                "timestamp": metadata.get("ingested_at"),
+                "source_type": str(metadata.get("source_type") or "private"),
+                "source_platform": str(metadata.get("source_platform") or "unknown"),
+                "ingest_status": str(metadata.get("ingest_status") or "parsed"),
+            }
+        )
+        body_items.append(
+            {
+                "source": source,
+                "title": title,
+                "text": body_text,
+                "score": confidence,
+                "confidence": confidence,
+                "timestamp": metadata.get("ingested_at"),
+                "source_type": str(metadata.get("source_type") or "private"),
+                "source_platform": str(metadata.get("source_platform") or "unknown"),
+                "ingest_status": str(metadata.get("ingest_status") or "parsed"),
+            }
+        )
+    return {
+        "summary": {
+            "items": summary_items[:6],
+            "candidates": summary_items,
+            "used_chars": sum([len(str(item.get("text") or "")) for item in summary_items[:6]]),
+            "budget_chars": sum([len(str(item.get("text") or "")) for item in summary_items]),
+        },
+        "body": {
+            "items": body_items[:4],
+            "candidates": body_items,
+            "used_chars": sum([len(str(item.get("text") or "")) for item in body_items[:4]]),
+            "budget_chars": sum([len(str(item.get("text") or "")) for item in body_items]),
+        },
+        "budget": {
+            "summary_max_chars": sum([len(str(item.get("text") or "")) for item in summary_items]),
+            "body_max_chars": sum([len(str(item.get("text") or "")) for item in body_items]),
+        },
+    }
+
+
+def _merge_evidence_sections(private_section: Any, public_section: Any) -> Dict[str, Any]:
+    private_payload = private_section if isinstance(private_section, dict) else {}
+    public_payload = public_section if isinstance(public_section, dict) else {}
+    private_items = list(private_payload.get("items") or [])
+    public_items = list(public_payload.get("items") or [])
+    private_candidates = list(private_payload.get("candidates") or [])
+    public_candidates = list(public_payload.get("candidates") or [])
+    merged_items = private_items + public_items
+    merged_candidates = private_candidates + public_candidates
+    return {
+        "items": merged_items,
+        "candidates": merged_candidates,
+        "used_chars": sum([len(str(item.get("text") or "")) for item in merged_items]),
+        "budget_chars": sum([len(str(item.get("text") or "")) for item in merged_candidates]),
+    }
+
+
+def _merge_knowledge_evidence(private_evidence: Dict[str, Any], public_evidence: Dict[str, Any]) -> Dict[str, Any]:
+    private_payload = private_evidence if isinstance(private_evidence, dict) else {}
+    public_payload = public_evidence if isinstance(public_evidence, dict) else {}
+    if not private_payload and not public_payload:
+        return _build_empty_evidence()
+    merged_summary = _merge_evidence_sections(private_payload.get("summary"), public_payload.get("summary"))
+    merged_body = _merge_evidence_sections(private_payload.get("body"), public_payload.get("body"))
+    return {
+        "summary": merged_summary,
+        "body": merged_body,
+        "budget": {
+            "summary_max_chars": int(merged_summary.get("budget_chars") or 0),
+            "body_max_chars": int(merged_body.get("budget_chars") or 0),
+        },
+    }
 
 
 def _ensure_session_id(user_id: str, device_id: str, session_id: Optional[str]) -> str:
@@ -1208,6 +1723,7 @@ async def _run_flow_stream(
         "tool_count": 0,
         "rag_hit": False,
         "agent_escalated": False,
+        "knowledge_scope": str(payload.knowledge_scope or "private_plus_public"),
     }
     trip_data: Optional[Dict[str, Any]] = None
     escalation_reasons: List[str] = []
@@ -1219,6 +1735,16 @@ async def _run_flow_stream(
     }
     merged_context_texts = list(payload.context_texts or [])
     response_text = ""
+    source_evidence: List[Dict[str, Any]] = []
+    allow_public_fusion = str(payload.knowledge_scope or "private_plus_public").strip().lower() != "private_only"
+    logger.info(
+        "flow_start message_id=%s session_id=%s knowledge_scope=%s allow_public_fusion=%s knowledge_base_id=%s",
+        message_id,
+        session_id,
+        str(payload.knowledge_scope or "private_plus_public"),
+        allow_public_fusion,
+        str(payload.knowledge_base_id or ""),
+    )
     try:
         # 初始化主流程 start 事件，通知前端进入统一状态机
         last_sequence += 1
@@ -1269,13 +1795,21 @@ async def _run_flow_stream(
         last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "tool")
         tool_query = llm_manager._build_tool_query(user_input=user_input, query=flow_query)
         tool_result: Dict[str, Any] = {"needs_tool": False}
-        if tool_query:
+        if tool_query and allow_public_fusion:
             tool_result = llm_manager.call_tool_by_llm(tool_query, context_messages)
             if tool_result.get("needs_tool"):
                 metrics["tool_count"] = 1
                 result_payload = tool_result.get("result")
                 if isinstance(result_payload, dict) and result_payload.get("success"):
                     merged_context_texts.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
+            logger.info(
+                "flow_tool_result message_id=%s needs_tool=%s success=%s",
+                message_id,
+                bool(tool_result.get("needs_tool")),
+                bool(((tool_result.get("result") or {}) if isinstance(tool_result, dict) else {}).get("success")),
+            )
+        elif tool_query and not allow_public_fusion:
+            logger.info("flow_tool_skipped_private_only message_id=%s reason=knowledge_scope_private_only", message_id)
         kb_context_texts = _build_knowledge_context_texts(
             payload.knowledge_base_id,
             payload.destination,
@@ -1287,6 +1821,24 @@ async def _run_flow_stream(
         merged_context_texts.extend(kb_context_texts)
         if kb_context_texts:
             metrics["rag_hit"] = True
+            collection_name = _to_collection_name(payload.knowledge_base_id or "")
+            source_entries = _load_collection_source_entries(collection_name)
+            source_evidence = [
+                {
+                    "source_id": str(item.get("source_id") or ""),
+                    "source_type": str(item.get("source_type") or "unknown"),
+                    "source_platform": str(item.get("source_platform") or "unknown"),
+                    "source_url": str(item.get("source_url") or ""),
+                    "ingest_status": str(item.get("ingest_status") or "parsed"),
+                }
+                for item in source_entries[:8]
+            ]
+        logger.info(
+            "flow_private_context message_id=%s kb_context_count=%s source_evidence_count=%s",
+            message_id,
+            len(kb_context_texts),
+            len(source_evidence),
+        )
         merged_context_texts = _merge_context_with_budget(merged_context_texts)
         metrics["context_count"] = len(merged_context_texts)
         metrics["context_chars"] = sum([len(item) for item in merged_context_texts])
@@ -1459,6 +2011,13 @@ async def _run_flow_stream(
                     "trip_data": trip_data,
                     "response_text": response_text,
                     "metrics": metrics,
+                    "source_evidence": source_evidence,
+                    "knowledge_debug": {
+                        "knowledge_scope": str(payload.knowledge_scope or "private_plus_public"),
+                        "allow_public_fusion": allow_public_fusion,
+                        "kb_context_count": len(kb_context_texts),
+                        "source_evidence_count": len(source_evidence),
+                    },
                     "agent_escalated": metrics["agent_escalated"],
                     "escalation_reasons": escalation_reasons,
                 },
@@ -2024,7 +2583,7 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
 @app.get("/api/knowledge/bases", response_model=KnowledgeBaseListResponse)
 def list_knowledge_bases() -> KnowledgeBaseListResponse:
     records = _load_knowledge_base_registry()
-    items = [KnowledgeBaseItem(**row) for row in records]
+    items = [_build_knowledge_base_item(row) for row in records]
     return KnowledgeBaseListResponse(items=items)
 
 
@@ -2063,8 +2622,9 @@ def delete_knowledge_base(knowledge_base_id: str) -> KnowledgeBaseDeleteResponse
 
 @app.post("/api/knowledge/bases/{knowledge_base_id}/upload", response_model=KnowledgeUploadResponse)
 async def upload_knowledge_document(knowledge_base_id: str, file: UploadFile = File(...)) -> KnowledgeUploadResponse:
-    normalized_id = _normalize_knowledge_base_id(knowledge_base_id)
-    collection_name = _to_collection_name(normalized_id)
+    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+    normalized_id = kb_info["knowledge_base_id"]
+    collection_name = kb_info["collection_name"]
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
     file_bytes = await file.read()
@@ -2073,19 +2633,35 @@ async def upload_knowledge_document(knowledge_base_id: str, file: UploadFile = F
     extracted_text = _extract_text_from_upload(file.filename, file_bytes)
     if not extracted_text:
         raise HTTPException(status_code=400, detail="文档中未提取到可用文本")
+    logger.info(
+        "knowledge_upload_parse_success kb=%s filename=%s content_chars=%s preview=%s",
+        normalized_id,
+        str(file.filename),
+        len(extracted_text),
+        _build_text_preview(extracted_text, 260),
+    )
     store = _get_knowledge_store()
-    existing = set(store.list_collections())
-    if collection_name not in existing:
-        raise HTTPException(status_code=404, detail="知识库不存在")
     store.switch_collection(collection_name, create_if_missing=False)
+    source_type = _detect_source_type_by_filename(file.filename)
+    source_metadata = _build_source_metadata(
+        knowledge_base_id=normalized_id,
+        source_url="",
+        source_type=source_type,
+        source_platform="unknown",
+        ingest_mode="auto",
+        ingest_status="parsed",
+    )
+    parsed_preview_text = _build_text_preview(extracted_text, 3000)
+    parsed_chars = len(extracted_text)
     added_chunks = store.add_documents(
         [
             {
                 "content": extracted_text,
                 "metadata": {
                     "source": str(file.filename),
-                    "knowledge_base_id": normalized_id,
-                    "uploaded_at": datetime.now().isoformat(),
+                    **source_metadata,
+                    "parsed_content_preview": parsed_preview_text,
+                    "parsed_content_chars": parsed_chars,
                     "file_type": str(file.content_type or ""),
                 },
             }
@@ -2093,17 +2669,428 @@ async def upload_knowledge_document(knowledge_base_id: str, file: UploadFile = F
     )
     if added_chunks <= 0:
         raise HTTPException(status_code=500, detail="文档入库失败")
-    return KnowledgeUploadResponse(knowledge_base_id=normalized_id, filename=str(file.filename), chunks=added_chunks)
+    logger.info(
+        "knowledge_upload_store_success kb=%s filename=%s source_id=%s chunks=%s",
+        normalized_id,
+        str(file.filename),
+        str(source_metadata.get("source_id") or ""),
+        added_chunks,
+    )
+    return KnowledgeUploadResponse(
+        knowledge_base_id=normalized_id,
+        filename=str(file.filename),
+        chunks=added_chunks,
+        metadata=source_metadata,
+        parsed_content_preview=parsed_preview_text,
+        parsed_content_chars=parsed_chars,
+    )
+
+
+@app.post("/api/knowledge/bases/{knowledge_base_id}/ingest/url", response_model=KnowledgeIngestUrlResponse)
+def ingest_knowledge_url(knowledge_base_id: str, payload: KnowledgeIngestUrlRequest) -> KnowledgeIngestUrlResponse:
+    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+    normalized_id = kb_info["knowledge_base_id"]
+    collection_name = kb_info["collection_name"]
+    url = str(payload.url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url 不能为空")
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise HTTPException(status_code=400, detail="url 必须是可公开访问的 http/https 链接")
+    mode = str(payload.mode or "auto").strip().lower()
+    if mode not in {"auto", "manual"}:
+        raise HTTPException(status_code=400, detail="mode 仅支持 auto/manual")
+    manual_text = str(payload.manual_text or "").strip()
+    ocr_text = str(payload.ocr_text or "").strip()
+    if mode == "manual" and not manual_text and not ocr_text:
+        raise HTTPException(status_code=400, detail="manual 模式下需提供 manual_text 或 ocr_text")
+    store = _get_knowledge_store()
+    store.switch_collection(collection_name, create_if_missing=False)
+    platform = _infer_source_platform(url)
+    ingest_status = "failed"
+    ingest_error_code = "INGEST_EMPTY_CONTENT"
+    source_type = "url"
+    content_text = ""
+    source_metadata: Dict[str, Any] = {}
+    if mode == "manual":
+        content_text = manual_text or ocr_text
+        source_type = "manual" if manual_text else "ocr"
+        ingest_status = "fallback"
+        ingest_error_code = None
+    else:
+        crawler = ContentCrawler(max_workers=1, timeout=10)
+        crawl_results = crawler.fetch_urls([url])
+        if crawl_results and isinstance(crawl_results[0], dict):
+            parsed_item = crawl_results[0]
+            content_text = str(parsed_item.get("content") or "").strip()
+            if content_text:
+                ingest_status = "parsed"
+                ingest_error_code = None
+                logger.info(
+                    "knowledge_ingest_url_auto_parse kb=%s platform=%s url=%s content_chars=%s preview=%s",
+                    normalized_id,
+                    platform,
+                    url,
+                    len(content_text),
+                    _build_text_preview(content_text, 260),
+                )
+        if not content_text and (manual_text or ocr_text):
+            content_text = manual_text or ocr_text
+            source_type = "manual" if manual_text else "ocr"
+            ingest_status = "fallback"
+            ingest_error_code = "AUTO_PARSE_EMPTY_FALLBACK"
+        elif not content_text:
+            ingest_status = "failed"
+            ingest_error_code = "AUTO_PARSE_EMPTY"
+    source_metadata = _build_source_metadata(
+        knowledge_base_id=normalized_id,
+        source_url=url,
+        source_type=source_type,
+        source_platform=platform,
+        ingest_mode=mode,
+        ingest_status=ingest_status,
+        ingest_error_code=ingest_error_code,
+    )
+    if ingest_status == "failed":
+        logger.warning(
+            "knowledge_ingest_url_failed kb=%s platform=%s url=%s error_code=%s",
+            normalized_id,
+            platform,
+            url,
+            ingest_error_code,
+        )
+        failed_preview = _build_text_preview(content_text, 3000) if content_text else ""
+        return KnowledgeIngestUrlResponse(
+            success=False,
+            ingest_status="failed",
+            chunks_count=0,
+            metadata=source_metadata,
+            parsed_content_preview=failed_preview,
+            parsed_content_chars=len(content_text),
+        )
+    parsed_preview_text = _build_text_preview(content_text, 3000)
+    parsed_chars = len(content_text)
+    logger.info(
+        "knowledge_ingest_url_content_ready kb=%s source_type=%s ingest_status=%s content_chars=%s preview=%s",
+        normalized_id,
+        source_type,
+        ingest_status,
+        len(content_text),
+        _build_text_preview(content_text, 260),
+    )
+    added_chunks = store.add_documents(
+        [
+            {
+                "content": content_text,
+                "metadata": {
+                    "source": url,
+                    **source_metadata,
+                    "parsed_content_preview": parsed_preview_text,
+                    "parsed_content_chars": parsed_chars,
+                },
+            }
+        ]
+    )
+    if added_chunks <= 0:
+        failed_metadata = dict(source_metadata)
+        failed_metadata["ingest_status"] = "failed"
+        failed_metadata["ingest_error_code"] = "VECTOR_STORE_INSERT_FAILED"
+        logger.error(
+            "knowledge_ingest_url_store_failed kb=%s source_id=%s url=%s",
+            normalized_id,
+            str(source_metadata.get("source_id") or ""),
+            url,
+        )
+        return KnowledgeIngestUrlResponse(
+            success=False,
+            ingest_status="failed",
+            chunks_count=0,
+            metadata=failed_metadata,
+            parsed_content_preview=parsed_preview_text,
+            parsed_content_chars=parsed_chars,
+        )
+    logger.info(
+        "knowledge_ingest_url_store_success kb=%s source_id=%s ingest_status=%s chunks=%s",
+        normalized_id,
+        str(source_metadata.get("source_id") or ""),
+        ingest_status,
+        added_chunks,
+    )
+    return KnowledgeIngestUrlResponse(
+        success=True,
+        ingest_status=ingest_status,
+        chunks_count=added_chunks,
+        metadata=source_metadata,
+        parsed_content_preview=parsed_preview_text,
+        parsed_content_chars=parsed_chars,
+    )
+
+
+@app.get("/api/knowledge/bases/{knowledge_base_id}/sources", response_model=KnowledgeSourceListResponse)
+def list_knowledge_sources(knowledge_base_id: str) -> KnowledgeSourceListResponse:
+    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+    normalized_id = kb_info["knowledge_base_id"]
+    collection_name = kb_info["collection_name"]
+    store = _get_knowledge_store()
+    all_collections = set(store.list_collections())
+    collection_exists = collection_name in all_collections
+    raw_doc_count = 0
+    if collection_exists:
+        try:
+            store.switch_collection(collection_name, create_if_missing=False)
+            raw_payload = store.vector_db.get(include=["ids"])
+            raw_ids = raw_payload.get("ids") if isinstance(raw_payload, dict) else []
+            raw_doc_count = len(raw_ids) if isinstance(raw_ids, list) else 0
+        except Exception as exc:
+            logger.error(
+                "knowledge_sources_raw_count_failed kb=%s collection=%s error=%s",
+                normalized_id,
+                collection_name,
+                str(exc),
+            )
+    source_entries = _load_collection_source_entries(collection_name)
+    social_entries = [
+        item
+        for item in source_entries
+        if str(item.get("source_url") or "").strip()
+        or str(item.get("source_type") or "").strip().lower() in {"url", "manual", "ocr"}
+    ]
+    items = [KnowledgeSourceItem(**{key: value for key, value in item.items() if key != "chunk_ids"}) for item in source_entries]
+    status_counter = {"parsed": 0, "fallback": 0, "failed": 0}
+    for item in source_entries:
+        status_value = str(item.get("ingest_status") or "parsed")
+        if status_value in status_counter:
+            status_counter[status_value] += 1
+    logger.info(
+        "knowledge_sources_list kb=%s collection=%s exists=%s raw_docs=%s total=%s social=%s first_source_id=%s first_source_url=%s",
+        normalized_id,
+        collection_name,
+        collection_exists,
+        raw_doc_count,
+        len(source_entries),
+        len(social_entries),
+        str(source_entries[0].get("source_id") or "") if source_entries else "",
+        str(source_entries[0].get("source_url") or "") if source_entries else "",
+    )
+    stats = KnowledgeSourceStats(
+        total=len(source_entries),
+        parsed=status_counter["parsed"],
+        fallback=status_counter["fallback"],
+        failed=status_counter["failed"],
+    )
+    return KnowledgeSourceListResponse(knowledge_base_id=normalized_id, items=items, stats=stats)
+
+
+@app.get("/api/knowledge/debug/snapshot", response_model=KnowledgeDebugSnapshotResponse)
+def knowledge_debug_snapshot() -> KnowledgeDebugSnapshotResponse:
+    """输出全部知识库与分块调试快照，便于核验导入解析结果。"""
+    records = _load_knowledge_base_registry()
+    debug_items: List[KnowledgeDebugBaseItem] = []
+    for record in records:
+        collection_name = str(record.get("collection_name") or "")
+        source_entries = _load_collection_debug_entries(collection_name) if collection_name else []
+        last_updated_at = None
+        ingest_times = [str(item.get("ingested_at") or "").strip() for item in source_entries]
+        ingest_times = [value for value in ingest_times if value]
+        if ingest_times:
+            last_updated_at = max(ingest_times)
+        source_payload = [KnowledgeDebugSourceItem(**item) for item in source_entries]
+        document_count = sum([int(item.chunks_count or 0) for item in source_payload])
+        debug_items.append(
+            KnowledgeDebugBaseItem(
+                knowledge_base_id=str(record.get("knowledge_base_id") or ""),
+                name=str(record.get("name") or ""),
+                collection_name=collection_name,
+                document_count=document_count,
+                source_count=len(source_payload),
+                last_updated_at=last_updated_at,
+                sources=source_payload,
+            )
+        )
+    logger.info(
+        "knowledge_debug_snapshot_generated bases=%s total_sources=%s",
+        len(debug_items),
+        sum([len(item.sources) for item in debug_items]),
+    )
+    return KnowledgeDebugSnapshotResponse(generated_at=datetime.now().isoformat(), items=debug_items)
+
+
+@app.delete("/api/knowledge/bases/{knowledge_base_id}/sources/{source_id}", response_model=KnowledgeSourceDeleteResponse)
+def delete_knowledge_source(knowledge_base_id: str, source_id: str) -> KnowledgeSourceDeleteResponse:
+    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+    normalized_id = kb_info["knowledge_base_id"]
+    collection_name = kb_info["collection_name"]
+    source_entries = _load_collection_source_entries(collection_name)
+    matched_entry = next((item for item in source_entries if str(item.get("source_id") or "") == str(source_id or "")), None)
+    if not matched_entry:
+        raise HTTPException(status_code=404, detail="来源不存在")
+    chunk_ids = [str(item) for item in (matched_entry.get("chunk_ids") or []) if str(item).strip()]
+    if not chunk_ids:
+        raise HTTPException(status_code=404, detail="来源无可删除分块")
+    store = _get_knowledge_store()
+    store.switch_collection(collection_name, create_if_missing=False)
+    store.vector_db.delete(ids=chunk_ids)
+    return KnowledgeSourceDeleteResponse(
+        knowledge_base_id=normalized_id,
+        source_id=str(source_id),
+        success=True,
+        deleted_chunks=len(chunk_ids),
+    )
+
+
+@app.patch("/api/knowledge/bases/{knowledge_base_id}/sources/{source_id}", response_model=KnowledgeSourceUpdateResponse)
+def update_knowledge_source(knowledge_base_id: str, source_id: str, payload: KnowledgeSourceUpdateRequest) -> KnowledgeSourceUpdateResponse:
+    """更新指定来源内容并重建该来源分块，确保修改后内容可被私有检索命中。"""
+    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+    normalized_id = kb_info["knowledge_base_id"]
+    collection_name = kb_info["collection_name"]
+    normalized_source_id = str(source_id or "").strip()
+    if not normalized_source_id:
+        raise HTTPException(status_code=400, detail="source_id 不能为空")
+    updated_content = str(payload.content or "").strip()
+    if not updated_content:
+        raise HTTPException(status_code=400, detail="content 不能为空")
+    source_entries = _load_collection_source_entries(collection_name)
+    matched_entry = next((item for item in source_entries if str(item.get("source_id") or "") == normalized_source_id), None)
+    if not matched_entry:
+        raise HTTPException(status_code=404, detail="来源不存在")
+    logger.info(
+        "knowledge_source_update_start kb=%s source_id=%s old_chunks=%s old_source_url=%s",
+        normalized_id,
+        normalized_source_id,
+        len(matched_entry.get("chunk_ids") or []),
+        str(matched_entry.get("source_url") or ""),
+    )
+    store = _get_knowledge_store()
+    store.switch_collection(collection_name, create_if_missing=False)
+    chunk_ids = [str(item) for item in (matched_entry.get("chunk_ids") or []) if str(item).strip()]
+    if chunk_ids:
+        store.vector_db.delete(ids=chunk_ids)
+    # 复用原来源标识并替换正文，保证前端列表与检索引用稳定。
+    source_metadata = _build_source_metadata(
+        knowledge_base_id=normalized_id,
+        source_url=str(payload.source_url or matched_entry.get("source_url") or "").strip(),
+        source_type=str(matched_entry.get("source_type") or "manual"),
+        source_platform=str(matched_entry.get("source_platform") or "unknown"),
+        ingest_mode="manual",
+        ingest_status="fallback",
+        source_id=normalized_source_id,
+        author=matched_entry.get("author"),
+        expires_at=matched_entry.get("expires_at"),
+    )
+    parsed_preview_text = _build_text_preview(updated_content, 3000)
+    parsed_chars = len(updated_content)
+    added_chunks = store.add_documents(
+        [
+            {
+                "content": updated_content,
+                "metadata": {
+                    "source": str(payload.source_url or matched_entry.get("source_url") or ""),
+                    **source_metadata,
+                    "parsed_content_preview": parsed_preview_text,
+                    "parsed_content_chars": parsed_chars,
+                },
+            }
+        ]
+    )
+    if added_chunks <= 0:
+        raise HTTPException(status_code=500, detail="来源更新失败")
+    logger.info(
+        "knowledge_source_update_done kb=%s source_id=%s new_chunks=%s content_chars=%s",
+        normalized_id,
+        normalized_source_id,
+        added_chunks,
+        parsed_chars,
+    )
+    return KnowledgeSourceUpdateResponse(
+        knowledge_base_id=normalized_id,
+        source_id=normalized_source_id,
+        success=True,
+        chunks_count=added_chunks,
+        metadata=source_metadata,
+        parsed_content_preview=parsed_preview_text,
+        parsed_content_chars=parsed_chars,
+    )
 
 
 @app.post("/api/knowledge/search", response_model=KnowledgeSearchResponse)
 def knowledge_search(payload: KnowledgeSearchRequest) -> KnowledgeSearchResponse:
-    """知识库检索接口（最小闭环）"""
+    """知识库检索接口"""
+    query = str(payload.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query 不能为空")
+    scope = _normalize_knowledge_scope(payload.knowledge_scope)
+    knowledge_base_id = str(payload.knowledge_base_id or "").strip()
+    if scope == "private_only" and not knowledge_base_id:
+        raise HTTPException(status_code=400, detail="private_only 模式下必须选择 knowledge_base_id")
+    allow_public_fusion = scope != "private_only"
+    source_evidence: List[Dict[str, Any]] = []
+    if knowledge_base_id:
+        collection_name = _to_collection_name(knowledge_base_id)
+        source_entries = _load_collection_source_entries(collection_name)
+        source_evidence = [
+            {
+                "source_id": str(item.get("source_id") or ""),
+                "source_type": str(item.get("source_type") or "unknown"),
+                "source_platform": str(item.get("source_platform") or "unknown"),
+                "source_url": str(item.get("source_url") or ""),
+                "ingest_status": str(item.get("ingest_status") or "parsed"),
+            }
+            for item in source_entries[:12]
+        ]
     rag_pipeline = _get_rag_pipeline()
-    result = rag_pipeline.run(payload.query, generate_answer=payload.generate_answer)
-    evidence = result.get("evidence") or {}
-    answer = result.get("answer")
-    return KnowledgeSearchResponse(query=payload.query, evidence=evidence, answer=answer)
+    private_evidence = (
+        _build_private_knowledge_evidence(knowledge_base_id, query)
+        if knowledge_base_id
+        else _build_empty_evidence()
+    )
+    if scope == "private_only":
+        evidence = private_evidence
+        answer = rag_pipeline.generate_answer_from_evidence(query, evidence) if payload.generate_answer else None
+        return KnowledgeSearchResponse(
+            query=query,
+            evidence=evidence,
+            answer=answer,
+            source_evidence=source_evidence,
+            knowledge_debug={
+                "knowledge_scope": scope,
+                "allow_public_fusion": allow_public_fusion,
+                "kb_context_count": len((evidence.get("body") or {}).get("items") or []),
+                "source_evidence_count": len(source_evidence),
+            },
+        )
+    if not knowledge_base_id:
+        result = rag_pipeline.run(query, generate_answer=payload.generate_answer)
+        evidence = result.get("evidence") or _build_empty_evidence()
+        answer = result.get("answer")
+        return KnowledgeSearchResponse(
+            query=query,
+            evidence=evidence,
+            answer=answer,
+            source_evidence=[],
+            knowledge_debug={
+                "knowledge_scope": scope,
+                "allow_public_fusion": allow_public_fusion,
+                "kb_context_count": 0,
+                "source_evidence_count": 0,
+            },
+        )
+    public_result = rag_pipeline.run(query, generate_answer=False)
+    public_evidence = public_result.get("evidence") or _build_empty_evidence()
+    merged_evidence = _merge_knowledge_evidence(private_evidence, public_evidence)
+    answer = rag_pipeline.generate_answer_from_evidence(query, merged_evidence) if payload.generate_answer else None
+    return KnowledgeSearchResponse(
+        query=query,
+        evidence=merged_evidence,
+        answer=answer,
+        source_evidence=source_evidence,
+        knowledge_debug={
+            "knowledge_scope": scope,
+            "allow_public_fusion": allow_public_fusion,
+            "kb_context_count": len((private_evidence.get("body") or {}).get("items") or []),
+            "source_evidence_count": len(source_evidence),
+        },
+    )
 
 
 @app.post("/api/knowledge/answer_from_evidence", response_model=KnowledgeAnswerResponse)

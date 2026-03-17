@@ -116,6 +116,12 @@ class VectorStore:
             
             # 分割文本
             splits = self.text_splitter.create_documents([text], metadatas=[metadata])
+            total_chunks = len(splits)
+            for chunk_index, split_doc in enumerate(splits):
+                chunk_metadata = dict(split_doc.metadata or {})
+                chunk_metadata["chunk_index"] = chunk_index + 1
+                chunk_metadata["chunk_total"] = total_chunks
+                split_doc.metadata = chunk_metadata
             docs_to_add.extend(splits)
 
         if docs_to_add:
