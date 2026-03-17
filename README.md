@@ -82,3 +82,14 @@ TripNexus 是一个基于大语言模型（LLM）与多智能体（Agent）架�
 * Agent 编排逻辑：[`src/agent/agent_loop.py`](src/agent/agent_loop.py)
 
 ---
+
+
+## 项目运行
+```shell
+# 后端
+PYTHONPATH=. uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --reload
+
+# 前端
+cd web
+pnpm run dev
+```
