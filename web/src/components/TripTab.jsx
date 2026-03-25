@@ -1,4 +1,4 @@
-import { Button, Card, Divider, Form, Input, Modal, Space, Spin, Tag } from "antd"
+import { Alert, Button, Card, Divider, Form, Input, Modal, Space, Spin, Tag, Tooltip } from "antd"
 import { DndContext, PointerSensor, closestCenter, useSensor, useSensors } from "@dnd-kit/core"
 import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
@@ -50,6 +50,14 @@ function buildConstraintSummary(constraintsUsed) {
     parts.push("无障碍：需要")
   }
   return parts.join(" | ")
+}
+
+function getConflictTagColor(severity) {
+  return severity === "error" ? "red" : "gold"
+}
+
+function getConflictSeverityIcon(severity) {
+  return severity === "error" ? "⛔" : "⚠"
 }
 
 function SortableTripItem({ item, onEdit, onDelete, onCardClick, isSelected, itemRef }) {
@@ -158,9 +166,14 @@ function SortableTripItem({ item, onEdit, onDelete, onCardClick, isSelected, ite
 }
 
 export default function TripTab({
+  conflictReport,
   loadingTrip,
+  onApplyAlternative,
+  onConflictReportChange,
+  onSelectAlternative,
   tripDays,
   tripResult,
+  selectedAlternative,
   onTripChange,
   onReplanDay,
   selectedPoiId,
@@ -174,13 +187,38 @@ export default function TripTab({
   useEffect(() => {
     setDraftTrip(tripResult || null)
   }, [tripResult])
-  const normalizedDays = useMemo(() => normalizeTripDays(draftTrip), [draftTrip])
-  const sortedTripDays = Array.isArray(tripDays) && tripDays.length ? tripDays : normalizedDays
-  const constraintsUsed = draftTrip?.constraints_used || null
+  const alternatives = Array.isArray(conflictReport?.alternatives) ? conflictReport.alternatives : []
+  const previewAlternative =
+    Number.isInteger(selectedAlternative) && selectedAlternative >= 0 ? alternatives[selectedAlternative] : null
+  // 方案卡片切换只影响当前预览，不立即改写正式行程，避免用户误触后直接落库。
+  const displayTrip = useMemo(() => {
+    if (previewAlternative?.trip_data) {
+      return previewAlternative.trip_data
+    }
+    return draftTrip
+  }, [draftTrip, previewAlternative])
+  const normalizedDays = useMemo(() => normalizeTripDays(displayTrip), [displayTrip])
+  const sortedTripDays = normalizedDays
+  const constraintsUsed = displayTrip?.constraints_used || null
   const constraintSummary = useMemo(() => buildConstraintSummary(constraintsUsed), [constraintsUsed])
-  const constraintStatuses = Array.isArray(draftTrip?.constraints_satisfied)
-    ? draftTrip.constraints_satisfied
+  const constraintStatuses = Array.isArray(displayTrip?.constraints_satisfied)
+    ? displayTrip.constraints_satisfied
     : []
+  const activeConflicts = Array.isArray(conflictReport?.conflicts) ? conflictReport.conflicts : []
+  const conflictsByDay = useMemo(() => {
+    const grouped = {}
+    activeConflicts.forEach((item) => {
+      const key = String(item?.day || "")
+      if (!key) {
+        return
+      }
+      if (!grouped[key]) {
+        grouped[key] = []
+      }
+      grouped[key].push(item)
+    })
+    return grouped
+  }, [activeConflicts])
   const handleUpdateTrip = useCallback(
     (nextTrip) => {
       setDraftTrip(nextTrip)
@@ -192,6 +230,9 @@ export default function TripTab({
   )
   const handleDragEnd = useCallback(
     (event) => {
+      if (previewAlternative) {
+        return
+      }
       const { active, over } = event
       if (!active?.id || !over?.id || !draftTrip?.daily_plan) {
         return
@@ -219,11 +260,11 @@ export default function TripTab({
       }
       handleUpdateTrip(nextTrip)
     },
-    [draftTrip, handleUpdateTrip],
+    [draftTrip, handleUpdateTrip, previewAlternative],
   )
   const handleDeleteItem = useCallback(
     (dayKey, index) => {
-      if (!draftTrip?.daily_plan) {
+      if (previewAlternative || !draftTrip?.daily_plan) {
         return
       }
       const dayItems = Array.isArray(draftTrip.daily_plan[dayKey])
@@ -239,10 +280,13 @@ export default function TripTab({
       }
       handleUpdateTrip(nextTrip)
     },
-    [draftTrip, handleUpdateTrip],
+    [draftTrip, handleUpdateTrip, previewAlternative],
   )
   const handleOpenEdit = useCallback(
     (dayKey, index, item) => {
+      if (previewAlternative) {
+        return
+      }
       setEditingItem({ dayKey, index })
       editForm.setFieldsValue({
         attraction: item?.attraction || "",
@@ -253,7 +297,7 @@ export default function TripTab({
         note: item?.note || item?.description || item?.introduction || "",
       })
     },
-    [editForm],
+    [editForm, previewAlternative],
   )
   const setCardRef = useCallback((poiId, node) => {
     if (!poiId) {
@@ -280,6 +324,10 @@ export default function TripTab({
     [handleSelectPoi],
   )
   const handleEditOk = useCallback(async () => {
+    if (previewAlternative) {
+      setEditingItem(null)
+      return
+    }
     if (!editingItem || !draftTrip?.daily_plan) {
       setEditingItem(null)
       return
@@ -310,13 +358,13 @@ export default function TripTab({
     }
     handleUpdateTrip(nextTrip)
     setEditingItem(null)
-  }, [draftTrip, editForm, editingItem, handleUpdateTrip])
+  }, [draftTrip, editForm, editingItem, handleUpdateTrip, previewAlternative])
   const handleEditCancel = useCallback(() => {
     setEditingItem(null)
   }, [])
   const handleReplan = useCallback(
     async (dayKey) => {
-      if (!onReplanDay) {
+      if (!onReplanDay || previewAlternative) {
         return
       }
       const result = await onReplanDay(Number(dayKey))
@@ -324,8 +372,25 @@ export default function TripTab({
         setDraftTrip(result)
       }
     },
-    [onReplanDay],
+    [onReplanDay, previewAlternative],
   )
+  const handleApplyAlternative = useCallback(async () => {
+    if (!previewAlternative?.trip_data || !onApplyAlternative) {
+      return
+    }
+    const nextTrip = {
+      ...previewAlternative.trip_data,
+      conflict_report: {
+        has_conflicts: false,
+        conflicts: [],
+        alternatives: [],
+      },
+    }
+    if (onConflictReportChange) {
+      onConflictReportChange({ has_conflicts: false, conflicts: [], alternatives: [] })
+    }
+    await onApplyAlternative(nextTrip)
+  }, [onApplyAlternative, onConflictReportChange, previewAlternative])
   useEffect(() => {
     if (!selectedPoiId) {
       return
@@ -341,11 +406,62 @@ export default function TripTab({
       <Card title="行程详情" className="panel-card">
         <Spin spinning={loadingTrip}>
           {!tripResult && <div className="empty-tip">暂无行程结果</div>}
-          {tripResult && (
+          {displayTrip && (
             <Space orientation="vertical" size="middle" className="full-width">
               <div className="trip-summary">
-                目的地：{tripResult.destination} · 天数：{tripResult.days}
+                目的地：{displayTrip.destination} · 天数：{displayTrip.days}
               </div>
+              {conflictReport?.has_conflicts && (
+                <Space direction="vertical" size="small" className="full-width">
+                  <Alert
+                    type="warning"
+                    showIcon
+                    message={`检测到 ${activeConflicts.length} 处行程冲突`}
+                    description={
+                      <Space direction="vertical" size="small" className="full-width">
+                        {activeConflicts.map((item, index) => (
+                          <div key={`${item?.type || "conflict"}-${item?.day || 0}-${index}`}>
+                            {getConflictSeverityIcon(item?.severity)} 第 {item?.day} 天 · {item?.description}
+                          </div>
+                        ))}
+                      </Space>
+                    }
+                  />
+                  {alternatives.length > 0 && (
+                    <Space size="middle" align="start" wrap>
+                      {alternatives.map((item, index) => (
+                        <Card
+                          key={`${item?.label || "plan"}-${index}`}
+                          size="small"
+                          title={item?.label || `Plan ${index + 1}`}
+                          style={{
+                            width: 280,
+                            borderColor: selectedAlternative === index ? "#1677ff" : undefined,
+                          }}
+                          extra={selectedAlternative === index ? <Tag color="blue">当前预览</Tag> : null}
+                        >
+                          <Space direction="vertical" size="small" className="full-width">
+                            <div>{item?.strategy || "已生成替代策略"}</div>
+                            <Space>
+                              <Button size="small" onClick={() => onSelectAlternative && onSelectAlternative(index)}>
+                                查看方案
+                              </Button>
+                              <Button
+                                size="small"
+                                type="primary"
+                                onClick={handleApplyAlternative}
+                                disabled={selectedAlternative !== index}
+                              >
+                                采用此方案
+                              </Button>
+                            </Space>
+                          </Space>
+                        </Card>
+                      ))}
+                    </Space>
+                  )}
+                </Space>
+              )}
               {(constraintSummary || constraintStatuses.length > 0) && (
                 <Card size="small" title="约束满足状态">
                   <Space orientation="vertical" size="small" className="full-width">
@@ -373,9 +489,22 @@ export default function TripTab({
                     return (
                       <div key={dayKey} className="trip-day-block">
                         <div className="trip-day-header">
-                          <div className="trip-day-title">第 {dayKey} 天</div>
+                          <div className="trip-day-title">
+                            第 {dayKey} 天
+                            {Array.isArray(conflictsByDay[dayKey]) && conflictsByDay[dayKey].length > 0 && (
+                              <Tooltip
+                                title={conflictsByDay[dayKey]
+                                  .map((item) => `${getConflictSeverityIcon(item?.severity)} ${item?.description}`)
+                                  .join("\n")}
+                              >
+                                <Tag color={getConflictTagColor(conflictsByDay[dayKey][0]?.severity)} style={{ marginLeft: 8 }}>
+                                  {getConflictSeverityIcon(conflictsByDay[dayKey][0]?.severity)} {conflictsByDay[dayKey].length} 个冲突
+                                </Tag>
+                              </Tooltip>
+                            )}
+                          </div>
                           <div className="trip-day-actions">
-                            <Button size="small" onClick={() => handleReplan(dayKey)}>
+                            <Button size="small" onClick={() => handleReplan(dayKey)} disabled={Boolean(previewAlternative)}>
                               重规划当日
                             </Button>
                           </div>

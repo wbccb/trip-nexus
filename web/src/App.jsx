@@ -121,10 +121,14 @@ export default function App() {
     uploadingKnowledge,
   } = useKnowledge()
   const {
+    conflictReport,
     handleFlowSubmit,
     handleFlowReplanDay,
     loadingTrip,
     persistFlowTripResult,
+    selectedAlternative,
+    setConflictReport,
+    setSelectedAlternative,
     tripDays,
     tripResult,
     updateTripResult,
@@ -499,10 +503,20 @@ export default function App() {
                   label: "行程详情",
                   children: (
                     <TripTab
+                      conflictReport={conflictReport}
                       loadingTrip={loadingTrip}
+                      selectedAlternative={selectedAlternative}
                       tripDays={tripDays}
                       tripResult={tripResult}
                       selectedPoiId={selectedPoiId}
+                      onApplyAlternative={async (nextTrip) => {
+                        updateTripResult(nextTrip)
+                        setConflictReport({ has_conflicts: false, conflicts: [], alternatives: [] })
+                        setSelectedAlternative(null)
+                        await persistFlowTripResult(nextTrip)
+                      }}
+                      onConflictReportChange={setConflictReport}
+                      onSelectAlternative={setSelectedAlternative}
                       onSelectPoi={handleSelectPoi}
                       onTripChange={async (nextTrip) => {
                         updateTripResult(nextTrip)

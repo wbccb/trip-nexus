@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from typing import Dict, List, Optional, Any, Iterable
 
 from langchain_ollama import OllamaLLM
+import copy
 import json
 import re
 from string import Formatter
@@ -16,6 +17,7 @@ from src.llm.tools.weather_tool import get_daily_weather
 from src.llm.tools.geo_tool import geocode_address
 from src.llm.tools.poi_tool import search_poi
 from src.llm.streaming_adapter import LlmStreamingAdapter
+from src.models.conflicts import AlternativePlan, ConflictItem, ConflictReport, ConflictType
 from src.observability import (
     ErrorCodes,
     normalize_exception,
@@ -1098,6 +1100,271 @@ class LlmManager:
             f"- 体能强度：{intensity}，{INTENSITY_MAP[intensity]}\n"
             f"- 节奏偏好：{pace}，{PACE_MAP[pace]}\n"
             f"- 特殊约束：{special_text}"
+        )
+
+    def _normalize_conflict_constraints(self, constraints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        raw = constraints or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        special = raw.get("special_constraints") or {}
+        if not isinstance(special, dict):
+            special = {}
+        return {
+            "budget_level": str(raw.get("budget_level") or "balanced").strip().lower(),
+            "intensity": str(raw.get("intensity") or "standard").strip().lower(),
+            "pace": str(raw.get("pace") or "cultural").strip().lower(),
+            "special_constraints": {
+                "walking_limit_km": special.get("walking_limit_km"),
+                "need_nap": bool(special.get("need_nap")),
+                "accessibility": bool(special.get("accessibility")),
+            },
+        }
+
+    def _normalize_daily_plan_items(self, trip_data: Optional[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        if not isinstance(trip_data, dict):
+            return {}
+        daily_plan = trip_data.get("daily_plan")
+        if isinstance(daily_plan, dict):
+            return {str(day): [item for item in items if isinstance(item, dict)] for day, items in daily_plan.items() if isinstance(items, list)}
+        if isinstance(daily_plan, list):
+            return {"1": [item for item in daily_plan if isinstance(item, dict)]}
+        return {}
+
+    def _parse_time_range_minutes(self, time_text: Any) -> Optional[tuple[int, int]]:
+        match = re.match(r"^\s*(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})\s*$", str(time_text or ""))
+        if not match:
+            return None
+        start_minutes = int(match.group(1)) * 60 + int(match.group(2))
+        end_minutes = int(match.group(3)) * 60 + int(match.group(4))
+        return (start_minutes, end_minutes) if end_minutes > start_minutes else None
+
+    def _extract_city_token(self, item: Dict[str, Any], fallback_city: str) -> str:
+        city = str(item.get("city") or "").strip()
+        if city:
+            return city
+        address = str(item.get("address") or "").strip()
+        city_match = re.search(r"([^，,\s]+(?:市|州|地区|盟))", address)
+        if city_match:
+            return city_match.group(1)
+        return fallback_city
+
+    def _parse_transport_minutes(self, text: Any) -> int:
+        value = str(text or "")
+        total_minutes = 0
+        hour_match = re.search(r"(\d+(?:\.\d+)?)\s*小时", value)
+        if hour_match:
+            total_minutes += int(float(hour_match.group(1)) * 60)
+        minute_match = re.search(r"(\d+)\s*分钟", value)
+        if minute_match:
+            total_minutes += int(minute_match.group(1))
+        if total_minutes == 0:
+            compact_match = re.search(r"(\d+(?:\.\d+)?)h", value, flags=re.IGNORECASE)
+            if compact_match:
+                total_minutes += int(float(compact_match.group(1)) * 60)
+        return total_minutes
+
+    def _is_major_poi(self, item: Dict[str, Any]) -> bool:
+        attraction = str(item.get("attraction") or "")
+        exclude_keywords = ["午餐", "晚餐", "早餐", "午休", "休息", "返程", "入住", "酒店", "出发"]
+        return attraction.strip() != "" and not any(keyword in attraction for keyword in exclude_keywords)
+
+    def _is_rest_related_item(self, item: Dict[str, Any]) -> bool:
+        merged_text = " ".join([
+            str(item.get("attraction") or ""),
+            str(item.get("transport") or ""),
+            str(item.get("duration") or ""),
+            str(item.get("recommend_reason") or ""),
+            str(item.get("note") or ""),
+        ])
+        return any(keyword in merged_text for keyword in ["午休", "休息", "午睡", "酒店", "回酒店", "用餐", "午餐"])
+
+    def _copy_trip_data(self, trip_data: Dict[str, Any]) -> Dict[str, Any]:
+        return copy.deepcopy(trip_data if isinstance(trip_data, dict) else {})
+
+    def _detect_conflicts(self, trip_data: Dict[str, Any], constraints: Optional[Dict[str, Any]] = None) -> ConflictReport:
+        try:
+            normalized_constraints = self._normalize_conflict_constraints(constraints)
+            daily_plan = self._normalize_daily_plan_items(trip_data)
+            if not daily_plan:
+                return ConflictReport(has_conflicts=False)
+
+            conflicts: List[ConflictItem] = []
+            fallback_city = str((trip_data or {}).get("destination") or "").strip()
+            intensity_limit_map = {"leisure": 3, "standard": 5}
+            intensity = normalized_constraints.get("intensity", "standard")
+            special = normalized_constraints.get("special_constraints") or {}
+
+            for day_key, items in daily_plan.items():
+                day = int(day_key) if str(day_key).isdigit() else 0
+                if day <= 0:
+                    continue
+
+                # 核心逻辑：用城市标签 + 交通时长做轻量规则检测，优先拦截“同日跨城/超长交通”这类明显不可执行的方案。
+                city_tokens = {
+                    self._extract_city_token(item, fallback_city)
+                    for item in items
+                    if self._extract_city_token(item, fallback_city)
+                }
+                if len(city_tokens) >= 2:
+                    conflicts.append(
+                        ConflictItem(
+                            type=ConflictType.DISTANCE_TIME,
+                            day=day,
+                            description=f"第{day}天存在跨城安排：{ '、'.join(sorted(city_tokens)) }，同日串联执行风险较高。",
+                            severity="error",
+                        )
+                    )
+                for item in items:
+                    transport_minutes = self._parse_transport_minutes(item.get("transport"))
+                    if transport_minutes > 120:
+                        conflicts.append(
+                            ConflictItem(
+                                type=ConflictType.DISTANCE_TIME,
+                                day=day,
+                                description=f"第{day}天存在单段超过 {transport_minutes} 分钟的交通，连续游玩体验可能明显下降。",
+                                severity="error" if transport_minutes >= 150 else "warning",
+                            )
+                        )
+                        break
+
+                major_poi_count = sum(1 for item in items if self._is_major_poi(item))
+                intensity_limit = intensity_limit_map.get(intensity)
+                if intensity_limit is not None and major_poi_count > intensity_limit:
+                    conflicts.append(
+                        ConflictItem(
+                            type=ConflictType.PACE_DENSITY,
+                            day=day,
+                            description=f"第{day}天主要景点约 {major_poi_count} 个，已超过当前强度建议上限 {intensity_limit} 个。",
+                            severity="error" if major_poi_count >= intensity_limit + 2 else "warning",
+                        )
+                    )
+
+                lunch_window_hit = False
+                nap_window_hit = False
+                for item in items:
+                    minutes_range = self._parse_time_range_minutes(item.get("time"))
+                    if not minutes_range:
+                        continue
+                    start_minutes, end_minutes = minutes_range
+                    if end_minutes > 11 * 60 + 30 and start_minutes < 13 * 60 + 30 and self._is_rest_related_item(item):
+                        lunch_window_hit = True
+                    if end_minutes > 12 * 60 and start_minutes < 14 * 60 and self._is_rest_related_item(item):
+                        nap_window_hit = True
+                if not lunch_window_hit:
+                    conflicts.append(
+                        ConflictItem(
+                            type=ConflictType.REST_WINDOW,
+                            day=day,
+                            description=f"第{day}天在 11:30-13:30 区间未识别到明确的用餐或休息安排。",
+                            severity="warning",
+                        )
+                    )
+                if bool(special.get("need_nap")) and not nap_window_hit:
+                    conflicts.append(
+                        ConflictItem(
+                            type=ConflictType.REST_WINDOW,
+                            day=day,
+                            description=f"第{day}天未满足 12:00-14:00 的午休需求，建议补充休息窗口。",
+                            severity="error",
+                        )
+                    )
+
+            # 同类同天冲突只保留一条最明确描述，避免前端警告区域被重复信息淹没。
+            deduped: Dict[tuple[str, int, str], ConflictItem] = {}
+            for item in conflicts:
+                key = (item.type.value, item.day, item.description)
+                deduped[key] = item
+            deduped_conflicts = list(deduped.values())
+            return ConflictReport(has_conflicts=bool(deduped_conflicts), conflicts=deduped_conflicts, alternatives=[])
+        except Exception as exc:
+            print(f"[{_ts()}][LlmManager] 冲突检测降级，原因={exc}")
+            return ConflictReport(has_conflicts=False)
+
+    def _generate_alternatives(
+        self,
+        trip_data: Dict[str, Any],
+        conflicts: List[ConflictItem],
+        constraints: Optional[Dict[str, Any]] = None,
+    ) -> List[AlternativePlan]:
+        if not conflicts:
+            return []
+        try:
+            normalized_constraints = self._normalize_conflict_constraints(constraints)
+            prompt = f"""
+你是旅行方案修正助手。请基于当前行程与冲突描述，输出两个替代方案：
+1. Plan A：更保守、更可执行，优先消除冲突。
+2. Plan B：尽量保留原偏好，但允许保留少量风险。
+
+请严格输出 JSON：
+{{
+  "alternatives": [
+    {{
+      "label": "Plan A",
+      "strategy": "一句话说明策略",
+      "trip_data": {json.dumps(trip_data, ensure_ascii=False)}
+    }},
+    {{
+      "label": "Plan B",
+      "strategy": "一句话说明策略",
+      "trip_data": {json.dumps(trip_data, ensure_ascii=False)}
+    }}
+  ]
+}}
+
+当前行程：
+{json.dumps(trip_data, ensure_ascii=False)}
+
+当前约束：
+{json.dumps(normalized_constraints, ensure_ascii=False)}
+
+冲突列表：
+{json.dumps([item.model_dump() for item in conflicts], ensure_ascii=False)}
+
+要求：
+- trip_data 必须保持现有结构，包含 destination/days/daily_plan。
+- 必须真的调整存在冲突的天，不要只改 strategy 文案。
+- 只输出 JSON，不要输出 Markdown 或解释。
+"""
+            raw_response = self.generation_llm.invoke(prompt)
+            response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
+            cleaned_response = _strip_think_content(response_text)
+            clean_json = self.extract_json_from_string(cleaned_response)
+            parsed = json.loads(clean_json)
+            alternatives_raw = parsed.get("alternatives") if isinstance(parsed, dict) else []
+            alternatives: List[AlternativePlan] = []
+            for index, item in enumerate(alternatives_raw or []):
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("label") or f"Plan {'AB'[index] if index < 2 else index + 1}").strip()
+                strategy = str(item.get("strategy") or "").strip()
+                alternative_trip = item.get("trip_data") or {}
+                if not isinstance(alternative_trip, dict) or not alternative_trip.get("daily_plan"):
+                    continue
+                alternatives.append(
+                    AlternativePlan(
+                        label=label,
+                        strategy=strategy or "已调整冲突较高的行程段落",
+                        trip_data=self._copy_trip_data(alternative_trip),
+                    )
+                )
+            return alternatives[:2]
+        except Exception as exc:
+            print(f"[{_ts()}][LlmManager] 替代方案生成降级，原因={exc}")
+            return []
+
+    def build_conflict_report(self, trip_data: Dict[str, Any], constraints: Optional[Dict[str, Any]] = None) -> ConflictReport:
+        conflict_report = self._detect_conflicts(trip_data, constraints)
+        if not conflict_report.has_conflicts:
+            self._metrics.record("conflict_detected", {"detected": False})
+            self._metrics.record("plan_alternative_generated", {"generated": False})
+            return conflict_report
+        alternatives = self._generate_alternatives(trip_data, conflict_report.conflicts, constraints)
+        self._metrics.record("conflict_detected", {"detected": True, "count": len(conflict_report.conflicts)})
+        self._metrics.record("plan_alternative_generated", {"generated": bool(alternatives), "count": len(alternatives)})
+        return ConflictReport(
+            has_conflicts=True,
+            conflicts=conflict_report.conflicts,
+            alternatives=alternatives,
         )
 
     def _build_constraints_context(self, user_input: Dict[str, Any]) -> str:

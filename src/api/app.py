@@ -35,6 +35,7 @@ from src.rag.network.crawler import ContentCrawler
 from src.rag.network.url_preprocessor import infer_source_platform, preprocess_url
 from src.rag.store.vector_store import VectorStore
 from src.agent import run_agent_loop_sync
+from src.models.conflicts import ConflictReport
 
 logger = logging.getLogger(__name__)
 
@@ -2300,6 +2301,7 @@ async def _run_flow_stream(
     response_text = ""
     source_evidence: List[Dict[str, Any]] = []
     constraints_satisfied: List[Dict[str, Any]] = []
+    conflict_report = ConflictReport().model_dump()
     allow_public_fusion = str(payload.knowledge_scope or "private_plus_public").strip().lower() != "private_only"
     logger.info(
         "flow_start message_id=%s session_id=%s knowledge_scope=%s allow_public_fusion=%s knowledge_base_id=%s",
@@ -2558,9 +2560,37 @@ async def _run_flow_stream(
         if trip_data:
             if isinstance(trip_data, dict):
                 constraints_satisfied = _build_constraint_statuses(trip_data, constraints_used)
+                generated_conflict_report = llm_manager.build_conflict_report(trip_data, constraints_used)
+                conflict_report = generated_conflict_report.model_dump()
+                metrics["conflict_detected"] = bool(conflict_report.get("has_conflicts"))
+                metrics["plan_alternative_generated"] = bool(conflict_report.get("alternatives"))
+                if conflict_report.get("has_conflicts"):
+                    last_sequence += 1
+                    await _append_flow_event(
+                        message_id,
+                        {
+                            "event": "delta",
+                            "sequence": last_sequence,
+                            "message_id": message_id,
+                            "session_id": session_id,
+                            "step": "warning",
+                            "status": "running",
+                            "mode": flow_mode,
+                            "content_delta": f"检测到 {len(conflict_report.get('conflicts') or [])} 处行程冲突，请查看替代方案建议。",
+                            "is_final": False,
+                            "payload": {
+                                "message": "检测到行程冲突，请查看替代方案建议。",
+                                "conflict_report": conflict_report,
+                            },
+                        },
+                    )
                 trip_data["constraints_used"] = constraints_used
                 trip_data["constraints_satisfied"] = constraints_satisfied
+                trip_data["conflict_report"] = conflict_report
             _get_storage().store_trip_data(session_id, trip_data)
+        else:
+            metrics["conflict_detected"] = False
+            metrics["plan_alternative_generated"] = False
         metrics["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
         _record_flow_metrics(
             {
@@ -2611,6 +2641,7 @@ async def _run_flow_stream(
                     "metrics": metrics,
                     "constraints_used": constraints_used,
                     "constraints_satisfied": constraints_satisfied,
+                    "conflict_report": conflict_report,
                     "source_evidence": source_evidence,
                     "knowledge_debug": {
                         "knowledge_scope": str(payload.knowledge_scope or "private_plus_public"),
@@ -3144,12 +3175,15 @@ def render_map_geojson(payload: MapGeoJsonRequest) -> MapGeoJsonResponse:
 def update_trip(payload: TripUpdateRequest) -> TripUpdateResponse:
     session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
     storage = _get_storage()
+    llm_manager = _get_llm_manager()
     next_trip = dict(payload.trip_data or {})
     raw_constraints = payload.constraints or next_trip.get("constraints_used") or {}
     normalized_constraints = _normalize_trip_constraints(raw_constraints)
     constraint_statuses = _build_constraint_statuses(next_trip, normalized_constraints)
+    conflict_report = llm_manager.build_conflict_report(next_trip, normalized_constraints).model_dump()
     next_trip["constraints_used"] = normalized_constraints
     next_trip["constraints_satisfied"] = constraint_statuses
+    next_trip["conflict_report"] = conflict_report
     storage.store_trip_data(session_id, next_trip)
     return TripUpdateResponse(session_id=session_id, trip_data=next_trip)
 
@@ -3190,6 +3224,7 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
     merged_trip["daily_plan"] = current_daily_plan
     merged_trip["constraints_used"] = normalized_constraints
     merged_trip["constraints_satisfied"] = _build_constraint_statuses(merged_trip, normalized_constraints)
+    merged_trip["conflict_report"] = llm_manager.build_conflict_report(merged_trip, normalized_constraints).model_dump()
     storage.store_trip_data(session_id, merged_trip)
     return TripReplanDayResponse(session_id=session_id, trip_data=merged_trip)
 

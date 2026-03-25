@@ -12,6 +12,14 @@ import {
 } from "../constants/appConfig.js";
 import { normalizeTripDays } from "../utils/tripUtils.js";
 
+function createEmptyConflictReport() {
+  return {
+    has_conflicts: false,
+    conflicts: [],
+    alternatives: [],
+  };
+}
+
 function normalizeFlowConstraints(values) {
   const budgetLevel = ["economy", "balanced", "comfortable"].includes(values?.budget_level)
     ? values.budget_level
@@ -59,10 +67,14 @@ export function useTrip({
   setActiveSessionId,
 }) {
   const [tripResult, setTripResult] = useState(null);
+  const [conflictReport, setConflictReport] = useState(createEmptyConflictReport());
+  const [selectedAlternative, setSelectedAlternative] = useState(null);
   const [loadingTrip, setLoadingTrip] = useState(false);
   const tripDays = useMemo(() => normalizeTripDays(tripResult), [tripResult]);
   const updateTripResult = useCallback((data) => {
     setTripResult(data || null);
+    setConflictReport(data?.conflict_report || createEmptyConflictReport());
+    setSelectedAlternative(null);
   }, []);
   const buildDefaultKnowledgeQuery = useCallback((values) => {
     const destination = String(values?.destination || "").trim();
@@ -118,6 +130,8 @@ export function useTrip({
       }
       if (data?.trip_data) {
         setTripResult(data.trip_data);
+        setConflictReport(data.trip_data?.conflict_report || createEmptyConflictReport());
+        setSelectedAlternative(null);
       }
       return data?.trip_data || null;
     },
@@ -130,6 +144,8 @@ export function useTrip({
       try {
         // 标记加载状态
         setLoadingTrip(true);
+        setConflictReport(createEmptyConflictReport());
+        setSelectedAlternative(null);
         // 组装请求参数
         const payload = {
           // 用户 ID
@@ -181,7 +197,14 @@ export function useTrip({
             onStreamStart(event);
           }
           if (eventType === "delta") {
-            accumulatedText += deltaText;
+            if (step === "generate") {
+              accumulatedText += deltaText;
+            }
+            if (step === "warning") {
+              const warningReport = event?.payload?.conflict_report || createEmptyConflictReport();
+              setConflictReport(warningReport);
+              setSelectedAlternative(null);
+            }
             if (onStreamDelta) {
               onStreamDelta(accumulatedText, event);
             }
@@ -190,6 +213,8 @@ export function useTrip({
             streamSessionId = event?.session_id || null;
             const eventPayload = event?.payload || {};
             streamTripData = eventPayload?.trip_data || null;
+            setConflictReport(eventPayload?.conflict_report || streamTripData?.conflict_report || createEmptyConflictReport());
+            setSelectedAlternative(null);
             if (onTripData) {
               onTripData(streamTripData, event);
             }
@@ -235,7 +260,11 @@ export function useTrip({
   );
 
   return {
+    conflictReport,
     handleFlowSubmit,
+    selectedAlternative,
+    setConflictReport,
+    setSelectedAlternative,
     loadingTrip,
     tripDays,
     tripResult,
