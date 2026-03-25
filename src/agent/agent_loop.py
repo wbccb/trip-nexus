@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 import re
+import logging
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -17,6 +18,8 @@ from src.llm.tool_protocol import ToolCallResult
 from src.map.map_renderer import TripMap
 from src.observability import ErrorCodes, build_error_payload, normalize_exception, BudgetManager, ConstraintChecker
 from src.config import Config  # 读取全局配置预算
+
+logger = logging.getLogger(__name__)
 
 
 def _strip_think_content(text: Any) -> str:
@@ -498,6 +501,13 @@ class AgentExecutor:
             # [LOG] 调用大模型生成行程前
             print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 正在执行行程生成任务: {task.id}")
             print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 上下文条目数: {len(context_payload)}")
+            logger.info(
+                "Agent行程生成开始 thread_id=%s task_id=%s context_count=%s user_input_keys=%s",
+                state.thread_id,
+                task.id,
+                len(context_payload),
+                sorted(list((state.user_input or {}).keys())),
+            )
             
             # 调用行程生成
             # generate_trip 内部会构建 prompt 并调用 LLM 生成详细行程 JSON
@@ -505,8 +515,21 @@ class AgentExecutor:
             
             # [LOG] 调用大模型生成行程后
             trip_days = draft.get("days") if isinstance(draft, dict) else "Unknown"
+            daily_plan_keys = []
+            if isinstance(draft, dict):
+                daily_plan = draft.get("daily_plan") or {}
+                if isinstance(daily_plan, dict):
+                    daily_plan_keys = sorted(list(daily_plan.keys()))
             print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 行程生成完成")
             print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 生成行程天数: {trip_days}")
+            logger.info(
+                "Agent行程生成结束 thread_id=%s task_id=%s success=%s trip_days=%s daily_plan_keys=%s",
+                state.thread_id,
+                task.id,
+                bool(isinstance(draft, dict) and draft),
+                trip_days,
+                daily_plan_keys,
+            )
 
             # 写入共享上下文
             output_key = task.output_key or "draft_trip"
@@ -996,6 +1019,14 @@ def run_agent_loop_sync(
     initial_state: Optional[TripState] = None,
     resume: bool = False,
 ) -> TripState:
+    logger.info(
+        "Agent主循环开始 thread_id=%s intent=%s resume=%s context_count=%s user_input_keys=%s",
+        thread_id,
+        user_intent,
+        bool(resume),
+        len(context or []),
+        sorted(list((user_input or {}).keys())),
+    )
     agent_graph = _build_agent_graph(llm_manager)
     config = {"configurable": {"thread_id": thread_id}}
     resume_payload = agent_config.get("human_decision") or {"approved": True}
@@ -1039,4 +1070,15 @@ def run_agent_loop_sync(
         result["stop_reason"] = "human_intervention"
         result.setdefault("final_payload", {})
         result["final_payload"]["interrupt"] = result.get("__interrupt__")
-    return _trip_state_from_graph_state(result if isinstance(result, dict) else {})
+    trip_state = _trip_state_from_graph_state(result if isinstance(result, dict) else {})
+    final_payload = trip_state.final_payload or {}
+    draft_trip = final_payload.get("draft_trip") if isinstance(final_payload, dict) else {}
+    logger.info(
+        "Agent主循环结束 thread_id=%s status=%s stop_reason=%s has_draft_trip=%s final_payload_keys=%s",
+        thread_id,
+        trip_state.status,
+        trip_state.stop_reason,
+        bool(isinstance(draft_trip, dict) and draft_trip),
+        sorted(list(final_payload.keys())) if isinstance(final_payload, dict) else [],
+    )
+    return trip_state

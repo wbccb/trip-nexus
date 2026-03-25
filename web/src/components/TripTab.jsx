@@ -5,6 +5,53 @@ import { CSS } from "@dnd-kit/utilities"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { normalizeTripDays } from "../utils/tripUtils.js"
 
+function getConstraintStatusColor(status) {
+  if (status === "met") {
+    return "green"
+  }
+  if (status === "violated") {
+    return "red"
+  }
+  return "gold"
+}
+
+function buildConstraintSummary(constraintsUsed) {
+  const budgetLabelMap = {
+    economy: "经济",
+    balanced: "均衡",
+    comfortable: "舒适",
+  }
+  const intensityLabelMap = {
+    leisure: "休闲",
+    standard: "标准",
+    extreme: "特种兵",
+  }
+  const paceLabelMap = {
+    cultural: "文化探索",
+    efficient: "打卡效率",
+    family_friendly: "亲子友好",
+  }
+  if (!constraintsUsed || typeof constraintsUsed !== "object") {
+    return ""
+  }
+  const special = constraintsUsed.special_constraints || {}
+  const parts = [
+    `预算：${budgetLabelMap[constraintsUsed.budget_level] || budgetLabelMap.balanced}`,
+    `强度：${intensityLabelMap[constraintsUsed.intensity] || intensityLabelMap.standard}`,
+    `节奏：${paceLabelMap[constraintsUsed.pace] || paceLabelMap.cultural}`,
+  ]
+  if (Number.isFinite(Number(special.walking_limit_km)) && Number(special.walking_limit_km) > 0) {
+    parts.push(`步行上限：${Number(special.walking_limit_km)}km`)
+  }
+  if (special.need_nap) {
+    parts.push("午休：需要")
+  }
+  if (special.accessibility) {
+    parts.push("无障碍：需要")
+  }
+  return parts.join(" | ")
+}
+
 function SortableTripItem({ item, onEdit, onDelete, onCardClick, isSelected, itemRef }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: item.id,
@@ -129,6 +176,11 @@ export default function TripTab({
   }, [tripResult])
   const normalizedDays = useMemo(() => normalizeTripDays(draftTrip), [draftTrip])
   const sortedTripDays = Array.isArray(tripDays) && tripDays.length ? tripDays : normalizedDays
+  const constraintsUsed = draftTrip?.constraints_used || null
+  const constraintSummary = useMemo(() => buildConstraintSummary(constraintsUsed), [constraintsUsed])
+  const constraintStatuses = Array.isArray(draftTrip?.constraints_satisfied)
+    ? draftTrip.constraints_satisfied
+    : []
   const handleUpdateTrip = useCallback(
     (nextTrip) => {
       setDraftTrip(nextTrip)
@@ -294,6 +346,23 @@ export default function TripTab({
               <div className="trip-summary">
                 目的地：{tripResult.destination} · 天数：{tripResult.days}
               </div>
+              {(constraintSummary || constraintStatuses.length > 0) && (
+                <Card size="small" title="约束满足状态">
+                  <Space orientation="vertical" size="small" className="full-width">
+                    {constraintSummary && <div className="trip-summary">{constraintSummary}</div>}
+                    {constraintStatuses.length > 0 && (
+                      <Space size="small" wrap>
+                        {constraintStatuses.map((item, index) => (
+                          <Tag key={`${item?.label || "constraint"}-${index}`} color={getConstraintStatusColor(item?.status)}>
+                            {item?.status === "met" ? "✓" : item?.status === "violated" ? "⚠" : "~"} {item?.label || "约束项"}
+                            {item?.detail ? `：${item.detail}` : ""}
+                          </Tag>
+                        ))}
+                      </Space>
+                    )}
+                  </Space>
+                </Card>
+              )}
               <Divider />
               <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
                 <div className="trip-day-list">

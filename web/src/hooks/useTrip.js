@@ -12,6 +12,44 @@ import {
 } from "../constants/appConfig.js";
 import { normalizeTripDays } from "../utils/tripUtils.js";
 
+function normalizeFlowConstraints(values) {
+  const budgetLevel = ["economy", "balanced", "comfortable"].includes(values?.budget_level)
+    ? values.budget_level
+    : "balanced";
+  const intensity = ["leisure", "standard", "extreme"].includes(values?.intensity)
+    ? values.intensity
+    : "standard";
+  const pace = ["cultural", "efficient", "family_friendly"].includes(values?.pace)
+    ? values.pace
+    : "cultural";
+  const walkingLimitRaw = values?.walking_limit_km;
+  const walkingLimit = Number.isFinite(Number(walkingLimitRaw))
+    ? Number(walkingLimitRaw)
+    : null;
+  return {
+    budget_level: budgetLevel,
+    intensity,
+    pace,
+    special_constraints: {
+      walking_limit_km: walkingLimit && walkingLimit > 0 ? walkingLimit : null,
+      need_nap: Boolean(values?.need_nap),
+      accessibility: Boolean(values?.accessibility),
+    },
+  };
+}
+
+function resolveTripConstraints(source) {
+  const constraints = source?.constraints_used || source?.constraints || source || {};
+  return normalizeFlowConstraints({
+    budget_level: constraints?.budget_level,
+    intensity: constraints?.intensity,
+    pace: constraints?.pace,
+    walking_limit_km: constraints?.special_constraints?.walking_limit_km,
+    need_nap: constraints?.special_constraints?.need_nap,
+    accessibility: constraints?.special_constraints?.accessibility,
+  });
+}
+
 export function useTrip({
   activeSessionId,
   knowledgeGenerateQuery,
@@ -49,6 +87,7 @@ export function useTrip({
         device_id: DEFAULT_DEVICE_ID,
         session_id: sessionOverride || activeSessionId,
         trip_data: nextTrip,
+        constraints: resolveTripConstraints(nextTrip),
       };
       const data = await updateFlowTripData(payload);
       if (data?.session_id && data.session_id !== activeSessionId) {
@@ -70,6 +109,7 @@ export function useTrip({
         device_id: DEFAULT_DEVICE_ID,
         session_id: activeSessionId,
         day,
+        constraints: resolveTripConstraints(tripResult),
       };
       const data = await replanFlowDay(payload);
       if (data?.session_id && data.session_id !== activeSessionId) {
@@ -81,7 +121,7 @@ export function useTrip({
       }
       return data?.trip_data || null;
     },
-    [activeSessionId, setActiveSessionId],
+    [activeSessionId, setActiveSessionId, tripResult],
   );
 
   // 主流程提交：发起流式规划并消费统一 SSE 事件
@@ -114,6 +154,7 @@ export function useTrip({
           // 知识库检索查询
           knowledge_query: knowledgeGenerateQuery || buildDefaultKnowledgeQuery(values),
           knowledge_scope: knowledgeScope || "private_plus_public",
+          ...normalizeFlowConstraints(values),
         };
         // 解构流式回调
         const {

@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Any, Iterable
 from langchain_ollama import OllamaLLM
 import json
 import re
+from string import Formatter
 from datetime import datetime
 from geopy.geocoders import Nominatim
 from src.rag.network.multi_source_search import MultiSourceSearcher
@@ -70,6 +71,50 @@ def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
     preview = _format_log_text(cleaned_text)
     print(f"[{_ts()}][LlmManager] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
+
+
+def _collect_template_fields(template: str) -> List[str]:
+    fields: List[str] = []
+    for _, field_name, _, _ in Formatter().parse(template):
+        if field_name:
+            fields.append(field_name)
+    return fields
+
+
+def _validate_template_fields(template: str, allowed_fields: List[str], template_name: str) -> None:
+    allowed = set(allowed_fields)
+    actual = set(_collect_template_fields(template))
+    unexpected = sorted([field for field in actual if field not in allowed])
+    missing = sorted([field for field in allowed if field not in actual])
+    if unexpected:
+        raise ValueError(f"{template_name} 存在未转义或未声明的占位符: {unexpected}")
+    if missing:
+        print(f"[{_ts()}][LlmManager] 模板校验提示 {template_name} 缺少占位符: {missing}")
+
+
+BUDGET_LEVEL_MAP = {
+    "economy": "经济模式（优先公共交通与平价餐饮，控制整体花费，避免不必要的高消费安排）",
+    "balanced": "均衡模式（交通、餐饮与景点体验保持平衡，可在体验与成本之间灵活取舍）",
+    "comfortable": "舒适模式（可接受更舒适的交通与更有特色的餐饮，不必过度压缩预算）",
+}
+
+INTENSITY_MAP = {
+    "leisure": "休闲模式（单日不超过 3 个主要景点，控制步行强度，预留更多休息时间）",
+    "standard": "标准模式（单日 4-5 个景点，节奏适中，兼顾体验丰富度与体力负担）",
+    "extreme": "特种兵模式（允许高强度、早出晚归与高覆盖率，优先提升打卡数量）",
+}
+
+PACE_MAP = {
+    "cultural": "文化探索（优先博物馆、历史街区、文化体验类内容，并为重点景点预留更多停留时间）",
+    "efficient": "打卡效率（热门景点尽量高效串联，以更紧凑的路线提升覆盖数量）",
+    "family_friendly": "亲子友好（避免过早出发，优先儿童友好景点，安排更平缓的节奏与午间休息）",
+}
+
+OPENAI_CHAT_TEMPLATE_KWARGS = {
+    "chat_template_kwargs": {
+        "enable_thinking": False,
+    }
+}
 
 
 class LlmManager:
@@ -137,6 +182,7 @@ class LlmManager:
                 api_key=api_key,  # API Key
                 base_url=base_url,  # 远端 Base URL（/v1）
                 temperature=temperature,  # 温度参数
+                extra_body=OPENAI_CHAT_TEMPLATE_KWARGS,  # 统一关闭深度思考，优先响应速度
             )
 
         print(f"[{_ts()}][LlmManager] 初始化 Ollama 模型: {model_name} @ {base_url}")  # 记录 Ollama 初始化日志
@@ -146,6 +192,7 @@ class LlmManager:
             temperature=temperature,  # 温度参数
             num_ctx=4096,  # 上下文长度
             timeout=300,  # 请求超时
+            reasoning=False,  # 等价关闭 thinking/reasoning 模式，避免输出思考内容
         )
 
     def update_llm_config(self, config: Dict[str, Any]) -> None:
@@ -904,7 +951,7 @@ class LlmManager:
                         "tags": ["博物馆", "人文"],
                         "recommend_reason": "馆藏丰富，适合深入了解城市历史。",
                         "sources": [
-                            {"title": "景点评价来源", "url": "https://example.com/poi-a"}
+                            {{"title": "景点评价来源", "url": "https://example.com/poi-a"}}
                         ]
                     }},
                     {{
@@ -921,7 +968,7 @@ class LlmManager:
                         "tags": ["美食", "本地餐厅"],
                         "recommend_reason": "距离近，适合补充体力。",
                         "sources": [
-                            {"title": "餐厅信息", "url": "https://example.com/poi-b"}
+                            {{"title": "餐厅信息", "url": "https://example.com/poi-b"}}
                         ]
                     }}
                 ]
@@ -933,6 +980,7 @@ class LlmManager:
         - 总天数：{days}天
         - 预算：{budget}元/人（请合理分配交通、餐饮开支）
         - 偏好：{preference}
+        {constraints_section}
         - 额外要求：{edit_note}
 
         【参考攻略（优先采纳）】
@@ -950,9 +998,22 @@ class LlmManager:
         【Schema 定义】
         {format_instructions}
         """
+        allowed_template_fields = [
+            "json_example_correct",
+            "json_example_wrong",
+            "destination",
+            "days",
+            "budget",
+            "preference",
+            "constraints_section",
+            "edit_note",
+            "context",
+            "format_instructions",
+        ]
+        _validate_template_fields(template, allowed_template_fields, "build_prompt")
         prompt = PromptTemplate(
             template=template.strip(),
-            input_variables=["destination", "days", "budget", "preference", "context", "edit_note"],
+            input_variables=["destination", "days", "budget", "preference", "context", "edit_note", "constraints_section"],
             partial_variables={
                 "format_instructions": self.parser.get_format_instructions(),
                 "json_example_correct": '[{"a":1}, {"b":2}]',
@@ -995,6 +1056,7 @@ class LlmManager:
         # print(f"[{_ts()}][LlmManager] format.preference={preference_str}")
         # print(f"[{_ts()}][LlmManager] format.context={context_text}")
         # print(f"[{_ts()}][LlmManager] format.edit_note={edit_note}")
+        constraints_section = self._build_constraint_prompt_section(user_input)
         # 执行提示词格式化，若字段缺失会在此处抛出异常，前面的日志可辅助定位
         res = prompt.format(
             destination=user_input["destination"],
@@ -1002,11 +1064,41 @@ class LlmManager:
             budget=user_input["budget"],
             preference=preference_str,
             context=context_text,
-            edit_note=edit_note
+            edit_note=edit_note,
+            constraints_section=constraints_section,
         )
         # print(f"[{_ts()}][LlmManager] 返回构建完成的提示词文本={res}")
         # 返回构建完成的提示词文本
         return res
+
+    def _build_constraint_prompt_section(self, user_input: Dict[str, Any]) -> str:
+        budget_level = str(user_input.get("budget_level") or "balanced").strip().lower()
+        if budget_level not in BUDGET_LEVEL_MAP:
+            budget_level = "balanced"
+        intensity = str(user_input.get("intensity") or "standard").strip().lower()
+        if intensity not in INTENSITY_MAP:
+            intensity = "standard"
+        pace = str(user_input.get("pace") or "cultural").strip().lower()
+        if pace not in PACE_MAP:
+            pace = "cultural"
+        special = user_input.get("special_constraints") or {}
+        if not isinstance(special, dict):
+            special = {}
+        special_parts: List[str] = []
+        walking_limit_km = special.get("walking_limit_km")
+        if walking_limit_km not in [None, ""]:
+            special_parts.append(f"步行上限 {walking_limit_km}km/天")
+        if bool(special.get("need_nap")):
+            special_parts.append("需要午休，请在 12:00-14:00 预留休息或用餐缓冲")
+        if bool(special.get("accessibility")):
+            special_parts.append("优先考虑无障碍通道与无障碍友好的场所")
+        special_text = "、".join(special_parts) if special_parts else "无特殊约束"
+        return (
+            f"- 预算档位：{budget_level}，{BUDGET_LEVEL_MAP[budget_level]}\n"
+            f"- 体能强度：{intensity}，{INTENSITY_MAP[intensity]}\n"
+            f"- 节奏偏好：{pace}，{PACE_MAP[pace]}\n"
+            f"- 特殊约束：{special_text}"
+        )
 
     def _build_constraints_context(self, user_input: Dict[str, Any]) -> str:
         destination = user_input.get("destination")
@@ -1183,7 +1275,13 @@ class LlmManager:
         )
         return intent_data
 
-    def change_trip(self, query: str, context: List[Dict[str, str]] = None, current_trip: Dict = None) -> Dict[str, Any]:
+    def change_trip(
+        self,
+        query: str,
+        context: List[Dict[str, str]] = None,
+        current_trip: Dict = None,
+        constraints: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         根据用户查询调整行程，支持多轮对话上下文（不仅仅是调整行程，还支持初始化生成行程）
         """
@@ -1205,7 +1303,7 @@ class LlmManager:
             return self._handle_trip_generation(intent_data, context)
         elif intent_data["intent"] in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
             if current_trip:
-                return self._handle_trip_modification(intent_data, current_trip, context)
+                return self._handle_trip_modification(intent_data, current_trip, context, constraints=constraints)
             else:
                 return {
                     "response": "我需要先为您生成一个基础行程，然后才能进行调整。请先提供目的地、天数和预算信息。",
@@ -1429,10 +1527,15 @@ class LlmManager:
                 "trip_data": None
             }
 
-    def _handle_trip_modification(self, intent_data: Dict[str, Any], current_trip: Dict,
-                                  context: List[Dict[str, str]]) -> Dict[str, Any]:
+    def _handle_trip_modification(
+        self,
+        intent_data: Dict[str, Any],
+        current_trip: Dict,
+        context: List[Dict[str, str]],
+        constraints: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         print(f"[{_ts()}][LlmManager] 处理行程修改请求，intent={intent_data.get('intent')}, params_keys={list((intent_data.get('parameters') or {}).keys())}")
-        prepared = self.prepare_trip_request_from_modification(intent_data, current_trip, context)
+        prepared = self.prepare_trip_request_from_modification(intent_data, current_trip, context, constraints=constraints)
         user_input = prepared.get("user_input") or {}
         context_texts = prepared.get("context_texts") or []
         edit_cmd = prepared.get("edit_cmd")
@@ -1467,6 +1570,7 @@ class LlmManager:
         intent_data: Dict[str, Any],
         current_trip: Dict[str, Any],
         context: List[Dict[str, str]],
+        constraints: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         params = intent_data.get("parameters", {})
         intent_type = intent_data.get("intent")
@@ -1501,11 +1605,16 @@ class LlmManager:
                 },
             }
         updates = edit_cmd.get("updates", {}) if edit_cmd else {}
+        merged_constraints = constraints or current_trip.get("constraints_used") or {}
         user_input = {
             "destination": updates.get("destination") or current_trip.get("destination", "成都"),
             "days": updates.get("days") or current_trip.get("days", 3),
             "budget": updates.get("budget") or current_trip.get("budget", 5000),
             "preference": updates.get("preference") or current_trip.get("preference", ["美食", "历史"]),
+            "budget_level": merged_constraints.get("budget_level", "balanced"),
+            "intensity": merged_constraints.get("intensity", "standard"),
+            "pace": merged_constraints.get("pace", "cultural"),
+            "special_constraints": merged_constraints.get("special_constraints") or {},
             "guide_links": [],
         }
         context_texts = [msg["content"] for msg in context[-3:]] if context else []

@@ -54,3 +54,5 @@ trip_test.*
 agent_events.*
 
 护城河分析
+
+*.db

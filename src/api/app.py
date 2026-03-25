@@ -72,11 +72,34 @@ class FlowRequestBase(BaseModel):
     knowledge_base_id: Optional[str] = Field(None, description="知识库ID（可选）")
     knowledge_query: Optional[str] = Field(None, description="知识库检索查询（可选）")
     knowledge_scope: Optional[str] = Field("private_plus_public", description="知识范围 private_only/private_plus_public")
+    budget_level: Optional[str] = Field("balanced", description="预算档位 economy/balanced/comfortable")
+    intensity: Optional[str] = Field("standard", description="体能强度 leisure/standard/extreme")
+    pace: Optional[str] = Field("cultural", description="节奏偏好 cultural/efficient/family_friendly")
+    special_constraints: Optional[Dict[str, Any]] = Field(None, description="特殊约束配置")
 
 
 class FlowStreamRequest(FlowRequestBase):
     """主流程流式请求体，扩展执行模式字段。"""
     mode: Optional[str] = Field("fast", description="执行模式：fast/deep")
+
+
+class SpecialConstraints(BaseModel):
+    walking_limit_km: Optional[float] = Field(None, description="单日步行上限（公里）")
+    need_nap: bool = Field(False, description="是否需要午休")
+    accessibility: bool = Field(False, description="是否需要无障碍")
+
+
+class TripConstraints(BaseModel):
+    budget_level: str = Field("balanced", description="economy / balanced / comfortable")
+    intensity: str = Field("standard", description="leisure / standard / extreme")
+    pace: str = Field("cultural", description="cultural / efficient / family_friendly")
+    special_constraints: SpecialConstraints = Field(default_factory=SpecialConstraints, description="特殊约束")
+
+
+class ConstraintStatus(BaseModel):
+    label: str = Field(..., description="约束描述")
+    status: str = Field(..., description="met / partially_met / violated")
+    detail: Optional[str] = Field(None, description="补充说明")
 
 
 class TripDataResponse(BaseModel):
@@ -360,6 +383,7 @@ class TripUpdateRequest(BaseModel):
     device_id: str = Field(..., description="设备唯一ID")
     session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
     trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
+    constraints: Optional[Dict[str, Any]] = Field(None, description="可选约束参数，前端修改行程时显式透传")
 
 
 class TripUpdateResponse(BaseModel):
@@ -372,6 +396,7 @@ class TripReplanDayRequest(BaseModel):
     device_id: str = Field(..., description="设备唯一ID")
     session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
     day: int = Field(..., description="需要重新规划的天数")
+    constraints: Optional[Dict[str, Any]] = Field(None, description="可选约束参数，重排单日时显式透传")
 
 
 class TripReplanDayResponse(BaseModel):
@@ -1452,7 +1477,191 @@ def _build_flow_query_text(payload: FlowStreamRequest) -> str:
     knowledge_query = str(payload.knowledge_query or "").strip()
     if knowledge_query:
         parts.append(f"知识需求 {knowledge_query}")
+    constraints = _normalize_trip_constraints(payload)
+    if constraints.get("budget_level"):
+        parts.append(f"预算档位 {constraints['budget_level']}")
+    if constraints.get("intensity"):
+        parts.append(f"体能强度 {constraints['intensity']}")
+    if constraints.get("pace"):
+        parts.append(f"节奏偏好 {constraints['pace']}")
     return "，".join(parts) or destination
+
+
+def _normalize_trip_constraints(payload_like: Any) -> Dict[str, Any]:
+    if isinstance(payload_like, dict):
+        getter = lambda key, default=None: payload_like.get(key, default)
+    else:
+        getter = lambda key, default=None: getattr(payload_like, key, default)
+    budget_level = str(getter("budget_level", None) or "balanced").strip().lower()
+    if budget_level not in {"economy", "balanced", "comfortable"}:
+        budget_level = "balanced"
+    intensity = str(getter("intensity", None) or "standard").strip().lower()
+    if intensity not in {"leisure", "standard", "extreme"}:
+        intensity = "standard"
+    pace = str(getter("pace", None) or "cultural").strip().lower()
+    if pace not in {"cultural", "efficient", "family_friendly"}:
+        pace = "cultural"
+    special_raw = getter("special_constraints", None) or {}
+    if not isinstance(special_raw, dict):
+        special_raw = {}
+    walking_limit_km = special_raw.get("walking_limit_km")
+    try:
+        walking_limit_value = float(walking_limit_km) if walking_limit_km not in [None, ""] else None
+    except (TypeError, ValueError):
+        walking_limit_value = None
+    if walking_limit_value is not None:
+        walking_limit_value = max(0.5, min(walking_limit_value, 50.0))
+    return TripConstraints(
+        budget_level=budget_level,
+        intensity=intensity,
+        pace=pace,
+        special_constraints=SpecialConstraints(
+            walking_limit_km=walking_limit_value,
+            need_nap=bool(special_raw.get("need_nap", False)),
+            accessibility=bool(special_raw.get("accessibility", False)),
+        ),
+    ).model_dump()
+
+
+def _estimate_day_major_items(day_items: List[Dict[str, Any]]) -> int:
+    exclude_keywords = ["午餐", "晚餐", "早餐", "午休", "休息", "酒店", "返程", "出发", "入住"]
+    major_count = 0
+    for item in day_items or []:
+        attraction = str((item or {}).get("attraction") or "")
+        if any(keyword in attraction for keyword in exclude_keywords):
+            continue
+        major_count += 1
+    return major_count
+
+
+def _parse_time_hour_range(time_text: str) -> Tuple[Optional[int], Optional[int]]:
+    match = re.match(r"^\s*(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})\s*$", str(time_text or ""))
+    if not match:
+        return None, None
+    return int(match.group(1)), int(match.group(3))
+
+
+def _build_constraint_statuses(trip_data: Optional[Dict[str, Any]], constraints: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(trip_data, dict):
+        return []
+    daily_plan = trip_data.get("daily_plan") or {}
+    if not isinstance(daily_plan, dict):
+        daily_plan = {}
+    statuses: List[ConstraintStatus] = []
+    day_keys = sorted(daily_plan.keys(), key=lambda item: int(str(item)) if str(item).isdigit() else 0)
+    day_major_counts: List[int] = []
+    estimated_walking_km: List[float] = []
+    earliest_start_hours: List[int] = []
+    nap_hit_days = 0
+    accessibility_hit_days = 0
+    public_transport_hits = 0
+    taxi_hits = 0
+    cultural_hits = 0
+    family_hits = 0
+    total_transport_segments = 0
+    for day_key in day_keys:
+        raw_items = daily_plan.get(day_key) or []
+        items = raw_items if isinstance(raw_items, list) else []
+        day_major_counts.append(_estimate_day_major_items(items))
+        walking_segments = 0
+        day_has_nap = False
+        day_has_accessibility = False
+        start_hour_candidates: List[int] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            attraction = str(item.get("attraction") or "")
+            tags = [str(tag) for tag in (item.get("tags") or []) if str(tag).strip()]
+            transport = str(item.get("transport") or "")
+            note_text = " ".join([attraction, str(item.get("note") or ""), str(item.get("recommend_reason") or ""), " ".join(tags)])
+            if "步行" in transport:
+                walking_segments += 1
+            if any(keyword in transport for keyword in ["地铁", "公交", "步行", "骑行"]):
+                public_transport_hits += 1
+            if any(keyword in transport for keyword in ["打车", "出租", "专车", "网约车"]):
+                taxi_hits += 1
+            if transport.strip():
+                total_transport_segments += 1
+            start_hour, end_hour = _parse_time_hour_range(str(item.get("time") or ""))
+            if start_hour is not None:
+                start_hour_candidates.append(start_hour)
+            if any(keyword in note_text for keyword in ["午休", "休息", "午睡"]):
+                day_has_nap = True
+            elif attraction and any(keyword in attraction for keyword in ["午餐", "午休", "酒店休息", "回酒店"]):
+                if start_hour is not None and end_hour is not None and start_hour <= 14 and end_hour >= 12:
+                    day_has_nap = True
+            if any(keyword in note_text for keyword in ["无障碍", "accessible", "电梯", "轮椅"]):
+                day_has_accessibility = True
+            if any(keyword in note_text for keyword in ["博物馆", "历史", "古镇", "遗址", "美术馆", "文化", "寺", "展览"]):
+                cultural_hits += 1
+            if any(keyword in note_text for keyword in ["亲子", "乐园", "动物园", "公园", "儿童", "互动"]):
+                family_hits += 1
+        estimated_walking_km.append(round(walking_segments * 1.2, 1))
+        if start_hour_candidates:
+            earliest_start_hours.append(min(start_hour_candidates))
+        if day_has_nap:
+            nap_hit_days += 1
+        if day_has_accessibility:
+            accessibility_hit_days += 1
+
+    budget_level = str(constraints.get("budget_level") or "balanced")
+    intensity = str(constraints.get("intensity") or "standard")
+    pace = str(constraints.get("pace") or "cultural")
+    special = constraints.get("special_constraints") or {}
+
+    if budget_level == "economy":
+        public_ratio = (public_transport_hits / total_transport_segments) if total_transport_segments > 0 else 0
+        budget_status = "met" if public_ratio >= 0.5 and taxi_hits == 0 else ("partially_met" if public_ratio >= 0.35 else "violated")
+        statuses.append(ConstraintStatus(label="已优先控制交通成本", status=budget_status, detail=f"公共/步行交通占比约 {int(public_ratio * 100)}%"))
+    elif budget_level == "comfortable":
+        status = "met" if taxi_hits > 0 else "partially_met"
+        detail = "检测到更舒适的交通安排" if taxi_hits > 0 else "当前行程仍以公共交通为主"
+        statuses.append(ConstraintStatus(label="已提高舒适度安排", status=status, detail=detail))
+
+    if intensity == "leisure":
+        max_major_items = max(day_major_counts or [0])
+        status = "met" if max_major_items <= 3 else ("partially_met" if max_major_items <= 4 else "violated")
+        statuses.append(ConstraintStatus(label="单日景点数量偏休闲", status=status, detail=f"单日最多约 {max_major_items} 个主要景点"))
+    elif intensity == "standard":
+        max_major_items = max(day_major_counts or [0])
+        status = "met" if max_major_items <= 5 else "partially_met"
+        statuses.append(ConstraintStatus(label="单日节奏保持标准强度", status=status, detail=f"单日最多约 {max_major_items} 个主要景点"))
+    elif intensity == "extreme":
+        max_major_items = max(day_major_counts or [0])
+        status = "met" if max_major_items >= 5 else ("partially_met" if max_major_items >= 4 else "violated")
+        statuses.append(ConstraintStatus(label="单日覆盖数量偏高强度", status=status, detail=f"单日最多约 {max_major_items} 个主要景点"))
+
+    if pace == "family_friendly":
+        earliest_start = min(earliest_start_hours or [9])
+        status = "met" if earliest_start >= 9 and nap_hit_days >= max(1, len(day_keys) // 2) else ("partially_met" if earliest_start >= 8 else "violated")
+        statuses.append(ConstraintStatus(label="已尽量采用亲子友好节奏", status=status, detail=f"最早出发时间约 {earliest_start}:00"))
+    elif pace == "efficient":
+        max_major_items = max(day_major_counts or [0])
+        status = "met" if max_major_items >= 5 else ("partially_met" if max_major_items >= 4 else "violated")
+        statuses.append(ConstraintStatus(label="已尽量提高打卡效率", status=status, detail=f"单日最多约 {max_major_items} 个主要景点"))
+    elif pace == "cultural":
+        status = "met" if cultural_hits > 0 else "partially_met"
+        detail = f"文化类内容命中 {cultural_hits} 项" if cultural_hits > 0 else "暂未识别出明显文化类标签"
+        statuses.append(ConstraintStatus(label="已尽量向文化探索倾斜", status=status, detail=detail))
+
+    walking_limit_km = special.get("walking_limit_km")
+    if walking_limit_km is not None:
+        max_estimated_walk = max(estimated_walking_km or [0.0])
+        status = "met" if max_estimated_walk <= float(walking_limit_km) else ("partially_met" if max_estimated_walk <= float(walking_limit_km) + 1.5 else "violated")
+        statuses.append(
+            ConstraintStatus(
+                label="已控制单日步行强度",
+                status=status,
+                detail=f"估算单日步行约 {max_estimated_walk:.1f}km，上限 {float(walking_limit_km):.1f}km",
+            )
+        )
+    if bool(special.get("need_nap")):
+        status = "met" if nap_hit_days >= max(1, len(day_keys) // 2) else ("partially_met" if nap_hit_days > 0 else "violated")
+        statuses.append(ConstraintStatus(label="已安排午休时间段", status=status, detail=f"{nap_hit_days}/{max(1, len(day_keys))} 天识别到午休或休息安排"))
+    if bool(special.get("accessibility")):
+        status = "met" if accessibility_hit_days >= max(1, len(day_keys) // 2) else ("partially_met" if accessibility_hit_days > 0 else "violated")
+        statuses.append(ConstraintStatus(label="已尽量考虑无障碍需求", status=status, detail=f"{accessibility_hit_days}/{max(1, len(day_keys))} 天识别到无障碍提示"))
+    return [item.model_dump() for item in statuses]
 
 
 def _build_flow_context_messages(context_texts: List[str]) -> List[Dict[str, str]]:
@@ -2078,9 +2287,19 @@ async def _run_flow_stream(
         "budget": payload.budget,
         "preference": payload.preference,
     }
+    constraints_used = _normalize_trip_constraints(payload)
+    user_input.update(
+        {
+            "budget_level": constraints_used["budget_level"],
+            "intensity": constraints_used["intensity"],
+            "pace": constraints_used["pace"],
+            "special_constraints": constraints_used["special_constraints"],
+        }
+    )
     merged_context_texts = list(payload.context_texts or [])
     response_text = ""
     source_evidence: List[Dict[str, Any]] = []
+    constraints_satisfied: List[Dict[str, Any]] = []
     allow_public_fusion = str(payload.knowledge_scope or "private_plus_public").strip().lower() != "private_only"
     logger.info(
         "flow_start message_id=%s session_id=%s knowledge_scope=%s allow_public_fusion=%s knowledge_base_id=%s",
@@ -2207,6 +2426,14 @@ async def _run_flow_stream(
                 },
             )
             thread_id = _build_agent_thread_id(payload.user_id, payload.device_id)
+            logger.info(
+                "主流程进入Agent thread_id=%s message_id=%s session_id=%s context_count=%s reasons=%s",
+                thread_id,
+                message_id,
+                session_id,
+                len(merged_context_texts),
+                escalation_reasons,
+            )
             final_state = run_agent_loop_sync(
                 llm_manager=llm_manager,
                 user_input=user_input,
@@ -2216,10 +2443,35 @@ async def _run_flow_stream(
                 context=merged_context_texts,
                 resume=False,
             )
+            logger.info(
+                "主流程Agent返回 thread_id=%s message_id=%s session_id=%s status=%s stop_reason=%s final_payload_keys=%s",
+                thread_id,
+                message_id,
+                session_id,
+                getattr(final_state, "status", ""),
+                getattr(final_state, "stop_reason", None),
+                sorted(list((getattr(final_state, "final_payload", {}) or {}).keys())),
+            )
             if final_state and isinstance(final_state.final_payload, dict):
                 draft_trip = final_state.final_payload.get("draft_trip")
                 if isinstance(draft_trip, dict) and draft_trip:
                     trip_data = draft_trip
+                    logger.info(
+                        "主流程拿到行程草案 thread_id=%s message_id=%s session_id=%s days=%s daily_plan_keys=%s",
+                        thread_id,
+                        message_id,
+                        session_id,
+                        draft_trip.get("days"),
+                        sorted(list((draft_trip.get("daily_plan") or {}).keys())) if isinstance(draft_trip.get("daily_plan"), dict) else [],
+                    )
+                else:
+                    logger.warning(
+                        "主流程未拿到行程草案 thread_id=%s message_id=%s session_id=%s final_payload=%s",
+                        thread_id,
+                        message_id,
+                        session_id,
+                        json.dumps(final_state.final_payload, ensure_ascii=False, default=str),
+                    )
         elif intent == "general_conversation":
             response_chunks: List[str] = []
             stream = llm_manager.stream_chat_response(flow_query, context_messages, current_trip)
@@ -2249,7 +2501,7 @@ async def _run_flow_stream(
             response_text = "".join(response_chunks)
         elif intent in {"modify_trip", "add_attraction", "delete_attraction", "reorder_trip"} and current_trip:
             last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "modify")
-            change_result = llm_manager.change_trip(flow_query, context_messages, current_trip)
+            change_result = llm_manager.change_trip(flow_query, context_messages, current_trip, constraints=constraints_used)
             trip_data = change_result.get("trip_data")
             response_text = str(change_result.get("response") or "")
             if response_text:
@@ -2304,6 +2556,10 @@ async def _run_flow_stream(
             trip_data = llm_manager.parse_trip_from_response_text(response_text)
 
         if trip_data:
+            if isinstance(trip_data, dict):
+                constraints_satisfied = _build_constraint_statuses(trip_data, constraints_used)
+                trip_data["constraints_used"] = constraints_used
+                trip_data["constraints_satisfied"] = constraints_satisfied
             _get_storage().store_trip_data(session_id, trip_data)
         metrics["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
         _record_flow_metrics(
@@ -2329,6 +2585,14 @@ async def _run_flow_stream(
 
         # 统一 finalize 终态事件，输出 trip_data 与关键指标
         last_sequence += 1
+        logger.info(
+            "主流程结束 message_id=%s session_id=%s has_trip_data=%s response_len=%s agent_escalated=%s",
+            message_id,
+            session_id,
+            bool(isinstance(trip_data, dict) and trip_data),
+            len(str(response_text or "")),
+            bool(metrics.get("agent_escalated")),
+        )
         await _append_flow_event(
             message_id,
             {
@@ -2345,6 +2609,8 @@ async def _run_flow_stream(
                     "trip_data": trip_data,
                     "response_text": response_text,
                     "metrics": metrics,
+                    "constraints_used": constraints_used,
+                    "constraints_satisfied": constraints_satisfied,
                     "source_evidence": source_evidence,
                     "knowledge_debug": {
                         "knowledge_scope": str(payload.knowledge_scope or "private_plus_public"),
@@ -2358,6 +2624,7 @@ async def _run_flow_stream(
             },
         )
     except Exception as exc:
+        logger.exception("主流程异常 message_id=%s session_id=%s error=%s", message_id, session_id, str(exc))
         last_sequence += 1
         await _append_flow_event(
             message_id,
@@ -2877,8 +3144,14 @@ def render_map_geojson(payload: MapGeoJsonRequest) -> MapGeoJsonResponse:
 def update_trip(payload: TripUpdateRequest) -> TripUpdateResponse:
     session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
     storage = _get_storage()
-    storage.store_trip_data(session_id, payload.trip_data)
-    return TripUpdateResponse(session_id=session_id, trip_data=payload.trip_data)
+    next_trip = dict(payload.trip_data or {})
+    raw_constraints = payload.constraints or next_trip.get("constraints_used") or {}
+    normalized_constraints = _normalize_trip_constraints(raw_constraints)
+    constraint_statuses = _build_constraint_statuses(next_trip, normalized_constraints)
+    next_trip["constraints_used"] = normalized_constraints
+    next_trip["constraints_satisfied"] = constraint_statuses
+    storage.store_trip_data(session_id, next_trip)
+    return TripUpdateResponse(session_id=session_id, trip_data=next_trip)
 
 
 @app.post("/api/trip/replan_day", response_model=TripReplanDayResponse)
@@ -2890,11 +3163,16 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
         raise HTTPException(status_code=404, detail="当前会话未找到行程数据")
     day_value = int(payload.day)
     llm_manager = _get_llm_manager()
+    normalized_constraints = _normalize_trip_constraints(payload.constraints or current_trip.get("constraints_used") or {})
     user_input = {
         "destination": current_trip.get("destination", "成都"),
         "days": current_trip.get("days", 3),
         "budget": current_trip.get("budget", ""),
         "preference": current_trip.get("preference", ""),
+        "budget_level": normalized_constraints.get("budget_level", "balanced"),
+        "intensity": normalized_constraints.get("intensity", "standard"),
+        "pace": normalized_constraints.get("pace", "cultural"),
+        "special_constraints": normalized_constraints.get("special_constraints") or {},
     }
     edit_cmd = {
         "type": "modify",
@@ -2910,6 +3188,8 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
         current_daily_plan[day_key] = replanned_daily_plan[day_key]
     merged_trip = dict(current_trip)
     merged_trip["daily_plan"] = current_daily_plan
+    merged_trip["constraints_used"] = normalized_constraints
+    merged_trip["constraints_satisfied"] = _build_constraint_statuses(merged_trip, normalized_constraints)
     storage.store_trip_data(session_id, merged_trip)
     return TripReplanDayResponse(session_id=session_id, trip_data=merged_trip)
 
