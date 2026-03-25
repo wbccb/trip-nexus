@@ -2,7 +2,6 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional, Any, Iterable
-import torch  # 仍然保留，以防其他部分使用，但在 __init__ 中不再强制需要
 
 from langchain_ollama import OllamaLLM
 import json

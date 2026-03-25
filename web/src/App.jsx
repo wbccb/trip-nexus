@@ -48,6 +48,7 @@ export default function App() {
     handleIngestKnowledgeUrl,
     handleKnowledgeSearch,
     handleLoadKnowledgeDebugSnapshot,
+    handlePreprocessKnowledgeUrl,
     handleUpdateKnowledgeSource,
     handleUploadKnowledgeDocument,
     ingestingKnowledge,
@@ -58,11 +59,13 @@ export default function App() {
     knowledgeResult,
     knowledgeScope,
     knowledgeSources,
+    knowledgeUrlPreprocessResult,
     lastIngestResult,
     loadingKnowledge,
     loadingKnowledgeBases,
     loadingKnowledgeDebugSnapshot,
     loadingKnowledgeSources,
+    preprocessingKnowledgeUrl,
     refreshKnowledgeSources,
     selectedKnowledgeBaseId,
     setKnowledgeGenerateQuery,
@@ -474,6 +477,8 @@ export default function App() {
                       loadingKnowledgeDebugSnapshot={loadingKnowledgeDebugSnapshot}
                       loadingKnowledgeSources={loadingKnowledgeSources}
                       ingestingKnowledge={ingestingKnowledge}
+                      preprocessingKnowledgeUrl={preprocessingKnowledgeUrl}
+                      knowledgeUrlPreprocessResult={knowledgeUrlPreprocessResult}
                       lastIngestResult={lastIngestResult}
                       loadingKnowledge={loadingKnowledge}
                       loadingKnowledgeBases={loadingKnowledgeBases}
@@ -481,6 +486,7 @@ export default function App() {
                       onDeleteKnowledgeBase={handleDeleteKnowledgeBase}
                       onDeleteKnowledgeSource={handleDeleteKnowledgeSource}
                       onIngestKnowledgeUrl={handleIngestKnowledgeUrl}
+                      onPreprocessKnowledgeUrl={handlePreprocessKnowledgeUrl}
                       onLoadKnowledgeDebugSnapshot={handleLoadKnowledgeDebugSnapshot}
                       onRefreshKnowledgeSources={refreshKnowledgeSources}
                       onUpdateKnowledgeSource={handleUpdateKnowledgeSource}
@@ -531,7 +537,7 @@ export default function App() {
       <Drawer
         title="会话列表"
         placement="left"
-        width={320}
+        size="default"
         open={isSessionDrawerOpen}
         onClose={() => setIsSessionDrawerOpen(false)}
       >

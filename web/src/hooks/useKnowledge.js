@@ -8,6 +8,7 @@ import {
   ingestKnowledgeUrl,
   listKnowledgeBases,
   listKnowledgeSources,
+  preprocessKnowledgeUrl,
   searchKnowledge,
   updateKnowledgeSource,
   uploadKnowledgeDocument,
@@ -42,6 +43,12 @@ export function useKnowledge() {
   const [loadingKnowledgeSources, setLoadingKnowledgeSources] = useState(false);
   const [ingestingKnowledge, setIngestingKnowledge] = useState(false);
   const [lastIngestResult, setLastIngestResult] = useState(null);
+  // preprocess 与真实 ingest 分开维护状态：
+  // 前者用于输入 URL 时的即时预判，后者用于点击“导入社交内容”后的正式导入结果。
+  const [preprocessingKnowledgeUrl, setPreprocessingKnowledgeUrl] =
+    useState(false);
+  const [knowledgeUrlPreprocessResult, setKnowledgeUrlPreprocessResult] =
+    useState(null);
   const [knowledgeDebugSnapshot, setKnowledgeDebugSnapshot] = useState(null);
   const [loadingKnowledgeDebugSnapshot, setLoadingKnowledgeDebugSnapshot] =
     useState(false);
@@ -296,6 +303,27 @@ export function useKnowledge() {
     [refreshKnowledgeBases, refreshKnowledgeSources, selectedKnowledgeBaseId],
   );
 
+  const handlePreprocessKnowledgeUrl = useCallback(async (url) => {
+    const sourceUrl = String(url || "").trim();
+    if (!sourceUrl) {
+      setKnowledgeUrlPreprocessResult(null);
+      return null;
+    }
+    try {
+      setPreprocessingKnowledgeUrl(true);
+      // 这里故意把预处理结果缓存到 hook state，而不是只作为临时返回值使用，
+      // 因为 KnowledgeTab 需要持续读取这些信号来驱动 tag、提示文案和默认模式切换。
+      const result = await preprocessKnowledgeUrl({ url: sourceUrl });
+      setKnowledgeUrlPreprocessResult(result || null);
+      return result || null;
+    } catch (error) {
+      setKnowledgeUrlPreprocessResult(null);
+      return null;
+    } finally {
+      setPreprocessingKnowledgeUrl(false);
+    }
+  }, []);
+
   const handleDeleteKnowledgeSource = useCallback(
     async (sourceId) => {
       const normalizedSourceId = String(sourceId || "").trim();
@@ -367,6 +395,7 @@ export function useKnowledge() {
     handleIngestKnowledgeUrl,
     handleKnowledgeSearch,
     handleLoadKnowledgeDebugSnapshot,
+    handlePreprocessKnowledgeUrl,
     handleUpdateKnowledgeSource,
     handleUploadKnowledgeDocument,
     ingestingKnowledge,
@@ -378,10 +407,12 @@ export function useKnowledge() {
     knowledgeScope,
     knowledgeSources,
     lastIngestResult,
+    knowledgeUrlPreprocessResult,
     loadingKnowledge,
     loadingKnowledgeBases,
     loadingKnowledgeSources,
     loadingKnowledgeDebugSnapshot,
+    preprocessingKnowledgeUrl,
     refreshKnowledgeBases,
     refreshKnowledgeSources,
     selectedKnowledgeBaseId,

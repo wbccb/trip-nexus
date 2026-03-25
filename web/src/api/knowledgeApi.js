@@ -78,6 +78,12 @@ export async function ingestKnowledgeUrl(knowledgeBaseId, payload) {
   );
 }
 
+export async function preprocessKnowledgeUrl(payload) {
+  // 预处理接口不入库，只返回“这条链接值不值得走自动解析”的前置信号，
+  // 供前端在用户点击导入前就展示平台、风险、质量分与失败原因。
+  return apiPost("/api/knowledge/preprocess/url", payload || {});
+}
+
 export async function listKnowledgeSources(knowledgeBaseId) {
   const response = await fetch(
     `${API_BASE}/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/sources`,
@@ -115,7 +121,11 @@ export async function deleteKnowledgeSource(knowledgeBaseId, sourceId) {
   return response.json();
 }
 
-export async function updateKnowledgeSource(knowledgeBaseId, sourceId, payload) {
+export async function updateKnowledgeSource(
+  knowledgeBaseId,
+  sourceId,
+  payload,
+) {
   const response = await fetch(
     `${API_BASE}/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/sources/${encodeURIComponent(sourceId)}`,
     {

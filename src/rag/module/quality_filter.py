@@ -1,6 +1,5 @@
 from typing import List, Dict
 from src.config import Config
-from sentence_transformers import CrossEncoder
 import logging
 
 logger = logging.getLogger(__name__)
@@ -9,6 +8,7 @@ class QualityFilter:
     def __init__(self):
         self.config = Config()
         try:
+            from sentence_transformers import CrossEncoder
             self.reranker = CrossEncoder(self.config.MINILM_MODEL)
         except Exception as e:
             logger.warning(f"Failed to load CrossEncoder model: {e}. Using simple heuristic.")

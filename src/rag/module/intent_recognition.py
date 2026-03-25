@@ -1,7 +1,6 @@
 import json
 from typing import Dict
 from functools import lru_cache
-from sentence_transformers import SentenceTransformer, util
 from langchain_core.prompts import ChatPromptTemplate
 import re
 
@@ -15,11 +14,13 @@ except Exception:
 
 if _st_cache_resource:
     @_st_cache_resource
-    def _get_sentence_transformer(model_name: str) -> SentenceTransformer:
+    def _get_sentence_transformer(model_name: str):
+        from sentence_transformers import SentenceTransformer
         return SentenceTransformer(model_name)
 else:
     @lru_cache(maxsize=1)
-    def _get_sentence_transformer(model_name: str) -> SentenceTransformer:
+    def _get_sentence_transformer(model_name: str):
+        from sentence_transformers import SentenceTransformer
         return SentenceTransformer(model_name)
 
 
@@ -89,6 +90,8 @@ class IntentRecognizer:
         """
         先使用Sentence-BERT进行初步意图分类
         """
+        from sentence_transformers import util
+
         query_embedding = self.intent_classifier.encode(query, convert_to_tensor=True)
 
         # 计算与每个意图类别的相似度

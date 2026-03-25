@@ -4,6 +4,37 @@ import { generateKnowledgeAnswer } from "../api/index.js"
 
 const EMPTY_EVIDENCE = {}
 
+function getRiskTagColor(riskLevel) {
+  if (riskLevel === "high") {
+    return "red"
+  }
+  if (riskLevel === "medium") {
+    return "gold"
+  }
+  return "green"
+}
+
+function buildFailureGuide(platform, errorCode, fallbackMessage = "解析失败，建议切换手动导入并补充正文") {
+  const normalizedPlatform = String(platform || "unknown")
+  const normalizedErrorCode = String(errorCode || "")
+  const platformPrefix = normalizedPlatform === "unknown" ? "当前链接" : `${normalizedPlatform} 链接`
+  const guideMap = {
+    AUTO_PARSE_EMPTY: `${platformPrefix}正文提取为空，建议切换手动导入并粘贴完整正文`,
+    AUTO_PARSE_LOW_QUALITY: `${platformPrefix}质量不足，建议粘贴去广告后的正文`,
+    AUTO_PARSE_DUPLICATED: `${platformPrefix}已导入过相同来源，可直接复用历史内容`,
+    AUTO_PARSE_LOGIN_REQUIRED: `${platformPrefix}需要登录可见，建议手动粘贴内容`,
+    AUTO_PARSE_RISK_VERIFICATION: `${platformPrefix}触发风控验证，建议手动导入`,
+    AUTO_PARSE_BLOCKED: `${platformPrefix}命中平台限制文案，建议手动导入`,
+    AUTO_PARSE_PAYWALLED: `${platformPrefix}命中付费限制，建议补充可公开内容后导入`,
+    URL_RESOLVE_TIMEOUT: "短链解跳超时，建议粘贴解跳后的原始链接再试",
+    URL_RESOLVE_LOOP: "短链重定向异常，建议手动打开后复制最终链接",
+  }
+  if (!normalizedErrorCode) {
+    return fallbackMessage
+  }
+  return guideMap[normalizedErrorCode] || `${fallbackMessage}（${normalizedErrorCode}）`
+}
+
 function isSelectedMapEqual(prevMap, nextMap) {
   const prevKeys = Object.keys(prevMap || {})
   const nextKeys = Object.keys(nextMap || {})
@@ -26,6 +57,8 @@ export default function KnowledgeTab({
   loadingKnowledgeDebugSnapshot,
   loadingKnowledgeSources,
   ingestingKnowledge,
+  preprocessingKnowledgeUrl,
+  knowledgeUrlPreprocessResult,
   lastIngestResult,
   loadingKnowledge,
   loadingKnowledgeBases,
@@ -36,6 +69,7 @@ export default function KnowledgeTab({
   onDeleteKnowledgeBase,
   onDeleteKnowledgeSource,
   onIngestKnowledgeUrl,
+  onPreprocessKnowledgeUrl,
   onLoadKnowledgeDebugSnapshot,
   onRefreshKnowledgeSources,
   onSearch,
@@ -56,6 +90,7 @@ export default function KnowledgeTab({
   const [ingestMode, setIngestMode] = useState("auto")
   const [manualText, setManualText] = useState("")
   const [ocrText, setOcrText] = useState("")
+  const [subtitleText, setSubtitleText] = useState("")
   const [debugModalOpen, setDebugModalOpen] = useState(false)
   const [loadingDebugModal, setLoadingDebugModal] = useState(false)
   const [editSourceOpen, setEditSourceOpen] = useState(false)
@@ -94,6 +129,48 @@ export default function KnowledgeTab({
         : normalizedKnowledgeSources.filter((item) => String(item?.source_url || "").trim()),
     [socialSources, normalizedKnowledgeSources]
   )
+  const preprocessGuide = useMemo(() => {
+    // preprocessGuide 的职责是把后端较底层的风控/质量信号翻译成面向用户的操作建议，
+    // 例如“继续自动解析”还是“直接切手动导入”。
+    const platform = String(knowledgeUrlPreprocessResult?.source_platform || "unknown")
+    const riskLevel = String(knowledgeUrlPreprocessResult?.source_risk_level || "")
+    const errorCode = String(knowledgeUrlPreprocessResult?.ingest_error_code || "")
+    const qualityScore = knowledgeUrlPreprocessResult?.quality_score
+    const extractorLayer = String(knowledgeUrlPreprocessResult?.extractor_layer || "")
+    if (errorCode) {
+      return {
+        message: buildFailureGuide(platform, errorCode, "预处理预判当前链接自动解析成功率较低，建议直接切换手动/OCR 导入"),
+        type: "warning",
+      }
+    }
+    if (riskLevel === "high") {
+      return {
+        message: "该链接为高风险平台，建议优先手动导入（粘贴正文/OCR）",
+        type: "warning",
+      }
+    }
+    if (riskLevel === "medium") {
+      return {
+        message: "该链接可尝试自动解析，建议同时准备手动文本作为备份",
+        type: "info",
+      }
+    }
+    if (riskLevel === "low") {
+      return {
+        message:
+          qualityScore !== undefined && qualityScore !== null
+            ? `该链接预判可自动解析，当前质量分 ${qualityScore}${extractorLayer ? `，命中 ${extractorLayer}` : ""}`
+            : "该链接支持自动解析，点击导入即可",
+        type: "success",
+      }
+    }
+    return null
+  }, [knowledgeUrlPreprocessResult])
+  const failedGuide = useMemo(() => {
+    const platform = String(lastIngestResult?.metadata?.source_platform || "unknown")
+    const errorCode = String(lastIngestResult?.metadata?.ingest_error_code || "")
+    return buildFailureGuide(platform, errorCode, "解析失败，建议切换手动导入模式并粘贴文本/OCR 内容")
+  }, [lastIngestResult])
   const effectiveKnowledgeDebug = useMemo(() => {
     if (lastFlowKnowledgeDebug) {
       return lastFlowKnowledgeDebug
@@ -170,6 +247,20 @@ export default function KnowledgeTab({
   }, [onRefreshKnowledgeSources, selectedKnowledgeBaseId])
 
   useEffect(() => {
+    if (lastIngestResult?.ingest_status !== "failed") {
+      return
+    }
+    // 自动解析失败后要把 UI 强制切到 manual：
+    // 仅展示文本框还不够，如果 radio 状态不跟着切，用户会误以为当前仍在“自动解析”模式。
+    setIngestMode("manual")
+    const failedSourceUrl = String(lastIngestResult?.metadata?.source_url || "").trim()
+    if (!failedSourceUrl) {
+      return
+    }
+    setIngestUrl((prev) => (String(prev || "").trim() ? prev : failedSourceUrl))
+  }, [lastIngestResult])
+
+  useEffect(() => {
     console.info("[knowledge-tab] social-list-state", {
       selectedKnowledgeBaseId: String(selectedKnowledgeBaseId || ""),
       knowledgeSourcesCount: normalizedKnowledgeSources.length,
@@ -178,6 +269,42 @@ export default function KnowledgeTab({
       firstVisibleSourceId: String(visibleSocialSources[0]?.source_id || ""),
     })
   }, [normalizedKnowledgeSources, selectedKnowledgeBaseId, socialSources, visibleSocialSources])
+
+  useEffect(() => {
+    const sourceUrl = String(ingestUrl || "").trim()
+    if (!sourceUrl || !onPreprocessKnowledgeUrl) {
+      return
+    }
+    let isCanceled = false
+    const timer = window.setTimeout(async () => {
+      if (isCanceled) {
+        return
+      }
+      const result = await onPreprocessKnowledgeUrl(sourceUrl)
+      if (!result) {
+        return
+      }
+      // 这里做防抖预处理，避免用户每输入一个字符就触发一次后端请求；
+      // 同时依据预处理结果自动建议默认模式，减少高风险平台上的无效点击。
+      if (
+        String(result?.source_risk_level || "") === "high" ||
+        (Boolean(result?.requires_user_assist) && Boolean(String(result?.ingest_error_code || "").trim()))
+      ) {
+        setIngestMode("manual")
+      }
+      if (
+        String(result?.source_risk_level || "") === "low" &&
+        !Boolean(result?.requires_user_assist) &&
+        ingestMode !== "manual"
+      ) {
+        setIngestMode("auto")
+      }
+    }, 400)
+    return () => {
+      isCanceled = true
+      window.clearTimeout(timer)
+    }
+  }, [ingestMode, ingestUrl, onPreprocessKnowledgeUrl])
 
   const filterEntries = (entries) => {
     const keyword = filterKeyword.trim()
@@ -248,18 +375,26 @@ export default function KnowledgeTab({
     if (!onIngestKnowledgeUrl) {
       return
     }
+    const currentUrl = String(ingestUrl || "").trim()
     const result = await onIngestKnowledgeUrl({
-      url: ingestUrl,
+      url: currentUrl,
       mode: ingestMode,
       manual_text: manualText,
-      ocr_text: ocrText,
+      ocr_text: [ocrText, subtitleText].filter(Boolean).join("\n"),
     })
     if (result?.success) {
       setManualText("")
       setOcrText("")
-      if (result.ingest_status !== "failed") {
-        setIngestUrl("")
-      }
+      setSubtitleText("")
+      setIngestUrl("")
+      return
+    }
+    // 失败时显式回填 URL，避免组件重渲染或状态刷新后把用户刚输入的链接丢掉，
+    // 这样用户可以直接补正文继续重试，而不需要重新粘贴链接。
+    const fallbackUrl =
+      String(result?.metadata?.source_url || "").trim() || currentUrl
+    if (fallbackUrl) {
+      setIngestUrl(fallbackUrl)
     }
   }
 
@@ -370,7 +505,7 @@ export default function KnowledgeTab({
   return (
     <div className="knowledge-layout">
       <Card title="知识库管理" className="panel-card">
-        <Space direction="vertical" className="full-width">
+        <Space orientation="vertical" className="full-width">
           <Space.Compact className="full-width">
             <Input
               placeholder="新知识库名称"
@@ -405,9 +540,9 @@ export default function KnowledgeTab({
         </Space>
       </Card>
       <Card title="数据来源" className="panel-card">
-        <Space direction="vertical" className="full-width">
+        <Space orientation="vertical" className="full-width">
           <Card size="small" title="文档上传（来源类型：upload）" className="evidence-card">
-            <Space direction="vertical" className="full-width" size="small">
+            <Space orientation="vertical" className="full-width" size="small">
               <Typography.Text type="secondary">上传后的数据会写入当前知识库并参与私有检索。</Typography.Text>
               <Upload
                 showUploadList={false}
@@ -426,12 +561,51 @@ export default function KnowledgeTab({
             </Space>
           </Card>
           <Card size="small" title="社交链接导入（来源类型：social_url/manual/ocr）" className="evidence-card">
-            <Space direction="vertical" className="full-width" size="small">
+            <Space orientation="vertical" className="full-width" size="small">
               <Input
                 placeholder="粘贴公开可访问链接"
                 value={ingestUrl}
                 onChange={(event) => setIngestUrl(event.target.value)}
               />
+              <Space size="small" wrap>
+                {preprocessingKnowledgeUrl && <Tag color="processing">预处理分析中</Tag>}
+                {knowledgeUrlPreprocessResult?.source_platform && (
+                  <Tag>平台 {knowledgeUrlPreprocessResult.source_platform}</Tag>
+                )}
+                {knowledgeUrlPreprocessResult?.source_risk_level && (
+                  <Tag
+                    color={getRiskTagColor(knowledgeUrlPreprocessResult.source_risk_level)}
+                  >
+                    风险 {knowledgeUrlPreprocessResult.source_risk_level}
+                  </Tag>
+                )}
+                {knowledgeUrlPreprocessResult?.resolve_error_code && (
+                  <Tag color="volcano">resolve {knowledgeUrlPreprocessResult.resolve_error_code}</Tag>
+                )}
+                {knowledgeUrlPreprocessResult?.ingest_error_code && (
+                  <Tag color="volcano">error {knowledgeUrlPreprocessResult.ingest_error_code}</Tag>
+                )}
+                {knowledgeUrlPreprocessResult?.extractor_layer && (
+                  <Tag>layer {knowledgeUrlPreprocessResult.extractor_layer}</Tag>
+                )}
+                {knowledgeUrlPreprocessResult?.quality_score !== undefined &&
+                  knowledgeUrlPreprocessResult?.quality_score !== null && (
+                    <Tag color="blue">quality {knowledgeUrlPreprocessResult.quality_score}</Tag>
+                  )}
+                {knowledgeUrlPreprocessResult?.parsed_content_chars ? (
+                  <Tag>chars {knowledgeUrlPreprocessResult.parsed_content_chars}</Tag>
+                ) : null}
+                {knowledgeUrlPreprocessResult?.requires_user_assist ? (
+                  <Tag color="orange">建议手动辅助</Tag>
+                ) : null}
+              </Space>
+              {preprocessGuide && (
+                <Alert
+                  showIcon
+                  type={preprocessGuide.type}
+                  message={preprocessGuide.message}
+                />
+              )}
               <Radio.Group
                 value={ingestMode}
                 onChange={(event) => setIngestMode(event.target.value)}
@@ -441,7 +615,7 @@ export default function KnowledgeTab({
                 ]}
               />
               {(ingestMode === "manual" || lastIngestResult?.ingest_status === "failed") && (
-                <Space direction="vertical" className="full-width" size="small">
+                <Space orientation="vertical" className="full-width" size="small">
                   <Input.TextArea
                     rows={4}
                     placeholder="手动粘贴正文（解析失败时建议粘贴）"
@@ -453,6 +627,12 @@ export default function KnowledgeTab({
                     placeholder="可选：粘贴 OCR 文本"
                     value={ocrText}
                     onChange={(event) => setOcrText(event.target.value)}
+                  />
+                  <Input.TextArea
+                    rows={3}
+                    placeholder="可选：粘贴视频字幕文本（会并入 OCR 文本）"
+                    value={subtitleText}
+                    onChange={(event) => setSubtitleText(event.target.value)}
                   />
                 </Space>
               )}
@@ -466,15 +646,27 @@ export default function KnowledgeTab({
                 {lastIngestResult?.ingest_status === "failed" && <Tag color="error">解析失败</Tag>}
               </Space>
               {lastIngestResult?.ingest_status === "failed" && (
-                <Alert type="warning" showIcon message="解析失败，建议切换手动导入模式并粘贴文本/OCR 内容" />
+                <Alert type="warning" showIcon message={failedGuide} />
               )}
               {lastIngestResult?.parsed_content_preview && (
                 <Card size="small" title="本次解析正文预览">
-                  <Space direction="vertical" className="full-width" size={4}>
+                  <Space orientation="vertical" className="full-width" size={4}>
                     <Tag>字符数 {lastIngestResult?.parsed_content_chars || 0}</Tag>
                     <Input.TextArea
                       value={lastIngestResult?.parsed_content_preview || ""}
                       autoSize={{ minRows: 4, maxRows: 12 }}
+                      readOnly
+                    />
+                  </Space>
+                </Card>
+              )}
+              {knowledgeUrlPreprocessResult?.parsed_content_preview && (
+                <Card size="small" title="预处理正文预览">
+                  <Space orientation="vertical" className="full-width" size={4}>
+                    <Tag>字符数 {knowledgeUrlPreprocessResult?.parsed_content_chars || 0}</Tag>
+                    <Input.TextArea
+                      value={knowledgeUrlPreprocessResult?.parsed_content_preview || ""}
+                      autoSize={{ minRows: 4, maxRows: 10 }}
                       readOnly
                     />
                   </Space>
@@ -485,7 +677,7 @@ export default function KnowledgeTab({
         </Space>
       </Card>
       <Card title="当前知识库来源列表" className="panel-card">
-        <Space direction="vertical" className="full-width" size="small">
+        <Space orientation="vertical" className="full-width" size="small">
           <Space size="small" wrap>
             <Tag>总数 {sourceStats?.total || 0}</Tag>
             <Tag color="success">parsed {sourceStats?.parsed || 0}</Tag>
@@ -505,7 +697,7 @@ export default function KnowledgeTab({
                       size="small"
                       onClick={() => handleOpenEditSource(item)}
                     >
-                      修改
+                      {item.ingest_status === "failed" ? "重试" : "修改"}
                     </Button>,
                     <Popconfirm
                       key={`delete-${item.source_id}`}
@@ -520,13 +712,25 @@ export default function KnowledgeTab({
                     </Popconfirm>,
                   ]}
                 >
-                  <Space direction="vertical" size={2} className="full-width">
+                  <Space orientation="vertical" size={2} className="full-width">
                     <Space size="small" wrap>
                       <Tag>{item.source_type || "unknown"}</Tag>
                       <Tag>{item.source_platform || "unknown"}</Tag>
                       <Tag color={item.ingest_status === "parsed" ? "success" : item.ingest_status === "fallback" ? "warning" : "error"}>
                         {item.ingest_status || "unknown"}
                       </Tag>
+                      {item.ingest_error_code && <Tag color="volcano">error {item.ingest_error_code}</Tag>}
+                      {item.source_risk_level && (
+                        <Tag
+                          color={getRiskTagColor(item.source_risk_level)}
+                        >
+                          risk {item.source_risk_level}
+                        </Tag>
+                      )}
+                      {item.extractor_layer && <Tag>layer {item.extractor_layer}</Tag>}
+                      {item.quality_score !== undefined && item.quality_score !== null && (
+                        <Tag color="blue">quality {item.quality_score}</Tag>
+                      )}
                       <Tag>chunks {item.chunks_count || 0}</Tag>
                       <Tag>chars {item.parsed_content_chars || 0}</Tag>
                     </Space>
@@ -549,7 +753,7 @@ export default function KnowledgeTab({
         </Space>
       </Card>
       <Card title="检索知识库" className="panel-card">
-        <Space direction="vertical" className="full-width">
+        <Space orientation="vertical" className="full-width">
           <Input
             placeholder="行程生成时的知识库检索条件（可选）"
             value={knowledgeGenerateQuery}
@@ -576,13 +780,16 @@ export default function KnowledgeTab({
       <Card size="small" title="私有知识命中调试" className="panel-card">
         {!effectiveKnowledgeDebug && <Typography.Text type="secondary">暂无调试信息（主流程或知识库检索后显示）</Typography.Text>}
         {effectiveKnowledgeDebug && (
-          <Space size="small" wrap>
-            <Tag>scope {effectiveKnowledgeDebug?.knowledge_scope || "-"}</Tag>
-            <Tag color={effectiveKnowledgeDebug?.allow_public_fusion ? "blue" : "default"}>
-              {effectiveKnowledgeDebug?.allow_public_fusion ? "公网工具已开启" : "仅私有知识"}
-            </Tag>
-            <Tag color="success">私有片段 {effectiveKnowledgeDebug?.kb_context_count || 0}</Tag>
-            <Tag color="purple">来源 {effectiveKnowledgeDebug?.source_evidence_count || 0}</Tag>
+          <Space orientation="vertical" size="small" className="full-width">
+            <Space size="small" wrap>
+              <Tag>scope {effectiveKnowledgeDebug?.knowledge_scope || "-"}</Tag>
+              <Tag color={effectiveKnowledgeDebug?.allow_public_fusion ? "blue" : "default"}>
+                {effectiveKnowledgeDebug?.allow_public_fusion ? "公网工具已开启" : "仅私有知识"}
+              </Tag>
+              <Tag color="success">私有片段 {effectiveKnowledgeDebug?.kb_context_count || 0}</Tag>
+              <Tag color="purple">实际命中来源 {effectiveKnowledgeDebug?.source_evidence_count || 0}</Tag>
+            </Space>
+            <Typography.Text type="secondary">此处仅展示本次检索或主流程实际命中的来源；全部来源请查看上方来源列表。</Typography.Text>
           </Space>
         )}
         {Array.isArray(effectiveKnowledgeDebug?.source_evidence) && effectiveKnowledgeDebug.source_evidence.length > 0 && (
@@ -597,6 +804,7 @@ export default function KnowledgeTab({
                   <Tag color={item?.ingest_status === "parsed" ? "success" : item?.ingest_status === "fallback" ? "warning" : "error"}>
                     {item?.ingest_status || "unknown"}
                   </Tag>
+                  {item?.hit_count ? <Tag color="blue">hits {item.hit_count}</Tag> : null}
                   {item?.source_url ? (
                     <a href={item.source_url} target="_blank" rel="noreferrer">
                       {item.source_url}
@@ -614,11 +822,11 @@ export default function KnowledgeTab({
         <Spin spinning={loadingKnowledge}>
           {!knowledgeResult && <div className="empty-tip">暂无检索结果</div>}
           {knowledgeResult && (
-            <Space direction="vertical" size="middle" className="full-width">
+            <Space orientation="vertical" size="middle" className="full-width">
               <div className="trip-summary">查询：{knowledgeResult.query}</div>
               <Divider />
               <Card size="small" title="证据筛选" className="evidence-card">
-                <Space direction="vertical" size="small" className="full-width">
+                <Space orientation="vertical" size="small" className="full-width">
                   <Input
                     placeholder="关键词筛选"
                     value={filterKeyword}
@@ -655,7 +863,7 @@ export default function KnowledgeTab({
                   },
                 ]}
               />
-              <Space direction="vertical" size="small" className="full-width">
+              <Space orientation="vertical" size="small" className="full-width">
                 <Button type="primary" onClick={handleGenerateAnswer} loading={loadingAnswer}>
                   用已选证据生成回答
                 </Button>
@@ -670,15 +878,18 @@ export default function KnowledgeTab({
         </Spin>
       </Card>
       <Modal
-        title="修改社交来源正文"
+        title={editingSource?.ingest_status === "failed" ? "补全文本并重试失败来源" : "修改社交来源正文"}
         open={editSourceOpen}
         onCancel={() => setEditSourceOpen(false)}
         onOk={handleUpdateSourceContent}
-        okText="保存修改"
+        okText={editingSource?.ingest_status === "failed" ? "提交重试" : "保存修改"}
         cancelText="取消"
         confirmLoading={updatingSource}
       >
-        <Space direction="vertical" className="full-width" size="small">
+        <Space orientation="vertical" className="full-width" size="small">
+          {editingSource?.ingest_error_code && (
+            <Alert type="warning" showIcon message={`失败原因：${editingSource.ingest_error_code}`} />
+          )}
           <Input
             value={editingSourceUrl}
             onChange={(event) => setEditingSourceUrl(event.target.value)}
@@ -700,7 +911,7 @@ export default function KnowledgeTab({
         width={920}
       >
         <Spin spinning={loadingDebugModal || loadingKnowledgeDebugSnapshot}>
-          <Space direction="vertical" className="full-width" size="middle">
+          <Space orientation="vertical" className="full-width" size="middle">
             <Typography.Text type="secondary">
               快照时间：{knowledgeDebugSnapshot?.generated_at || "-"}
             </Typography.Text>
@@ -723,7 +934,7 @@ export default function KnowledgeTab({
                     key: source.source_id,
                     label: `${source.source_type || "unknown"} · ${source.source_platform || "unknown"} · ${source.ingest_status || "unknown"} · chunks ${source.chunks_count || 0}`,
                     children: (
-                      <Space direction="vertical" className="full-width" size="small">
+                      <Space orientation="vertical" className="full-width" size="small">
                         <Typography.Text>source_id: {source.source_id || "-"}</Typography.Text>
                         <Typography.Text>source_url: {source.source_url || "-"}</Typography.Text>
                         <Typography.Text>ingested_at: {source.ingested_at || "-"}</Typography.Text>
@@ -743,7 +954,7 @@ export default function KnowledgeTab({
                           locale={{ emptyText: "暂无分块内容" }}
                           renderItem={(chunk) => (
                             <List.Item>
-                              <Space direction="vertical" className="full-width" size={2}>
+                              <Space orientation="vertical" className="full-width" size={2}>
                                 <Typography.Text>
                                   chunk {chunk?.chunk_index || "-"} / {chunk?.chunk_total || "-"} · chunk_id: {chunk?.chunk_id || "-"} · chars: {chunk?.content_chars || 0}
                                 </Typography.Text>

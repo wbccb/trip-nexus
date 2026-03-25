@@ -290,7 +290,7 @@ export default function TripTab({
         <Spin spinning={loadingTrip}>
           {!tripResult && <div className="empty-tip">暂无行程结果</div>}
           {tripResult && (
-            <Space direction="vertical" size="middle" className="full-width">
+            <Space orientation="vertical" size="middle" className="full-width">
               <div className="trip-summary">
                 目的地：{tripResult.destination} · 天数：{tripResult.days}
               </div>

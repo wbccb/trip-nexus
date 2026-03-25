@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 from io import BytesIO
 from functools import lru_cache  # 用于缓存全局单例对象，减少重复初始化
-from typing import Any, Dict, List, Optional  # 提供类型注解，便于接口契约清晰
+from typing import Any, Dict, List, Optional, Set, Tuple  # 提供类型注解，便于接口契约清晰
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile  # FastAPI 框架与错误处理
 from fastapi.responses import StreamingResponse
@@ -30,7 +30,9 @@ from src.frontend.context.storage import get_conversation_storage  # 获取会�
 from src.llm.llm_manager import LlmManager  # 行程生成核心管理器
 from src.map.map_renderer import TripMap
 from src.rag.rag_main import AIRetrievalPipeline  # 知识库检索流水线
+from src.rag.network.content_validator import validate_content_quality
 from src.rag.network.crawler import ContentCrawler
+from src.rag.network.url_preprocessor import infer_source_platform, preprocess_url
 from src.rag.store.vector_store import VectorStore
 from src.agent import run_agent_loop_sync
 
@@ -166,6 +168,27 @@ class KnowledgeIngestUrlRequest(BaseModel):
     ocr_text: Optional[str] = Field(None, description="OCR 提取文本")
 
 
+class KnowledgePreprocessUrlRequest(BaseModel):
+    url: str = Field(..., description="待预处理链接")
+
+
+class KnowledgePreprocessUrlResponse(BaseModel):
+    success: bool = Field(..., description="是否预处理成功")
+    normalized_url: str = Field("", description="规范化链接")
+    resolved_url: str = Field("", description="解跳后的链接")
+    source_platform: str = Field("unknown", description="来源平台")
+    source_risk_level: str = Field("low", description="来源风险等级 low/medium/high")
+    resolve_error_code: Optional[str] = Field(None, description="短链解跳异常码")
+    extractor_layer: Optional[str] = Field(None, description="预处理阶段命中的提取层级")
+    quality_score: Optional[int] = Field(None, description="预处理阶段质量分")
+    ingest_error_code: Optional[str] = Field(None, description="预处理阶段预测失败码")
+    failure_reason: Optional[str] = Field(None, description="预处理阶段失败原因")
+    content_lang: Optional[str] = Field(None, description="预处理阶段识别的内容语言")
+    requires_user_assist: bool = Field(False, description="是否建议用户直接切换手动/OCR 辅助导入")
+    parsed_content_preview: str = Field("", description="预处理阶段正文预览")
+    parsed_content_chars: int = Field(0, description="预处理阶段正文字符数")
+
+
 class KnowledgeIngestUrlResponse(BaseModel):
     success: bool = Field(..., description="是否导入成功")
     ingest_status: str = Field(..., description="导入状态 parsed/fallback/failed")
@@ -189,6 +212,14 @@ class KnowledgeSourceItem(BaseModel):
     chunks_count: int = Field(0, description="分块数")
     parsed_content_preview: str = Field("", description="解析正文预览")
     parsed_content_chars: int = Field(0, description="解析正文字符数")
+    normalized_url: Optional[str] = Field(None, description="规范化链接")
+    resolved_url: Optional[str] = Field(None, description="解跳后链接")
+    source_risk_level: Optional[str] = Field(None, description="来源风险等级")
+    extractor_layer: Optional[str] = Field(None, description="提取层级")
+    quality_score: Optional[int] = Field(None, description="质量分")
+    failure_reason: Optional[str] = Field(None, description="失败原因")
+    retry_count: int = Field(0, description="重试次数")
+    last_retry_at: Optional[str] = Field(None, description="最后重试时间")
 
 
 class KnowledgeSourceStats(BaseModel):
@@ -214,6 +245,7 @@ class KnowledgeSourceDeleteResponse(BaseModel):
 class KnowledgeSourceUpdateRequest(BaseModel):
     content: str = Field(..., description="更新后的来源正文内容")
     source_url: Optional[str] = Field(None, description="可选来源链接，传入时会覆盖原链接")
+    ocr_text: Optional[str] = Field(None, description="可选 OCR 或字幕文本")
 
 
 class KnowledgeSourceUpdateResponse(BaseModel):
@@ -249,6 +281,14 @@ class KnowledgeDebugSourceItem(BaseModel):
     chunks_count: int = Field(0, description="分块数")
     parsed_content_preview: str = Field("", description="解析正文预览")
     parsed_content_chars: int = Field(0, description="解析正文字符数")
+    normalized_url: Optional[str] = Field(None, description="规范化链接")
+    resolved_url: Optional[str] = Field(None, description="解跳后链接")
+    source_risk_level: Optional[str] = Field(None, description="来源风险等级")
+    extractor_layer: Optional[str] = Field(None, description="提取层级")
+    quality_score: Optional[int] = Field(None, description="质量分")
+    failure_reason: Optional[str] = Field(None, description="失败原因")
+    retry_count: int = Field(0, description="重试次数")
+    last_retry_at: Optional[str] = Field(None, description="最后重试时间")
     chunks: List[KnowledgeDebugChunkItem] = Field(default_factory=list, description="分块调试数据")
 
 
@@ -495,7 +535,8 @@ def _get_map_renderer() -> TripMap:
 
 KNOWLEDGE_COLLECTION_PREFIX = "kb_"
 KNOWLEDGE_REGISTRY_COLLECTION = "knowledge_registry"
-SOCIAL_SOURCE_PLATFORMS = {"xiaohongshu", "weibo", "bilibili"}
+SOCIAL_SOURCE_PLATFORMS = {"xiaohongshu", "weibo", "bilibili", "zhihu"}
+FAILED_SOURCE_RECORD_TYPE = "knowledge_failed_source"
 
 
 @lru_cache(maxsize=1)
@@ -568,7 +609,13 @@ def _upsert_knowledge_base_registry(knowledge_base_id: str, name: str, collectio
     """写入或更新知识库 registry 记录。"""
     store = _get_knowledge_store()
     store.switch_collection(KNOWLEDGE_REGISTRY_COLLECTION, create_if_missing=True)
-    existing = store.vector_db.get(where={"knowledge_base_id": knowledge_base_id}, include=["metadatas"])
+    existing = store.vector_db.get(
+        where=_build_chroma_where(
+            knowledge_base_id=knowledge_base_id,
+            record_type="knowledge_base",
+        ),
+        include=["metadatas"],
+    )
     existing_ids = existing.get("ids") if isinstance(existing, dict) else []
     if isinstance(existing_ids, list) and existing_ids:
         store.vector_db.delete(ids=existing_ids)
@@ -591,7 +638,147 @@ def _delete_knowledge_base_registry(knowledge_base_id: str) -> None:
     """删除知识库 registry 记录。"""
     store = _get_knowledge_store()
     store.switch_collection(KNOWLEDGE_REGISTRY_COLLECTION, create_if_missing=True)
-    existing = store.vector_db.get(where={"knowledge_base_id": knowledge_base_id}, include=["metadatas"])
+    existing = store.vector_db.get(
+        where=_build_chroma_where(
+            knowledge_base_id=knowledge_base_id,
+            record_type="knowledge_base",
+        ),
+        include=["metadatas"],
+    )
+    existing_ids = existing.get("ids") if isinstance(existing, dict) else []
+    if isinstance(existing_ids, list) and existing_ids:
+        store.vector_db.delete(ids=existing_ids)
+
+
+def _build_chroma_where(**filters: Any) -> Dict[str, Any]:
+    """构造兼容 Chroma 的 metadata 等值过滤条件。"""
+    # Chroma 在单条件和多条件下的 where 结构不同，这里统一做一层适配，
+    # 避免调用方在删除 registry、查失败来源、查知识库定义时重复拼装 "$and"。
+    normalized_filters = {key: value for key, value in filters.items() if value is not None}
+    if not normalized_filters:
+        return {}
+    if len(normalized_filters) == 1:
+        return normalized_filters
+    return {"$and": [{key: value} for key, value in normalized_filters.items()]}
+
+
+def _load_failed_source_entries(knowledge_base_id: str) -> List[Dict[str, Any]]:
+    """从 registry 集合加载指定知识库的失败来源记录。"""
+    normalized_id = str(knowledge_base_id or "").strip()
+    if not normalized_id:
+        return []
+    store = _get_knowledge_store()
+    store.switch_collection(KNOWLEDGE_REGISTRY_COLLECTION, create_if_missing=True)
+    payload = store.vector_db.get(
+        where=_build_chroma_where(
+            knowledge_base_id=normalized_id,
+            record_type=FAILED_SOURCE_RECORD_TYPE,
+        ),
+        include=["metadatas"],
+    )
+    metadata_rows = payload.get("metadatas") if isinstance(payload, dict) else []
+    if not isinstance(metadata_rows, list):
+        return []
+    items: List[Dict[str, Any]] = []
+    for metadata in metadata_rows:
+        if not isinstance(metadata, dict):
+            continue
+        source_id = str(metadata.get("source_id") or "").strip()
+        if not source_id:
+            continue
+        # 失败来源没有真实 chunk，因此这里显式补一个“零分块”的来源项。
+        # 这样前端来源列表、统计面板和“补全文本重试”入口都能看见它。
+        items.append(
+            {
+                "source_id": source_id,
+                "source_type": str(metadata.get("source_type") or "url"),
+                "source_platform": str(metadata.get("source_platform") or "unknown"),
+                "source_url": str(metadata.get("source_url") or ""),
+                "author": metadata.get("author"),
+                "ingest_mode": str(metadata.get("ingest_mode") or "auto"),
+                "ingest_status": "failed",
+                "ingest_error_code": metadata.get("ingest_error_code"),
+                "ingested_at": metadata.get("ingested_at"),
+                "expires_at": metadata.get("expires_at"),
+                "chunks_count": 0,
+                "parsed_content_preview": str(metadata.get("parsed_content_preview") or ""),
+                "parsed_content_chars": int(metadata.get("parsed_content_chars") or 0),
+                "normalized_url": metadata.get("normalized_url"),
+                "resolved_url": metadata.get("resolved_url"),
+                "source_risk_level": metadata.get("source_risk_level"),
+                "extractor_layer": metadata.get("extractor_layer"),
+                "quality_score": metadata.get("quality_score"),
+                "failure_reason": metadata.get("failure_reason"),
+                "retry_count": int(metadata.get("retry_count") or 0),
+                "last_retry_at": metadata.get("last_retry_at"),
+                "chunk_ids": [],
+            }
+        )
+    return sorted(items, key=lambda item: str(item.get("ingested_at") or ""), reverse=True)
+
+
+def _upsert_failed_source_entry(metadata: Dict[str, Any], parsed_preview_text: str = "", parsed_chars: int = 0) -> None:
+    """将失败来源写入 registry 集合，保证来源列表与重试链路可见。"""
+    source_id = str((metadata or {}).get("source_id") or "").strip()
+    knowledge_base_id = str((metadata or {}).get("knowledge_base_id") or "").strip()
+    if not source_id or not knowledge_base_id:
+        return
+    store = _get_knowledge_store()
+    store.switch_collection(KNOWLEDGE_REGISTRY_COLLECTION, create_if_missing=True)
+    existing = store.vector_db.get(
+        where=_build_chroma_where(
+            knowledge_base_id=knowledge_base_id,
+            record_type=FAILED_SOURCE_RECORD_TYPE,
+            source_id=source_id,
+        ),
+        include=["metadatas"],
+    )
+    existing_ids = existing.get("ids") if isinstance(existing, dict) else []
+    existing_rows = existing.get("metadatas") if isinstance(existing, dict) else []
+    previous_retry_count = 0
+    if isinstance(existing_rows, list) and existing_rows:
+        previous = existing_rows[0] if isinstance(existing_rows[0], dict) else {}
+        previous_retry_count = int((previous or {}).get("retry_count") or 0)
+    if isinstance(existing_ids, list) and existing_ids:
+        store.vector_db.delete(ids=existing_ids)
+    # 失败来源与知识库定义共用一个 registry 集合，所以需要通过 record_type 区分。
+    # 这里使用“先删旧记录再写新记录”的 upsert 方式，保证 source_id 维度始终只有一条最新失败快照。
+    failure_reason = str(metadata.get("failure_reason") or metadata.get("ingest_error_code") or "INGEST_FAILED")
+    payload_metadata = {
+        **metadata,
+        "record_type": FAILED_SOURCE_RECORD_TYPE,
+        "ingest_status": "failed",
+        "parsed_content_preview": parsed_preview_text,
+        "parsed_content_chars": parsed_chars,
+        "failure_reason": failure_reason,
+        "retry_count": previous_retry_count,
+        "last_retry_at": metadata.get("last_retry_at"),
+    }
+    store.add_documents(
+        [
+            {
+                "content": parsed_preview_text or failure_reason,
+                "metadata": payload_metadata,
+            }
+        ]
+    )
+
+
+def _delete_failed_source_entry(knowledge_base_id: str, source_id: str) -> None:
+    normalized_id = str(knowledge_base_id or "").strip()
+    normalized_source_id = str(source_id or "").strip()
+    if not normalized_id or not normalized_source_id:
+        return
+    store = _get_knowledge_store()
+    store.switch_collection(KNOWLEDGE_REGISTRY_COLLECTION, create_if_missing=True)
+    existing = store.vector_db.get(
+        where=_build_chroma_where(
+            knowledge_base_id=normalized_id,
+            record_type=FAILED_SOURCE_RECORD_TYPE,
+            source_id=normalized_source_id,
+        ),
+        include=["metadatas"],
+    )
     existing_ids = existing.get("ids") if isinstance(existing, dict) else []
     if isinstance(existing_ids, list) and existing_ids:
         store.vector_db.delete(ids=existing_ids)
@@ -642,14 +829,7 @@ def _resolve_knowledge_base_collection(knowledge_base_id: str) -> Dict[str, str]
 
 def _infer_source_platform(source_url: str) -> str:
     """根据来源链接域名推断平台标识。"""
-    hostname = str(urlparse(str(source_url or "")).hostname or "").lower()
-    if "xiaohongshu" in hostname or "xhslink" in hostname:
-        return "xiaohongshu"
-    if "weibo" in hostname:
-        return "weibo"
-    if "bilibili" in hostname or "b23.tv" in hostname:
-        return "bilibili"
-    return "unknown"
+    return infer_source_platform(source_url)
 
 
 def _build_source_metadata(
@@ -663,6 +843,11 @@ def _build_source_metadata(
     author: Optional[str] = None,
     ingest_error_code: Optional[str] = None,
     expires_at: Optional[str] = None,
+    normalized_url: Optional[str] = None,
+    resolved_url: Optional[str] = None,
+    source_risk_level: Optional[str] = None,
+    extractor_layer: Optional[str] = None,
+    quality_score: Optional[int] = None,
 ) -> Dict[str, Any]:
     """构造来源 metadata，统一字段协议。"""
     return {
@@ -677,7 +862,26 @@ def _build_source_metadata(
         "ingest_error_code": ingest_error_code or None,
         "ingested_at": datetime.now().isoformat(),
         "expires_at": expires_at or None,
+        "normalized_url": normalized_url or None,
+        "resolved_url": resolved_url or None,
+        "source_risk_level": source_risk_level or None,
+        "extractor_layer": extractor_layer or None,
+        "quality_score": int(quality_score) if quality_score is not None else None,
     }
+
+
+def _exists_source_url(collection_name: str, target_url: str) -> bool:
+    normalized_target = str(target_url or "").strip()
+    if not normalized_target:
+        return False
+    for item in _load_collection_source_entries(collection_name):
+        if str(item.get("resolved_url") or "").strip() == normalized_target:
+            return True
+        if str(item.get("normalized_url") or "").strip() == normalized_target:
+            return True
+        if str(item.get("source_url") or "").strip() == normalized_target:
+            return True
+    return False
 
 
 def _build_text_preview(text: str, max_chars: int = 180) -> str:
@@ -690,7 +894,69 @@ def _build_text_preview(text: str, max_chars: int = 180) -> str:
     return f"{normalized_text[:max_chars]}..."
 
 
-def _load_collection_source_entries(collection_name: str) -> List[Dict[str, Any]]:
+def _run_url_auto_parse_preview(
+    resolved_url: str,
+    source_platform: str,
+    source_risk_level: str,
+    resolve_error_code: Optional[str] = None,
+) -> Dict[str, Any]:
+    """执行一次无副作用的自动解析预判，供 preprocess 与 ingest 复用。"""
+    crawler = ContentCrawler(max_workers=1, timeout=10)
+    # 预处理阶段与正式 ingest 必须尽量复用同一套自动解析逻辑，
+    # 否则前端会出现“预判能导入，真正导入却失败”的提示漂移。
+    parsed_item = crawler.fetch_url_with_fallback(resolved_url, source_platform=source_platform)
+    content_text = ""
+    extractor_layer: Optional[str] = None
+    if isinstance(parsed_item, dict):
+        content_text = str(parsed_item.get("content") or "").strip()
+        extractor_layer = str(parsed_item.get("extractor_layer") or "").strip() or None
+    quality_payload: Dict[str, Any] = {}
+    quality_score: Optional[int] = None
+    ingest_error_code: Optional[str] = None
+    failure_reason: Optional[str] = None
+    content_lang: Optional[str] = None
+    if content_text:
+        # 只要拿到了正文，就继续走质量门禁，而不是简单按“是否非空”判成功。
+        # 这样可以提前拦住登录墙、风控页、广告页、过短文本等“看起来有字但不可用”的内容。
+        quality_payload = validate_content_quality(
+            content_text,
+            {
+                "source_platform": source_platform,
+                "source_risk_level": source_risk_level,
+                "extractor_layer": extractor_layer,
+            },
+        )
+        quality_score = int(quality_payload.get("quality_score") or 0)
+        content_lang = str(quality_payload.get("content_lang") or "").strip() or None
+        if bool(quality_payload.get("is_valid")):
+            ingest_error_code = None
+            failure_reason = None
+        else:
+            ingest_error_code = str(quality_payload.get("error_code") or resolve_error_code or "AUTO_PARSE_LOW_QUALITY")
+            failure_reason = str(quality_payload.get("failure_reason") or ingest_error_code)
+    else:
+        ingest_error_code = str(resolve_error_code or "AUTO_PARSE_EMPTY")
+        failure_reason = str(resolve_error_code or "content_too_short")
+    parsed_content_preview = _build_text_preview(content_text, 3000) if content_text else ""
+    # 高风险平台或者已命中失败码时，前端应该优先引导用户走手动/OCR，
+    # 而不是继续让用户在自动解析上反复重试。
+    requires_user_assist = bool(ingest_error_code) or str(source_risk_level or "").lower() == "high"
+    return {
+        "content_text": content_text,
+        "extractor_layer": extractor_layer,
+        "quality_payload": quality_payload,
+        "quality_score": quality_score,
+        "ingest_error_code": ingest_error_code,
+        "failure_reason": failure_reason,
+        "content_lang": content_lang,
+        "parsed_content_preview": parsed_content_preview,
+        "parsed_content_chars": len(content_text),
+        "requires_user_assist": requires_user_assist,
+        "is_valid": not ingest_error_code,
+    }
+
+
+def _load_collection_source_entries(collection_name: str, knowledge_base_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """读取知识库集合中的来源条目并按 source_id 聚合。"""
     store = _get_knowledge_store()
     try:
@@ -702,7 +968,7 @@ def _load_collection_source_entries(collection_name: str) -> List[Dict[str, Any]
             collection_name,
             str(exc),
         )
-        return []
+        return _load_failed_source_entries(knowledge_base_id) if knowledge_base_id else []
     metadata_rows = payload.get("metadatas") if isinstance(payload, dict) else []
     id_rows = payload.get("ids") if isinstance(payload, dict) else []
     if not isinstance(metadata_rows, list):
@@ -724,6 +990,8 @@ def _load_collection_source_entries(collection_name: str) -> List[Dict[str, Any]
             legacy_source_rows += 1
         if not source_id:
             continue
+        # 一个来源可能因为文本分块被拆成多条向量记录，这里要重新按 source_id 聚合回“来源视图”，
+        # 否则前端来源列表会把同一个 URL 渲染成多条记录。
         ingest_status = str(metadata.get("ingest_status") or "parsed").strip() or "parsed"
         current_entry = source_map.get(source_id)
         if not current_entry:
@@ -741,6 +1009,14 @@ def _load_collection_source_entries(collection_name: str) -> List[Dict[str, Any]
                 "chunks_count": 0,
                 "parsed_content_preview": str(metadata.get("parsed_content_preview") or ""),
                 "parsed_content_chars": int(metadata.get("parsed_content_chars") or 0),
+                "normalized_url": metadata.get("normalized_url"),
+                "resolved_url": metadata.get("resolved_url"),
+                "source_risk_level": metadata.get("source_risk_level"),
+                "extractor_layer": metadata.get("extractor_layer"),
+                "quality_score": metadata.get("quality_score"),
+                "failure_reason": metadata.get("failure_reason"),
+                "retry_count": int(metadata.get("retry_count") or 0),
+                "last_retry_at": metadata.get("last_retry_at"),
                 "chunk_ids": [],
             }
             source_map[source_id] = current_entry
@@ -758,21 +1034,24 @@ def _load_collection_source_entries(collection_name: str) -> List[Dict[str, Any]
             legacy_source_rows,
             len(metadata_rows),
         )
-    return sorted(
-        list(source_map.values()),
-        key=lambda item: str(item.get("ingested_at") or ""),
-        reverse=True,
-    )
+    if knowledge_base_id:
+        # 已入库来源来自向量集合，失败来源来自 registry；两边都要合并后前端才能看到完整状态。
+        for failed_entry in _load_failed_source_entries(knowledge_base_id):
+            failed_source_id = str(failed_entry.get("source_id") or "").strip()
+            if not failed_source_id or failed_source_id in source_map:
+                continue
+            source_map[failed_source_id] = failed_entry
+    return sorted(list(source_map.values()), key=lambda item: str(item.get("ingested_at") or ""), reverse=True)
 
 
-def _load_collection_debug_entries(collection_name: str) -> List[Dict[str, Any]]:
+def _load_collection_debug_entries(collection_name: str, knowledge_base_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """读取知识库集合调试快照并按 source_id 聚合分块内容。"""
     store = _get_knowledge_store()
     try:
         store.switch_collection(collection_name, create_if_missing=False)
         payload = store.vector_db.get(include=["metadatas", "documents"])
     except Exception:
-        return []
+        return _load_failed_source_entries(knowledge_base_id) if knowledge_base_id else []
     metadata_rows = payload.get("metadatas") if isinstance(payload, dict) else []
     id_rows = payload.get("ids") if isinstance(payload, dict) else []
     document_rows = payload.get("documents") if isinstance(payload, dict) else []
@@ -806,6 +1085,14 @@ def _load_collection_debug_entries(collection_name: str) -> List[Dict[str, Any]]
                 "chunks_count": 0,
                 "parsed_content_preview": str(metadata.get("parsed_content_preview") or ""),
                 "parsed_content_chars": int(metadata.get("parsed_content_chars") or 0),
+                "normalized_url": metadata.get("normalized_url"),
+                "resolved_url": metadata.get("resolved_url"),
+                "source_risk_level": metadata.get("source_risk_level"),
+                "extractor_layer": metadata.get("extractor_layer"),
+                "quality_score": metadata.get("quality_score"),
+                "failure_reason": metadata.get("failure_reason"),
+                "retry_count": int(metadata.get("retry_count") or 0),
+                "last_retry_at": metadata.get("last_retry_at"),
                 "chunks": [],
             }
             source_map[source_id] = current_entry
@@ -822,17 +1109,19 @@ def _load_collection_debug_entries(collection_name: str) -> List[Dict[str, Any]]
                 "metadata": metadata,
             }
         )
-    return sorted(
-        list(source_map.values()),
-        key=lambda item: str(item.get("ingested_at") or ""),
-        reverse=True,
-    )
+    if knowledge_base_id:
+        for failed_entry in _load_failed_source_entries(knowledge_base_id):
+            failed_source_id = str(failed_entry.get("source_id") or "").strip()
+            if not failed_source_id or failed_source_id in source_map:
+                continue
+            source_map[failed_source_id] = {**failed_entry, "chunks": []}
+    return sorted(list(source_map.values()), key=lambda item: str(item.get("ingested_at") or ""), reverse=True)
 
 
 def _build_knowledge_base_item(record: Dict[str, str]) -> KnowledgeBaseItem:
     """将 registry 记录转换为知识库列表项并补充统计信息。"""
     collection_name = str(record.get("collection_name") or "")
-    source_entries = _load_collection_source_entries(collection_name) if collection_name else []
+    source_entries = _load_collection_source_entries(collection_name, str(record.get("knowledge_base_id") or "")) if collection_name else []
     source_types = sorted({str(item.get("source_type") or "") for item in source_entries if str(item.get("source_type") or "").strip()})
     last_updated_at = None
     ingest_times = [str(item.get("ingested_at") or "").strip() for item in source_entries]
@@ -860,8 +1149,28 @@ def _build_knowledge_context_texts(
     knowledge_query: Optional[str],
 ) -> List[str]:
     """从指定知识库检索与本次行程相关的上下文片段并转为提示词上下文。"""
+    context_texts, _ = _build_knowledge_context_payload(
+        knowledge_base_id,
+        destination,
+        days,
+        budget,
+        preference,
+        knowledge_query,
+    )
+    return context_texts
+
+
+def _build_knowledge_context_payload(
+    knowledge_base_id: Optional[str],
+    destination: str,
+    days: int,
+    budget: Optional[str],
+    preference: Optional[str],
+    knowledge_query: Optional[str],
+) -> Tuple[List[str], List[Document]]:
+    """构造主流程私有知识上下文，并返回实际命中的文档列表。"""
     if not knowledge_base_id:
-        return []
+        return [], []
     store = _get_knowledge_store()
     collection_name = _to_collection_name(knowledge_base_id)
     all_collections = set(store.list_collections())
@@ -898,7 +1207,7 @@ def _build_knowledge_context_texts(
         context_texts.append(
             f"私有知识库参考（来源:{source}，类型:{source_type}，平台:{source_platform}，导入状态:{ingest_status}）：{snippet[:800]}"
         )
-    return context_texts
+    return context_texts, [doc for doc in related_docs if isinstance(doc, Document)]
 
 
 def _normalize_knowledge_scope(knowledge_scope: Optional[str]) -> str:
@@ -922,11 +1231,42 @@ def _is_social_private_source(metadata: Dict[str, Any]) -> bool:
     return source_type in {"url", "manual", "ocr"} or source_platform in SOCIAL_SOURCE_PLATFORMS
 
 
-def _build_private_knowledge_evidence(knowledge_base_id: str, query: str) -> Dict[str, Any]:
+def _build_source_evidence_from_docs(docs: List[Document]) -> List[Dict[str, Any]]:
+    """从实际命中的私有文档中提取来源证据，避免直接回传整个来源列表。"""
+    source_map: Dict[str, Dict[str, Any]] = {}
+    for doc in docs:
+        if not isinstance(doc, Document):
+            continue
+        metadata = doc.metadata or {}
+        source_id = str(metadata.get("source_id") or "").strip()
+        if not source_id:
+            continue
+        current = source_map.get(source_id)
+        if not current:
+            # 这里刻意只回传“命中的来源集合”，而不是整个知识库来源列表。
+            # 主流程调试区需要回答“这次检索到底命中了哪些来源”，不是“库里一共有多少来源”。
+            current = {
+                "source_id": source_id,
+                "source_type": str(metadata.get("source_type") or "unknown"),
+                "source_platform": str(metadata.get("source_platform") or "unknown"),
+                "source_url": str(metadata.get("source_url") or metadata.get("source") or ""),
+                "ingest_status": str(metadata.get("ingest_status") or "parsed"),
+                "hit_count": 0,
+                "hit_chunk_ids": [],
+            }
+            source_map[source_id] = current
+        current["hit_count"] = int(current.get("hit_count") or 0) + 1
+        chunk_id = str(metadata.get("chunk_id") or "").strip()
+        if chunk_id and chunk_id not in current["hit_chunk_ids"]:
+            current["hit_chunk_ids"].append(chunk_id)
+    return sorted(list(source_map.values()), key=lambda item: (-int(item.get("hit_count") or 0), str(item.get("source_id") or "")))
+
+
+def _search_private_knowledge_docs(knowledge_base_id: str, query: str, k: int = 14) -> List[Document]:
     kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
     store = _get_knowledge_store()
     store.switch_collection(kb_info["collection_name"], create_if_missing=False)
-    related_docs = store.similarity_search(query, k=14)
+    related_docs = store.similarity_search(query, k=k)
     social_docs: List[Document] = []
     other_docs: List[Document] = []
     for doc in related_docs:
@@ -937,7 +1277,12 @@ def _build_private_knowledge_evidence(knowledge_base_id: str, query: str) -> Dic
             social_docs.append(doc)
         else:
             other_docs.append(doc)
-    ordered_docs = (social_docs + other_docs)[:10]
+    return (social_docs + other_docs)[:10]
+
+
+def _build_private_knowledge_evidence(knowledge_base_id: str, query: str) -> Dict[str, Any]:
+    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+    ordered_docs = _search_private_knowledge_docs(knowledge_base_id, query, k=14)
     summary_items: List[Dict[str, Any]] = []
     body_items: List[Dict[str, Any]] = []
     for index, doc in enumerate(ordered_docs):
@@ -1810,7 +2155,7 @@ async def _run_flow_stream(
             )
         elif tool_query and not allow_public_fusion:
             logger.info("flow_tool_skipped_private_only message_id=%s reason=knowledge_scope_private_only", message_id)
-        kb_context_texts = _build_knowledge_context_texts(
+        kb_context_texts, kb_context_docs = _build_knowledge_context_payload(
             payload.knowledge_base_id,
             payload.destination,
             payload.days,
@@ -1821,18 +2166,7 @@ async def _run_flow_stream(
         merged_context_texts.extend(kb_context_texts)
         if kb_context_texts:
             metrics["rag_hit"] = True
-            collection_name = _to_collection_name(payload.knowledge_base_id or "")
-            source_entries = _load_collection_source_entries(collection_name)
-            source_evidence = [
-                {
-                    "source_id": str(item.get("source_id") or ""),
-                    "source_type": str(item.get("source_type") or "unknown"),
-                    "source_platform": str(item.get("source_platform") or "unknown"),
-                    "source_url": str(item.get("source_url") or ""),
-                    "ingest_status": str(item.get("ingest_status") or "parsed"),
-                }
-                for item in source_entries[:8]
-            ]
+            source_evidence = _build_source_evidence_from_docs(kb_context_docs)
         logger.info(
             "flow_private_context message_id=%s kb_context_count=%s source_evidence_count=%s",
             message_id,
@@ -2686,6 +3020,45 @@ async def upload_knowledge_document(knowledge_base_id: str, file: UploadFile = F
     )
 
 
+@app.post("/api/knowledge/preprocess/url", response_model=KnowledgePreprocessUrlResponse)
+def preprocess_knowledge_url(payload: KnowledgePreprocessUrlRequest) -> KnowledgePreprocessUrlResponse:
+    url = str(payload.url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url 不能为空")
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise HTTPException(status_code=400, detail="url 必须是可公开访问的 http/https 链接")
+    # preprocess 只做“预判”，不会真正入库。
+    # 它承担的是前端即时反馈：平台识别、短链解跳、风险等级、自动解析成功概率等。
+    preprocess_payload = preprocess_url(url, timeout=5)
+    resolved_url = str(preprocess_payload.get("resolved_url") or "")
+    source_platform = str(preprocess_payload.get("source_platform") or "unknown")
+    source_risk_level = str(preprocess_payload.get("source_risk_level") or "low")
+    resolve_error_code = str(preprocess_payload.get("resolve_error_code") or "").strip() or None
+    auto_parse_preview = _run_url_auto_parse_preview(
+        resolved_url=resolved_url or str(preprocess_payload.get("normalized_url") or ""),
+        source_platform=source_platform,
+        source_risk_level=source_risk_level,
+        resolve_error_code=resolve_error_code,
+    )
+    return KnowledgePreprocessUrlResponse(
+        success=True,
+        normalized_url=str(preprocess_payload.get("normalized_url") or ""),
+        resolved_url=resolved_url,
+        source_platform=source_platform,
+        source_risk_level=source_risk_level,
+        resolve_error_code=resolve_error_code,
+        extractor_layer=auto_parse_preview.get("extractor_layer"),
+        quality_score=auto_parse_preview.get("quality_score"),
+        ingest_error_code=auto_parse_preview.get("ingest_error_code"),
+        failure_reason=auto_parse_preview.get("failure_reason"),
+        content_lang=auto_parse_preview.get("content_lang"),
+        requires_user_assist=bool(auto_parse_preview.get("requires_user_assist")),
+        parsed_content_preview=str(auto_parse_preview.get("parsed_content_preview") or ""),
+        parsed_content_chars=int(auto_parse_preview.get("parsed_content_chars") or 0),
+    )
+
+
 @app.post("/api/knowledge/bases/{knowledge_base_id}/ingest/url", response_model=KnowledgeIngestUrlResponse)
 def ingest_knowledge_url(knowledge_base_id: str, payload: KnowledgeIngestUrlRequest) -> KnowledgeIngestUrlResponse:
     kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
@@ -2704,44 +3077,106 @@ def ingest_knowledge_url(knowledge_base_id: str, payload: KnowledgeIngestUrlRequ
     ocr_text = str(payload.ocr_text or "").strip()
     if mode == "manual" and not manual_text and not ocr_text:
         raise HTTPException(status_code=400, detail="manual 模式下需提供 manual_text 或 ocr_text")
+    # 先做 URL 规范化与解跳，后续去重、平台判断、落库 metadata 都基于这组标准字段，
+    # 避免同一条内容因为短链/追踪参数不同被重复导入。
+    preprocess_payload = preprocess_url(url, timeout=5)
+    normalized_url = str(preprocess_payload.get("normalized_url") or url)
+    resolved_url = str(preprocess_payload.get("resolved_url") or normalized_url)
+    platform = str(preprocess_payload.get("source_platform") or _infer_source_platform(resolved_url))
+    source_risk_level = str(preprocess_payload.get("source_risk_level") or "low")
+    resolve_error_code = str(preprocess_payload.get("resolve_error_code") or "").strip() or None
     store = _get_knowledge_store()
     store.switch_collection(collection_name, create_if_missing=False)
-    platform = _infer_source_platform(url)
     ingest_status = "failed"
-    ingest_error_code = "INGEST_EMPTY_CONTENT"
+    ingest_error_code = resolve_error_code or "INGEST_EMPTY_CONTENT"
     source_type = "url"
     content_text = ""
+    extractor_layer: Optional[str] = None
+    quality_score: Optional[int] = None
     source_metadata: Dict[str, Any] = {}
+    auto_parse_preview: Dict[str, Any] = {}
+    if _exists_source_url(collection_name, resolved_url):
+        # 即使是重复来源，也写一条失败来源记录。
+        # 这样前端可以给用户明确反馈“这条链接已导入过”，同时保留失败原因与来源追踪。
+        source_metadata = _build_source_metadata(
+            knowledge_base_id=normalized_id,
+            source_url=url,
+            source_type=source_type,
+            source_platform=platform,
+            ingest_mode=mode,
+            ingest_status="failed",
+            ingest_error_code="AUTO_PARSE_DUPLICATED",
+            normalized_url=normalized_url,
+            resolved_url=resolved_url,
+            source_risk_level=source_risk_level,
+            extractor_layer=extractor_layer,
+            quality_score=quality_score,
+        )
+        _upsert_failed_source_entry(source_metadata, parsed_preview_text="", parsed_chars=0)
+        return KnowledgeIngestUrlResponse(
+            success=False,
+            ingest_status="failed",
+            chunks_count=0,
+            metadata=source_metadata,
+            parsed_content_preview="",
+            parsed_content_chars=0,
+        )
     if mode == "manual":
+        # manual 模式本质上是“跳过自动解析，直接走用户提供的正文/OCR 文本入库”，
+        # 所以状态记为 fallback，用来和真正自动解析成功的 parsed 区分。
         content_text = manual_text or ocr_text
         source_type = "manual" if manual_text else "ocr"
         ingest_status = "fallback"
         ingest_error_code = None
+        extractor_layer = "manual" if manual_text else "ocr"
+        manual_quality = validate_content_quality(content_text, {"source_platform": platform})
+        quality_score = int(manual_quality.get("quality_score") or 0)
     else:
-        crawler = ContentCrawler(max_workers=1, timeout=10)
-        crawl_results = crawler.fetch_urls([url])
-        if crawl_results and isinstance(crawl_results[0], dict):
-            parsed_item = crawl_results[0]
-            content_text = str(parsed_item.get("content") or "").strip()
-            if content_text:
-                ingest_status = "parsed"
-                ingest_error_code = None
-                logger.info(
-                    "knowledge_ingest_url_auto_parse kb=%s platform=%s url=%s content_chars=%s preview=%s",
-                    normalized_id,
-                    platform,
-                    url,
-                    len(content_text),
-                    _build_text_preview(content_text, 260),
-                )
+        # auto 模式先走统一的预解析+质量门禁，再决定 parsed / failed / fallback。
+        # 这里的 fallback 表示“自动解析失败，但用户同时补了手动文本，所以仍然允许导入”。
+        auto_parse_preview = _run_url_auto_parse_preview(
+            resolved_url=resolved_url,
+            source_platform=platform,
+            source_risk_level=source_risk_level,
+            resolve_error_code=resolve_error_code,
+        )
+        content_text = str(auto_parse_preview.get("content_text") or "")
+        extractor_layer = str(auto_parse_preview.get("extractor_layer") or "").strip() or None
+        quality_score = auto_parse_preview.get("quality_score")
+        if bool(auto_parse_preview.get("is_valid")):
+            ingest_status = "parsed"
+            ingest_error_code = None
+            logger.info(
+                "knowledge_ingest_url_auto_parse kb=%s platform=%s url=%s content_chars=%s preview=%s layer=%s quality_score=%s",
+                normalized_id,
+                platform,
+                resolved_url,
+                len(content_text),
+                _build_text_preview(content_text, 260),
+                extractor_layer,
+                quality_score,
+            )
+        else:
+            ingest_status = "failed"
+            ingest_error_code = str(auto_parse_preview.get("ingest_error_code") or ingest_error_code or "AUTO_PARSE_LOW_QUALITY")
         if not content_text and (manual_text or ocr_text):
             content_text = manual_text or ocr_text
             source_type = "manual" if manual_text else "ocr"
             ingest_status = "fallback"
-            ingest_error_code = "AUTO_PARSE_EMPTY_FALLBACK"
+            ingest_error_code = ingest_error_code or "AUTO_PARSE_EMPTY_FALLBACK"
+            extractor_layer = "manual" if manual_text else "ocr"
+            manual_quality = validate_content_quality(content_text, {"source_platform": platform})
+            quality_score = int(manual_quality.get("quality_score") or 0)
+        elif ingest_status == "failed" and (manual_text or ocr_text):
+            content_text = manual_text or ocr_text
+            source_type = "manual" if manual_text else "ocr"
+            ingest_status = "fallback"
+            extractor_layer = "manual" if manual_text else "ocr"
+            manual_quality = validate_content_quality(content_text, {"source_platform": platform})
+            quality_score = int(manual_quality.get("quality_score") or 0)
         elif not content_text:
             ingest_status = "failed"
-            ingest_error_code = "AUTO_PARSE_EMPTY"
+            ingest_error_code = ingest_error_code or "AUTO_PARSE_EMPTY"
     source_metadata = _build_source_metadata(
         knowledge_base_id=normalized_id,
         source_url=url,
@@ -2750,7 +3185,16 @@ def ingest_knowledge_url(knowledge_base_id: str, payload: KnowledgeIngestUrlRequ
         ingest_mode=mode,
         ingest_status=ingest_status,
         ingest_error_code=ingest_error_code,
+        normalized_url=normalized_url,
+        resolved_url=resolved_url,
+        source_risk_level=source_risk_level,
+        extractor_layer=extractor_layer,
+        quality_score=quality_score,
     )
+    if ingest_status == "failed":
+        source_metadata["failure_reason"] = str(
+            auto_parse_preview.get("failure_reason") if mode == "auto" else (ingest_error_code or "INGEST_FAILED")
+        )
     if ingest_status == "failed":
         logger.warning(
             "knowledge_ingest_url_failed kb=%s platform=%s url=%s error_code=%s",
@@ -2760,6 +3204,9 @@ def ingest_knowledge_url(knowledge_base_id: str, payload: KnowledgeIngestUrlRequ
             ingest_error_code,
         )
         failed_preview = _build_text_preview(content_text, 3000) if content_text else ""
+        # 失败时不写向量分块，但必须把失败来源写进 registry，
+        # 否则用户下一次进入页面会看不到这条失败记录，也就没法原位重试。
+        _upsert_failed_source_entry(source_metadata, parsed_preview_text=failed_preview, parsed_chars=len(content_text))
         return KnowledgeIngestUrlResponse(
             success=False,
             ingest_status="failed",
@@ -2778,6 +3225,8 @@ def ingest_knowledge_url(knowledge_base_id: str, payload: KnowledgeIngestUrlRequ
         len(content_text),
         _build_text_preview(content_text, 260),
     )
+    # 当前仍按“单条长文本交给向量库内部切分”的方式入库。
+    # source_id / ingest_status / parsed_preview 等 metadata 会复制到所有分块上，供后续聚合与调试使用。
     added_chunks = store.add_documents(
         [
             {
@@ -2795,6 +3244,7 @@ def ingest_knowledge_url(knowledge_base_id: str, payload: KnowledgeIngestUrlRequ
         failed_metadata = dict(source_metadata)
         failed_metadata["ingest_status"] = "failed"
         failed_metadata["ingest_error_code"] = "VECTOR_STORE_INSERT_FAILED"
+        _upsert_failed_source_entry(failed_metadata, parsed_preview_text=parsed_preview_text, parsed_chars=parsed_chars)
         logger.error(
             "knowledge_ingest_url_store_failed kb=%s source_id=%s url=%s",
             normalized_id,
@@ -2809,6 +3259,8 @@ def ingest_knowledge_url(knowledge_base_id: str, payload: KnowledgeIngestUrlRequ
             parsed_content_preview=parsed_preview_text,
             parsed_content_chars=parsed_chars,
         )
+    # 成功入库后要把同 source_id 的失败记录清掉，避免来源列表同时出现“失败记录 + 成功记录”。
+    _delete_failed_source_entry(normalized_id, str(source_metadata.get("source_id") or ""))
     logger.info(
         "knowledge_ingest_url_store_success kb=%s source_id=%s ingest_status=%s chunks=%s",
         normalized_id,
@@ -2848,7 +3300,7 @@ def list_knowledge_sources(knowledge_base_id: str) -> KnowledgeSourceListRespons
                 collection_name,
                 str(exc),
             )
-    source_entries = _load_collection_source_entries(collection_name)
+    source_entries = _load_collection_source_entries(collection_name, normalized_id)
     social_entries = [
         item
         for item in source_entries
@@ -2888,7 +3340,7 @@ def knowledge_debug_snapshot() -> KnowledgeDebugSnapshotResponse:
     debug_items: List[KnowledgeDebugBaseItem] = []
     for record in records:
         collection_name = str(record.get("collection_name") or "")
-        source_entries = _load_collection_debug_entries(collection_name) if collection_name else []
+        source_entries = _load_collection_debug_entries(collection_name, str(record.get("knowledge_base_id") or "")) if collection_name else []
         last_updated_at = None
         ingest_times = [str(item.get("ingested_at") or "").strip() for item in source_entries]
         ingest_times = [value for value in ingest_times if value]
@@ -2920,16 +3372,16 @@ def delete_knowledge_source(knowledge_base_id: str, source_id: str) -> Knowledge
     kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
     normalized_id = kb_info["knowledge_base_id"]
     collection_name = kb_info["collection_name"]
-    source_entries = _load_collection_source_entries(collection_name)
+    source_entries = _load_collection_source_entries(collection_name, normalized_id)
     matched_entry = next((item for item in source_entries if str(item.get("source_id") or "") == str(source_id or "")), None)
     if not matched_entry:
         raise HTTPException(status_code=404, detail="来源不存在")
     chunk_ids = [str(item) for item in (matched_entry.get("chunk_ids") or []) if str(item).strip()]
-    if not chunk_ids:
-        raise HTTPException(status_code=404, detail="来源无可删除分块")
-    store = _get_knowledge_store()
-    store.switch_collection(collection_name, create_if_missing=False)
-    store.vector_db.delete(ids=chunk_ids)
+    if chunk_ids:
+        store = _get_knowledge_store()
+        store.switch_collection(collection_name, create_if_missing=False)
+        store.vector_db.delete(ids=chunk_ids)
+    _delete_failed_source_entry(normalized_id, str(source_id))
     return KnowledgeSourceDeleteResponse(
         knowledge_base_id=normalized_id,
         source_id=str(source_id),
@@ -2948,9 +3400,14 @@ def update_knowledge_source(knowledge_base_id: str, source_id: str, payload: Kno
     if not normalized_source_id:
         raise HTTPException(status_code=400, detail="source_id 不能为空")
     updated_content = str(payload.content or "").strip()
+    updated_ocr_text = str(payload.ocr_text or "").strip()
+    # 重试入口允许“正文 + OCR/字幕补充”拼接后一起入库，
+    # 这样用户可以在不覆盖原手工整理文本的情况下补充识别结果。
+    if updated_ocr_text:
+        updated_content = "\n".join([item for item in [updated_content, updated_ocr_text] if item]).strip()
     if not updated_content:
         raise HTTPException(status_code=400, detail="content 不能为空")
-    source_entries = _load_collection_source_entries(collection_name)
+    source_entries = _load_collection_source_entries(collection_name, normalized_id)
     matched_entry = next((item for item in source_entries if str(item.get("source_id") or "") == normalized_source_id), None)
     if not matched_entry:
         raise HTTPException(status_code=404, detail="来源不存在")
@@ -2967,17 +3424,33 @@ def update_knowledge_source(knowledge_base_id: str, source_id: str, payload: Kno
     if chunk_ids:
         store.vector_db.delete(ids=chunk_ids)
     # 复用原来源标识并替换正文，保证前端列表与检索引用稳定。
+    retry_count = int(matched_entry.get("retry_count") or 0) + 1
+    last_retry_at = datetime.now().isoformat()
+    source_type = str(matched_entry.get("source_type") or "manual")
+    if updated_ocr_text and not str(payload.content or "").strip():
+        source_type = "ocr"
+    quality_payload = validate_content_quality(updated_content, {"source_platform": str(matched_entry.get("source_platform") or "unknown")})
     source_metadata = _build_source_metadata(
         knowledge_base_id=normalized_id,
         source_url=str(payload.source_url or matched_entry.get("source_url") or "").strip(),
-        source_type=str(matched_entry.get("source_type") or "manual"),
+        source_type=source_type,
         source_platform=str(matched_entry.get("source_platform") or "unknown"),
         ingest_mode="manual",
         ingest_status="fallback",
         source_id=normalized_source_id,
         author=matched_entry.get("author"),
         expires_at=matched_entry.get("expires_at"),
+        normalized_url=matched_entry.get("normalized_url"),
+        resolved_url=matched_entry.get("resolved_url"),
+        source_risk_level=matched_entry.get("source_risk_level"),
+        extractor_layer="ocr" if source_type == "ocr" else "manual",
+        quality_score=int(quality_payload.get("quality_score") or 0),
     )
+    # retry_count / last_retry_at 只在“原位修复失败来源”时增长，
+    # 便于后续从调试快照中看出这条来源经历过多少次人工补救。
+    source_metadata["retry_count"] = retry_count
+    source_metadata["last_retry_at"] = last_retry_at
+    source_metadata["failure_reason"] = None
     parsed_preview_text = _build_text_preview(updated_content, 3000)
     parsed_chars = len(updated_content)
     added_chunks = store.add_documents(
@@ -2995,6 +3468,7 @@ def update_knowledge_source(knowledge_base_id: str, source_id: str, payload: Kno
     )
     if added_chunks <= 0:
         raise HTTPException(status_code=500, detail="来源更新失败")
+    _delete_failed_source_entry(normalized_id, normalized_source_id)
     logger.info(
         "knowledge_source_update_done kb=%s source_id=%s new_chunks=%s content_chars=%s",
         normalized_id,
@@ -3025,20 +3499,10 @@ def knowledge_search(payload: KnowledgeSearchRequest) -> KnowledgeSearchResponse
         raise HTTPException(status_code=400, detail="private_only 模式下必须选择 knowledge_base_id")
     allow_public_fusion = scope != "private_only"
     source_evidence: List[Dict[str, Any]] = []
-    if knowledge_base_id:
-        collection_name = _to_collection_name(knowledge_base_id)
-        source_entries = _load_collection_source_entries(collection_name)
-        source_evidence = [
-            {
-                "source_id": str(item.get("source_id") or ""),
-                "source_type": str(item.get("source_type") or "unknown"),
-                "source_platform": str(item.get("source_platform") or "unknown"),
-                "source_url": str(item.get("source_url") or ""),
-                "ingest_status": str(item.get("ingest_status") or "parsed"),
-            }
-            for item in source_entries[:12]
-        ]
     rag_pipeline = _get_rag_pipeline()
+    private_docs = _search_private_knowledge_docs(knowledge_base_id, query, k=14) if knowledge_base_id else []
+    if private_docs:
+        source_evidence = _build_source_evidence_from_docs(private_docs)
     private_evidence = (
         _build_private_knowledge_evidence(knowledge_base_id, query)
         if knowledge_base_id

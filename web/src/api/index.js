@@ -21,6 +21,7 @@ export {
   generateKnowledgeAnswer,
   getKnowledgeDebugSnapshot,
   ingestKnowledgeUrl,
+  preprocessKnowledgeUrl,
   listKnowledgeBases,
   listKnowledgeSources,
   searchKnowledge,
