@@ -197,6 +197,8 @@ class KnowledgePreprocessUrlRequest(BaseModel):
 
 
 class KnowledgePreprocessUrlResponse(BaseModel):
+    # v0.0.6 的 preprocess 响应不只是“平台识别结果”，
+    # 还承担“导入前预判自动解析成功率”的职责，所以会把 extractor/quality/error 全量透传给前端。
     success: bool = Field(..., description="是否预处理成功")
     normalized_url: str = Field("", description="规范化链接")
     resolved_url: str = Field("", description="解跳后的链接")
@@ -214,6 +216,8 @@ class KnowledgePreprocessUrlResponse(BaseModel):
 
 
 class KnowledgeIngestUrlResponse(BaseModel):
+    # 导入结果需要同时覆盖三条路径：
+    # parsed=自动解析成功，fallback=人工补录后成功，failed=未入库但保留失败来源供后续重试。
     success: bool = Field(..., description="是否导入成功")
     ingest_status: str = Field(..., description="导入状态 parsed/fallback/failed")
     chunks_count: int = Field(0, description="入库分块数")
@@ -223,6 +227,8 @@ class KnowledgeIngestUrlResponse(BaseModel):
 
 
 class KnowledgeSourceItem(BaseModel):
+    # 来源列表不是单纯的“已入库 chunk 列表”，
+    # 它还会合并 registry 中的失败来源快照，形成前端可直接展示/删除/重试的统一来源视图。
     source_id: str = Field(..., description="来源唯一标识")
     source_type: str = Field(..., description="来源类型")
     source_platform: str = Field(..., description="来源平台")
@@ -393,17 +399,23 @@ class TripUpdateResponse(BaseModel):
 
 
 class ReplanScope(BaseModel):
+    # v0.0.6 的局部重排支持“按天 + 按半天范围”两级粒度，
+    # 前端传 morning/afternoon/evening 后，后端只替换对应时间段的行程项。
     day: int = Field(..., description="目标重排天（1-indexed）")
     time_range: Optional[str] = Field(None, description="重排范围：morning/afternoon/evening，None=整天")
 
 
 class AgentEscalationInfo(BaseModel):
+    # 当前的 escalation 更接近“相邻天联动说明 + 最小联动修补结果”，
+    # 不是完整的 LangGraph 子图执行结果。
     escalated: bool = Field(False, description="是否触发相邻天联动重排")
     reasons: List[str] = Field(default_factory=list, description="触发原因列表")
     message: str = Field("", description="面向用户的说明文本")
 
 
 class TripReplanDayRequest(BaseModel):
+    # day 保留旧版整天重排兼容；scope 存在时优先使用 scope.day/time_range。
+    # locked_days / replan_instruction / constraints 则共同约束“允许怎么改、哪些地方绝对不能动”。
     user_id: str = Field(..., description="用户唯一ID")
     device_id: str = Field(..., description="设备唯一ID")
     session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
@@ -415,6 +427,8 @@ class TripReplanDayRequest(BaseModel):
 
 
 class TripReplanDayResponse(BaseModel):
+    # 返回的不只是重排后的 trip_data，还会显式说明：
+    # 这次到底改了哪一段、是否触发了相邻天联动、重排后冲突有没有变化。
     session_id: str = Field(..., description="会话ID")
     trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
     replanned_scope: Dict[str, Any] = Field(default_factory=dict, description="实际重排范围")
@@ -893,6 +907,8 @@ def _build_source_metadata(
     quality_score: Optional[int] = None,
 ) -> Dict[str, Any]:
     """构造来源 metadata，统一字段协议。"""
+    # 所有导入路径最终都落到同一套 metadata 协议上，
+    # 这样来源列表、source_evidence、删除撤回、失败重试都能共享同一组字段。
     return {
         "knowledge_base_id": knowledge_base_id,
         "source_id": source_id or f"src_{uuid4().hex}",
@@ -1439,6 +1455,8 @@ def _normalize_daily_plan(trip_data: Dict[str, Any]) -> Dict[str, List[Dict[str,
 
 
 def _normalize_locked_days(locked_days: List[int], target_day: int) -> List[int]:
+    # locked_days 需要先清洗成一个稳定集合：
+    # 过滤非法值、去重，并排除当前目标天，避免出现“同一天既要重排又要锁定”的矛盾输入。
     normalized: List[int] = []
     for value in locked_days or []:
         try:
@@ -1452,6 +1470,8 @@ def _normalize_locked_days(locked_days: List[int], target_day: int) -> List[int]
 
 
 def _parse_time_range_minutes(time_text: Any) -> Tuple[Optional[int], Optional[int]]:
+    # 局部重排 merge 依赖“行程项是否落在某个 scope 内”，
+    # 所以先把 09:00-10:30 这种字符串解析成可比较的分钟区间。
     match = re.match(r"^\s*(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})\s*$", str(time_text or ""))
     if not match:
         return None, None
@@ -1463,6 +1483,8 @@ def _parse_time_range_minutes(time_text: Any) -> Tuple[Optional[int], Optional[i
 
 
 def _resolve_scope_bounds(time_range: Optional[str]) -> Tuple[int, int]:
+    # 把 morning / afternoon / evening 收敛成固定时间边界，
+    # 让后面的 overlap / merge 判断都走统一规则，而不是依赖 prompt 里的自然语言理解。
     scope = str(time_range or "").strip().lower()
     if scope == "morning":
         return 0, 12 * 60
@@ -1474,6 +1496,8 @@ def _resolve_scope_bounds(time_range: Optional[str]) -> Tuple[int, int]:
 
 
 def _item_overlaps_scope(item: Dict[str, Any], time_range: Optional[str]) -> bool:
+    # overlap 判断是局部替换的关键：
+    # 命中 scope 的旧 item 可以被替换，未命中的旧 item 必须保留。
     if not time_range:
         return True
     start_minutes, end_minutes = _parse_time_range_minutes(item.get("time"))
@@ -1484,6 +1508,8 @@ def _item_overlaps_scope(item: Dict[str, Any], time_range: Optional[str]) -> boo
 
 
 def _sort_day_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # 同一天的数据在 merge 后会混合“原始项 + 新生成项”，
+    # 这里统一按开始时间重排，避免前端渲染顺序被局部替换打乱。
     def _sort_key(item: Dict[str, Any]) -> Tuple[int, int]:
         start_minutes, end_minutes = _parse_time_range_minutes(item.get("time"))
         return (
@@ -1499,6 +1525,8 @@ def _merge_day_items_by_scope(
     replanned_items: List[Dict[str, Any]],
     time_range: Optional[str],
 ) -> List[Dict[str, Any]]:
+    # 这是 v0.0.6 局部重排的核心 merge 策略：
+    # 整天重排时直接使用新结果；半天重排时仅替换落在目标 scope 内的项，其余时段保持原样。
     if not time_range:
         return _sort_day_items(replanned_items)
     kept_items = [item for item in original_items if isinstance(item, dict) and not _item_overlaps_scope(item, time_range)]
@@ -1524,6 +1552,8 @@ def _build_replan_context(
     locked_days: List[int],
     replan_instruction: str,
 ) -> List[str]:
+    # 这里把“当前完整行程、目标天原始内容、锁定天原始内容、用户补充说明”
+    # 明确拼成上下文块，帮助模型理解这次是受限范围内的局部重排，而不是重新生成整趟旅行。
     daily_plan = _normalize_daily_plan(current_trip)
     current_day_items = daily_plan.get(str(target_day)) or []
     context_blocks = [
@@ -1546,6 +1576,8 @@ def _detect_replan_escalation(
     time_range: Optional[str],
     locked_days: List[int],
 ) -> Dict[str, Any]:
+    # 当前版本先用启发式规则识别最常见的跨天依赖，
+    # 例如跨城衔接、过早出发、前一晚结束过晚等，再决定是否对前后相邻天做最小联动。
     daily_plan = _normalize_daily_plan(current_trip)
     total_days = len(daily_plan)
     fallback_city = str(current_trip.get("destination") or "").strip()
@@ -1672,6 +1704,9 @@ def _build_flow_query_text(payload: FlowStreamRequest) -> str:
 
 
 def _normalize_trip_constraints(payload_like: Any) -> Dict[str, Any]:
+    # 约束输入会同时来自三类来源：主流程表单、已有 trip_data、局部重排/编辑透传。
+    # 这里统一做枚举兜底和 special_constraints 规范化，保证后续 prompt 注入、状态判定、
+    # conflict 检测都读取同一套稳定结构。
     if isinstance(payload_like, dict):
         getter = lambda key, default=None: payload_like.get(key, default)
     else:
@@ -1726,6 +1761,8 @@ def _parse_time_hour_range(time_text: str) -> Tuple[Optional[int], Optional[int]
 
 
 def _build_constraint_statuses(trip_data: Optional[Dict[str, Any]], constraints: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # constraints_satisfied 是 v0.0.6 面向前端可视化的“启发式满足状态”，
+    # 目标是告诉用户“当前结果大致有没有遵守你的约束”，而不是给出地图级精确验证。
     if not isinstance(trip_data, dict):
         return []
     daily_plan = trip_data.get("daily_plan") or {}
@@ -1793,6 +1830,8 @@ def _build_constraint_statuses(trip_data: Optional[Dict[str, Any]], constraints:
     pace = str(constraints.get("pace") or "cultural")
     special = constraints.get("special_constraints") or {}
 
+    # 预算、强度、节奏、特殊约束分别走独立的启发式规则，
+    # 最终统一输出为 ConstraintStatus 列表，供 finalize payload 和 TripTab 直接消费。
     if budget_level == "economy":
         public_ratio = (public_transport_hits / total_transport_segments) if total_transport_segments > 0 else 0
         budget_status = "met" if public_ratio >= 0.5 and taxi_hits == 0 else ("partially_met" if public_ratio >= 0.35 else "violated")
@@ -2480,6 +2519,8 @@ async def _run_flow_stream(
             "special_constraints": constraints_used["special_constraints"],
         }
     )
+    # 主流程会把约束先归一化再注入 user_input；
+    # 这样生成、修改、冲突检测、终态回传始终围绕同一份 constraints_used 工作。
     merged_context_texts = list(payload.context_texts or [])
     response_text = ""
     source_evidence: List[Dict[str, Any]] = []
@@ -2742,12 +2783,15 @@ async def _run_flow_stream(
 
         if trip_data:
             if isinstance(trip_data, dict):
+                # trip_data 生成成功后，先做“约束满足状态”判定，再做“冲突检测与替代方案生成”；
+                # 两者都会回写到 trip_data，并在 finalize 事件中透传给前端。
                 constraints_satisfied = _build_constraint_statuses(trip_data, constraints_used)
                 generated_conflict_report = llm_manager.build_conflict_report(trip_data, constraints_used)
                 conflict_report = generated_conflict_report.model_dump()
                 metrics["conflict_detected"] = bool(conflict_report.get("has_conflicts"))
                 metrics["plan_alternative_generated"] = bool(conflict_report.get("alternatives"))
                 if conflict_report.get("has_conflicts"):
+                    # warning 事件是冲突区域的前置提示，目的是让前端在 finalize 之前就能高亮风险并准备展示替代方案。
                     last_sequence += 1
                     await _append_flow_event(
                         message_id,
@@ -2822,6 +2866,8 @@ async def _run_flow_stream(
                     "trip_data": trip_data,
                     "response_text": response_text,
                     "metrics": metrics,
+                    # finalize payload 统一回传三类与 v0.0.6 强相关的派生结果：
+                    # 实际采用的约束、约束满足状态、冲突检测报告。
                     "constraints_used": constraints_used,
                     "constraints_satisfied": constraints_satisfied,
                     "conflict_report": conflict_report,
@@ -3373,19 +3419,41 @@ def update_trip(payload: TripUpdateRequest) -> TripUpdateResponse:
 
 @app.post("/api/trip/replan_day", response_model=TripReplanDayResponse)
 def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
+    # 这条链路不是“把第 N 天整天覆盖写回”这么简单，
+    # 而是先生成候选结果，再按 scope merge，必要时只对前后相邻天做最小联动修补，
+    # 最后对 locked_days 做硬回退，并重算约束满足状态与 conflict_report。
+    # 下面这段实现可以按 6 个阶段理解：
+    # 1) 解析本次重排的目标范围（哪一天、整天还是半天）
+    # 2) 归一化锁定天与约束，构造给 LLM 的受限重排输入
+    # 3) 让 LLM 生成一份“候选重排行程”
+    # 4) 只把候选结果 merge 回允许变动的时间段，而不是整份行程整表覆盖
+    # 5) 若检测到相邻天依赖，只对相邻天的最小必要时间段做二次 merge
+    # 6) 对 locked_days 做最终硬回退，然后重算约束满足状态与冲突报告
     session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
+    # 会话里的 trip_data 才是本次局部重排的“原始基线”。
+    # 后面的所有 merge、锁定回退、冲突重算都围绕这份 current_trip 展开。
     storage = _get_storage()
     current_trip = storage.get_trip_data(session_id)
     if not current_trip:
         raise HTTPException(status_code=404, detail="当前会话未找到行程数据")
+    # scope 优先于旧版 day：如果前端传了更细粒度的 scope，就以 scope.day 作为目标天；
+    # 否则退化成旧版“整天重排”的 day。
     scope_day = int(payload.scope.day) if payload.scope else int(payload.day)
+    # 把前端的 time_range 清洗成统一的小写枚举，便于后面判断 morning/afternoon/evening。
     scope_time_range = str(payload.scope.time_range or "").strip().lower() if payload.scope else ""
     if scope_time_range not in {"", "morning", "afternoon", "evening"}:
         raise HTTPException(status_code=400, detail="time_range 仅支持 morning/afternoon/evening")
+    # None 表示整天重排；具体字符串则表示只改某个半天范围。
     time_range = scope_time_range or None
+    # locked_days 会过滤非法值、去重，并排除当前目标天本身，
+    # 避免出现“既要重排第 N 天，又锁定第 N 天”的矛盾请求。
     locked_days = _normalize_locked_days(payload.locked_days, scope_day)
     llm_manager = _get_llm_manager()
+    # 约束优先用本次请求显式透传的 constraints；如果没有，再回退到当前行程里已生效的 constraints_used。
+    # 这样局部重排会延续用户原先的预算/强度/节奏要求，而不是裸跑一次新的重排行程。
     normalized_constraints = _normalize_trip_constraints(payload.constraints or current_trip.get("constraints_used") or {})
+    # user_input 是喂给 generate_trip 的结构化输入基座：
+    # 目的地/天数/预算/偏好来自当前行程，结构化约束来自 normalized_constraints。
     user_input = {
         "destination": current_trip.get("destination", "成都"),
         "days": current_trip.get("days", 3),
@@ -3398,12 +3466,16 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
     }
     # 这里把“目标范围 / 锁定天 / 用户补充指令”全部压进 edit_cmd，
     # 让 LLM 在重排时有明确边界，避免把局部修改误扩散到全行程。
+    # edit_cmd 更像是“本次重排任务说明”，告诉模型：
+    # 目标是第几天、哪个时间段、哪些天绝对不能动、用户额外补充了什么要求。
     scope_label_map = {
         "morning": "上午",
         "afternoon": "下午",
         "evening": "晚间",
     }
+    # scope_label 只用于拼接更自然的中文任务描述，提升模型理解局部范围的稳定性。
     scope_label = scope_label_map.get(time_range, "整天")
+    # 用户在弹窗里输入的自然语言补充要求，例如“下午尽量轻松一点”或“保留晚餐安排”。
     replan_instruction = str(payload.replan_instruction or "").strip()
     edit_cmd = {
         "type": "modify",
@@ -3412,6 +3484,9 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
         "locked_days": locked_days,
         "replan_instruction": replan_instruction,
     }
+    # 除了 edit_cmd 外，再单独补一份结构化上下文，降低模型误改非目标范围的概率。
+    # 这份上下文会把当前完整行程、目标天原始安排、锁定天内容一起告诉模型，
+    # 等于同时给模型“任务说明 + 原始参考材料”两层约束。
     replan_context = _build_replan_context(
         current_trip=current_trip,
         target_day=scope_day,
@@ -3426,33 +3501,98 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
         time_range or "full_day",
         locked_days,
     )
+    # 这里拿到的是“模型认为应该如何重排”的候选结果，它可能：
+    # 1) 只改了目标天
+    # 2) 顺手改了相邻天
+    # 3) 甚至误改了锁定天
+    # 所以后面绝不能直接整份覆盖 current_trip，而必须经过受控 merge。
     replanned_trip = llm_manager.generate_trip(user_input, replan_context, edit_cmd)
     if not replanned_trip:
         raise HTTPException(status_code=500, detail="重新规划失败")
+    # original_daily_plan 是真正的基线；current_daily_plan 是后续持续被 merge 的工作副本；
+    # replanned_daily_plan 则是模型输出的候选版本。
     original_daily_plan = _normalize_daily_plan(current_trip)
     current_daily_plan = dict(original_daily_plan)
     replanned_daily_plan = _normalize_daily_plan(replanned_trip)
+    # 目标天的 key 统一转成字符串，和 daily_plan 的内部表示保持一致。
     day_key = str(scope_day)
+    # original_day_items 是目标天原始内容；
+    # replanned_day_items 是模型给目标天产出的候选内容。
     original_day_items = current_daily_plan.get(day_key, [])
     replanned_day_items = replanned_daily_plan.get(day_key, [])
     if replanned_day_items:
+        # 这里统一复用 scope merge：
+        # 整天时等价于直接替换，半天时只替换目标时间段。
+        # merge 的核心思路是：
+        # - 如果是整天重排：当前目标天直接使用模型返回的新日程
+        # - 如果是半天重排：只把 morning/afternoon/evening 命中的项替换掉
+        #   不在该时间段内的旧项全部保留
+        # 这样能保证“上午重排不会把晚上晚餐或酒店入住也冲掉”。
         current_daily_plan[day_key] = _merge_day_items_by_scope(
             original_day_items=original_day_items,
             replanned_items=replanned_day_items,
             time_range=time_range,
         )
 
+    # 目标天 merge 完成后，再检测这次改动是否影响相邻天。
+    # 例如：
+    # - 第 N 天晚上改到另一个城市，可能会影响第 N+1 天早晨的出发安排
+    # - 第 N 天上午改动，可能暴露出第 N-1 天晚上收尾过晚的问题
     escalation_meta = _detect_replan_escalation(current_trip, scope_day, time_range, locked_days)
     if escalation_meta.get("escalated"):
+        # impacted_days 是启发式检测出来“需要最小联动修补”的相邻天集合，
+        # 不是允许把整天都重算的授权列表。
         impacted_days = escalation_meta.get("impacted_days") or []
+        # 具体例子：
+        # - 原始 Day 2:
+        #   09:00-11:00 西湖
+        #   14:00-16:00 灵隐寺
+        #   19:00-20:30 河坊街晚餐
+        # - 原始 Day 3:
+        #   08:00-09:00 酒店早餐
+        #   09:30-12:00 西溪湿地
+        #   14:00-17:00 宋城
+        # - 用户只要求重排 Day 2 的 evening
+        # - 模型候选把 Day 2 晚上改成：
+        #   20:00-23:00 杭州 -> 上海
+        #
+        # 这时系统会判断 Day 3 上午原计划已经接不上，因此 impacted_days 会包含 Day 3。
+        # 但这里不会把 Day 3 整天重做，而是只替换 Day 3 的 morning：
+        # 1) 保留原始 Day 3 中不属于 morning 的项：
+        #    14:00-17:00 宋城
+        # 2) 从模型候选结果里只取属于 morning 的项，比如：
+        #    09:30-10:30 上海酒店补觉
+        #    11:00-12:00 南京路 brunch
+        # 3) merge 后得到新的 Day 3：
+        #    09:30-10:30 上海酒店补觉
+        #    11:00-12:00 南京路 brunch
+        #    14:00-17:00 宋城
+        #
+        # 也就是说：相邻天只做“受影响时间段”的局部替换，
+        # 不是把整天全部替换成模型版本。
         # 对相邻受影响天只做最小联动：上一天只允许动 evening，下一天只允许动 morning。
         # 这样既能处理跨天交通衔接，又能把改动范围控制在最小必要集合里。
         for impacted_day in impacted_days:
+            # 相邻天在 daily_plan 里同样用字符串 key 存储。
             impacted_key = str(impacted_day)
+            # impacted_items 取自模型候选结果中的相邻天安排。
+            # 如果模型没提供该相邻天内容，就说明没有可 merge 的候选项，直接跳过。
             impacted_items = replanned_daily_plan.get(impacted_key) or []
             if not impacted_items:
                 continue
+            # 只允许做“最小必要时间段”的联动：
+            # - 影响下一天：只调 morning，因为最常见的是跨城后影响次日清晨衔接
+            # - 影响上一天：只调 evening，因为最常见的是前一晚收尾过晚或跨城前置安排
             impacted_scope = "morning" if impacted_day > scope_day else "evening"
+            # 这里是整条链路里最重要、也最容易误解的 merge：
+            # 它不是“把相邻天整天替换成模型版本”，而是：
+            # 1) 先保留 current_daily_plan 中该相邻天未落入 impacted_scope 的原始项
+            # 2) 再从 impacted_items 中取出落入 impacted_scope 的候选项
+            # 3) 把两部分拼起来后重新按时间排序
+            # 结果就是：
+            # - 第 N+1 天若受影响，只会替换 morning，下午/晚上沿用原行程
+            # - 第 N-1 天若受影响，只会替换 evening，上午/下午沿用原行程
+            # 这样做的目的，是把“局部重排的副作用”严格限制在相邻天最小必要范围内。
             current_daily_plan[impacted_key] = _merge_day_items_by_scope(
                 original_items=current_daily_plan.get(impacted_key, []),
                 replanned_items=impacted_items,
@@ -3461,18 +3601,30 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
 
     # 锁定天始终以原始数据为准，哪怕模型误改了，也在 merge 末尾硬回退。
     for locked_day in locked_days:
+        # locked_key 也是字符串，因为 daily_plan 的键在当前实现里使用字符串 day。
         locked_key = str(locked_day)
+        # 如果模型候选结果里真的改到了锁定天，就记一条 warning，方便排查模型边界控制是否漂移。
         if locked_key in replanned_daily_plan and replanned_daily_plan.get(locked_key) != original_daily_plan.get(locked_key):
             logger.warning("局部重排命中锁定天回退 session_id=%s day=%s", session_id, locked_day)
         if locked_key in original_daily_plan:
+            # 这里是最终“硬回退”动作：
+            # 不管前面目标天 merge、相邻天 merge 发生了什么，只要这一天被锁定，就强制恢复原始内容。
             current_daily_plan[locked_key] = original_daily_plan.get(locked_key, [])
 
+    # merged_trip 基于 current_trip 拷贝，再只替换 daily_plan，
+    # 这样目的地、天数、预算、偏好等顶层字段会保持原始会话里的值。
     merged_trip = dict(current_trip)
+    # 到这里 current_daily_plan 已经是：
+    # 目标天局部 merge + 相邻天最小联动 merge + 锁定天硬回退 之后的最终日程。
     merged_trip["daily_plan"] = current_daily_plan
+    # 局部重排后的结果也要继续挂上当前约束，供后续展示、编辑、再次重排复用。
     merged_trip["constraints_used"] = normalized_constraints
+    # 约束满足状态基于 merge 后的最终结果重算，避免沿用旧 trip_data 的状态。
     merged_trip["constraints_satisfied"] = _build_constraint_statuses(merged_trip, normalized_constraints)
+    # 冲突报告同样必须基于 merge 后结果重算，因为局部重排和相邻天联动都可能改变冲突分布。
     conflict_report = llm_manager.build_conflict_report(merged_trip, normalized_constraints).model_dump()
     merged_trip["conflict_report"] = conflict_report
+    # 持久化的是最终 merge 完成后的 merged_trip，而不是模型原始候选结果。
     storage.store_trip_data(session_id, merged_trip)
     logger.info(
         "局部重排完成 session_id=%s day=%s time_range=%s escalated=%s conflict=%s",
@@ -3482,6 +3634,8 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
         bool(escalation_meta.get("escalated")),
         bool(conflict_report.get("has_conflicts")),
     )
+    # replanned_scope 回传的是后端最终采用的重排范围，
+    # 前端可据此确认这次是整天/上午/下午/晚间哪一种重排。
     return TripReplanDayResponse(
         session_id=session_id,
         trip_data=merged_trip,
@@ -3490,11 +3644,15 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
             "time_range": time_range,
             "locked_days": locked_days,
         },
+        # agent_escalation 返回的不是完整 agent 执行明细，而是：
+        # 是否触发了相邻天最小联动、为什么触发、对用户怎么解释。
         agent_escalation=AgentEscalationInfo(
             escalated=bool(escalation_meta.get("escalated")),
             reasons=list(escalation_meta.get("reasons") or []),
             message=str(escalation_meta.get("message") or ""),
         ),
+        # conflict_report 是 merge 后重新计算的最终冲突状态，
+        # 不是原行程的旧冲突报告，也不是模型候选结果里的临时冲突估计。
         conflict_report=conflict_report,
     )
 
@@ -3885,6 +4043,8 @@ def list_knowledge_sources(knowledge_base_id: str) -> KnowledgeSourceListRespons
                 collection_name,
                 str(exc),
             )
+    # sources 接口要返回“用户视角的来源列表”，而不是底层向量分块明细：
+    # 已成功入库的来源来自 collection，失败待修复的来源来自 registry，这里统一聚合后再返回。
     source_entries = _load_collection_source_entries(collection_name, normalized_id)
     social_entries = [
         item
@@ -3961,6 +4121,8 @@ def delete_knowledge_source(knowledge_base_id: str, source_id: str) -> Knowledge
     matched_entry = next((item for item in source_entries if str(item.get("source_id") or "") == str(source_id or "")), None)
     if not matched_entry:
         raise HTTPException(status_code=404, detail="来源不存在")
+    # 删除来源时既要删掉真正入库的 chunk，也要清理失败来源快照；
+    # 这样无论该来源当前处于 parsed/fallback/failed 哪个状态，都能完成“按来源撤回”。
     chunk_ids = [str(item) for item in (matched_entry.get("chunk_ids") or []) if str(item).strip()]
     if chunk_ids:
         store = _get_knowledge_store()
@@ -3992,6 +4154,8 @@ def update_knowledge_source(knowledge_base_id: str, source_id: str, payload: Kno
         updated_content = "\n".join([item for item in [updated_content, updated_ocr_text] if item]).strip()
     if not updated_content:
         raise HTTPException(status_code=400, detail="content 不能为空")
+    # 这里既服务“普通正文修改”，也服务“失败来源补全文本重试”。
+    # 两种场景都要求保留原 source_id，避免来源列表与命中引用断裂。
     source_entries = _load_collection_source_entries(collection_name, normalized_id)
     matched_entry = next((item for item in source_entries if str(item.get("source_id") or "") == normalized_source_id), None)
     if not matched_entry:

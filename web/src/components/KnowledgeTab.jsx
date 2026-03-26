@@ -15,6 +15,8 @@ function getRiskTagColor(riskLevel) {
 }
 
 function buildFailureGuide(platform, errorCode, fallbackMessage = "解析失败，建议切换手动导入并补充正文") {
+  // 这里把后端错误码映射成“下一步怎么操作”的文案，
+  // 目标不是解释技术细节，而是减少用户在失败场景里的试错成本。
   const normalizedPlatform = String(platform || "unknown")
   const normalizedErrorCode = String(errorCode || "")
   const platformPrefix = normalizedPlatform === "unknown" ? "当前链接" : `${normalizedPlatform} 链接`
@@ -172,6 +174,8 @@ export default function KnowledgeTab({
     return buildFailureGuide(platform, errorCode, "解析失败，建议切换手动导入模式并粘贴文本/OCR 内容")
   }, [lastIngestResult])
   const effectiveKnowledgeDebug = useMemo(() => {
+    // 优先展示主流程返回的命中来源；
+    // 若当前还没有跑主流程，则回退到知识检索接口返回的调试信息。
     if (lastFlowKnowledgeDebug) {
       return lastFlowKnowledgeDebug
     }
@@ -326,6 +330,8 @@ export default function KnowledgeTab({
   }
 
   const buildEvidenceForAnswer = () => {
+    // 重新组装用户勾选后的 evidence，
+    // 让“二次生成回答”只基于用户认可的证据，而不是默认吃下全部候选项。
     const buildSection = (entries, section) => {
       const selectedItems = entries
         .filter((entry) => selectedMap[entry._id])
@@ -376,6 +382,8 @@ export default function KnowledgeTab({
       return
     }
     const currentUrl = String(ingestUrl || "").trim()
+    // subtitleText 并到 ocr_text，是因为当前后端把 OCR/字幕都视为“辅助补全文本”，
+    // 最终统一走 fallback 入库链路，避免再拆一条平行导入协议。
     const result = await onIngestKnowledgeUrl({
       url: currentUrl,
       mode: ingestMode,
@@ -412,6 +420,8 @@ export default function KnowledgeTab({
   }
 
   const handleOpenEditSource = (item) => {
+    // 编辑弹窗既可修改 parsed/fallback 来源，也可用于修复 failed 来源，
+    // 因此前置回填 source_url 和正文预览，尽量减少用户重复输入。
     setEditingSource(item || null)
     setEditingSourceUrl(String(item?.source_url || ""))
     setEditingSourceContent(String(item?.parsed_content_preview || ""))
@@ -452,6 +462,8 @@ export default function KnowledgeTab({
           const isPrivateEvidence = Boolean(sourceTypeValue) || String(sourceValue).startsWith("private://")
           const isUploadSource = ["pdf", "markdown", "txt"].includes(sourceTypeValue)
           const isSocialSource = ["url", "manual", "ocr"].includes(sourceTypeValue)
+          // v0.0.6 的证据面板需要明确区分“公网检索”和“私有来源”，
+          // 私有来源里又进一步区分上传文件与社交导入，便于用户理解答案依据。
           const sourceCategoryLabel = isPrivateEvidence
             ? isUploadSource
               ? "私有·上传文件"

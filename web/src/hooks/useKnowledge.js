@@ -71,6 +71,8 @@ export function useKnowledge() {
       }
       try {
         setLoadingKnowledgeSources(true);
+        // 这里读取的是后端聚合后的来源视图，
+        // 所以前端无需再自己拼接 chunk -> source，也能直接拿到 failed 来源统计。
         const data = await listKnowledgeSources(normalizedId);
         const items = Array.isArray(data?.items) ? data.items : [];
         const socialCount = items.filter((item) =>
@@ -258,6 +260,8 @@ export function useKnowledge() {
       }
       try {
         setIngestingKnowledge(true);
+        // 正式导入与 preprocess 分开执行：
+        // preprocess 负责预判，ingest 才会真正写库并产生 source_id / chunks_count。
         const result = await ingestKnowledgeUrl(
           selectedKnowledgeBaseId,
           payload,
@@ -330,6 +334,8 @@ export function useKnowledge() {
       if (!selectedKnowledgeBaseId || !normalizedSourceId) {
         return null;
       }
+      // 删除后同时刷新 knowledgeBases 和 sources，
+      // 这样文档分块数、来源数、失败统计都能在同一轮 UI 更新里同步。
       await deleteKnowledgeSource(selectedKnowledgeBaseId, normalizedSourceId);
       console.info("[knowledge] deleteSource:done", {
         knowledgeBaseId: String(selectedKnowledgeBaseId || ""),
@@ -354,6 +360,8 @@ export function useKnowledge() {
         return null;
       }
       // 更新来源正文后立即刷新来源列表，确保重载前后数据一致。
+      // updateSource 既是正文编辑入口，也是失败来源的原位重试入口。
+      // 后端会保留原 source_id，因此这里刷新后列表中的来源身份不会变化。
       const result = await updateKnowledgeSource(
         selectedKnowledgeBaseId,
         normalizedSourceId,

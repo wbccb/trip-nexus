@@ -34,6 +34,8 @@ import { useTrip } from "./hooks/useTrip.js"
 const { Header, Content } = Layout
 
 const DEFAULT_TRIP_CONSTRAINTS = {
+  // 这些默认值与后端 _normalize_trip_constraints 的兜底语义保持一致，
+  // 保证用户不展开“约束设置”时，前后端看到的是同一份默认约束。
   budget_level: "balanced",
   intensity: "standard",
   pace: "cultural",
@@ -43,6 +45,8 @@ const DEFAULT_TRIP_CONSTRAINTS = {
 }
 
 function buildConstraintSummary(values) {
+  // 提交前先在聊天区/表单摘要里展示一份简短描述，
+  // 方便用户确认这次生成将带着哪些结构化约束进入主流程。
   const budgetLabelMap = {
     economy: "经济",
     balanced: "均衡",

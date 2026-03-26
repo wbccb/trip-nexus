@@ -64,6 +64,8 @@ def resolve_short_url(normalized_url: str, timeout: int = 5) -> Dict[str, Option
     hostname = str(parsed.hostname or "").lower()
     if hostname not in SHORT_LINK_HOSTS:
         return {"resolved_url": normalized_url, "resolve_error_code": None}
+    # v0.0.6 只做“合规的公开短链解跳”。
+    # 能拿到最终 URL 就继续后续平台识别；拿不到时返回错误码给前端做提示，而不是做更激进的绕过。
     try:
         # 短链只需要知道最终落点，优先用 HEAD，避免在预处理阶段下载整页正文。
         response = requests.head(

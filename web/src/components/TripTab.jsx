@@ -16,6 +16,8 @@ function getConstraintStatusColor(status) {
 }
 
 function buildConstraintSummary(constraintsUsed) {
+  // TripTab 不重复展示原始枚举值，而是把 constraints_used 压缩成用户可读摘要，
+  // 让用户快速确认“这次行程到底按什么约束生成/修改的”。
   const budgetLabelMap = {
     economy: "经济",
     balanced: "均衡",
@@ -212,6 +214,8 @@ export default function TripTab({
     : []
   const activeConflicts = Array.isArray(conflictReport?.conflicts) ? conflictReport.conflicts : []
   const conflictsByDay = useMemo(() => {
+    // 按天聚合冲突，供“天标题旁的小红点/tooltip”复用，
+    // 避免每次渲染都在 JSX 内重复扫描 conflict 列表。
     const grouped = {}
     activeConflicts.forEach((item) => {
       const key = String(item?.day || "")

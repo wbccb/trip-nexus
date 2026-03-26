@@ -95,6 +95,8 @@ def _validate_template_fields(template: str, allowed_fields: List[str], template
 
 
 BUDGET_LEVEL_MAP = {
+    # 结构化约束不会直接原样塞给模型，而是先映射成自然语言策略说明，
+    # 这样模型更容易把“档位枚举”转成具体的排程倾向。
     "economy": "经济模式（优先公共交通与平价餐饮，控制整体花费，避免不必要的高消费安排）",
     "balanced": "均衡模式（交通、餐饮与景点体验保持平衡，可在体验与成本之间灵活取舍）",
     "comfortable": "舒适模式（可接受更舒适的交通与更有特色的餐饮，不必过度压缩预算）",
@@ -1093,6 +1095,8 @@ class LlmManager:
         return res
 
     def _build_constraint_prompt_section(self, user_input: Dict[str, Any]) -> str:
+        # 这里负责把前端传来的结构化 constraints 转成 prompt 段落，
+        # 与原有 budget/preference 自由文本形成互补，而不是相互替代。
         budget_level = str(user_input.get("budget_level") or "balanced").strip().lower()
         if budget_level not in BUDGET_LEVEL_MAP:
             budget_level = "balanced"
@@ -1122,6 +1126,8 @@ class LlmManager:
         )
 
     def _normalize_conflict_constraints(self, constraints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        # conflict 检测链路单独做一次轻量归一化，
+        # 避免外部直接传入脏数据时影响 intensity 阈值、午休判断等规则。
         raw = constraints or {}
         if not isinstance(raw, dict):
             raw = {}
@@ -1202,6 +1208,8 @@ class LlmManager:
 
     def _detect_conflicts(self, trip_data: Dict[str, Any], constraints: Optional[Dict[str, Any]] = None) -> ConflictReport:
         try:
+            # 冲突检测优先保证“稳定、不阻断主流程”。
+            # 规则偏启发式：先抓最明显的不可执行信号，再在异常时整体降级为空报告。
             normalized_constraints = self._normalize_conflict_constraints(constraints)
             daily_plan = self._normalize_daily_plan_items(trip_data)
             if not daily_plan:
@@ -1219,6 +1227,7 @@ class LlmManager:
                     continue
 
                 # 核心逻辑：用城市标签 + 交通时长做轻量规则检测，优先拦截“同日跨城/超长交通”这类明显不可执行的方案。
+                # 1) 距离/时间冲突：同天跨城、单段超长交通。
                 city_tokens = {
                     self._extract_city_token(item, fallback_city)
                     for item in items
@@ -1246,6 +1255,7 @@ class LlmManager:
                         )
                         break
 
+                # 2) 节奏冲突：根据 intensity 的上限判断单日主要景点是否过密。
                 major_poi_count = sum(1 for item in items if self._is_major_poi(item))
                 intensity_limit = intensity_limit_map.get(intensity)
                 if intensity_limit is not None and major_poi_count > intensity_limit:
@@ -1258,6 +1268,7 @@ class LlmManager:
                         )
                     )
 
+                # 3) 休息窗口冲突：默认检查午间用餐/休息，need_nap=true 时再提高要求。
                 lunch_window_hit = False
                 nap_window_hit = False
                 for item in items:
@@ -1308,6 +1319,8 @@ class LlmManager:
         if not conflicts:
             return []
         try:
+            # 替代方案生成是冲突检测后的附加增益，不是主链路硬依赖；
+            # 因此这里只要失败就静默降级为空 alternatives，不阻塞最终行程返回。
             normalized_constraints = self._normalize_conflict_constraints(constraints)
             prompt = f"""
 你是旅行方案修正助手。请基于当前行程与冲突描述，输出两个替代方案：
@@ -1372,6 +1385,8 @@ class LlmManager:
             return []
 
     def build_conflict_report(self, trip_data: Dict[str, Any], constraints: Optional[Dict[str, Any]] = None) -> ConflictReport:
+        # 对外统一暴露 build_conflict_report，内部再串联“检测冲突 -> 生成替代方案 -> 指标打点”。
+        # 这样 app.py、trip/update、replan_day 都能复用同一套冲突闭环。
         conflict_report = self._detect_conflicts(trip_data, constraints)
         if not conflict_report.has_conflicts:
             self._metrics.record("conflict_detected", {"detected": False})

@@ -72,6 +72,8 @@ export async function uploadKnowledgeDocument(knowledgeBaseId, file) {
 }
 
 export async function ingestKnowledgeUrl(knowledgeBaseId, payload) {
+  // 导入接口会根据 payload.mode 返回 parsed / fallback / failed 三种状态，
+  // 前端据此决定展示成功提示、失败引导或“补全文本重试”入口。
   return apiPost(
     `/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/ingest/url`,
     payload,
@@ -85,6 +87,8 @@ export async function preprocessKnowledgeUrl(payload) {
 }
 
 export async function listKnowledgeSources(knowledgeBaseId) {
+  // sources 接口返回的是“来源聚合视图”，不是底层分块列表；
+  // 其中既包含已入库来源，也可能包含等待用户补救的 failed 来源。
   const response = await fetch(
     `${API_BASE}/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/sources`,
   );

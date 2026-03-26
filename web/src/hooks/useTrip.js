@@ -21,6 +21,8 @@ function createEmptyConflictReport() {
 }
 
 function normalizeFlowConstraints(values) {
+  // 前端表单层允许空值和局部字段更新，这里统一补默认值并转成后端约定的 constraints 结构，
+  // 避免 flow/stream、trip/update、trip/replan_day 三条链路各自拼装一套。
   const budgetLevel = ["economy", "balanced", "comfortable"].includes(values?.budget_level)
     ? values.budget_level
     : "balanced";
@@ -47,6 +49,8 @@ function normalizeFlowConstraints(values) {
 }
 
 function resolveTripConstraints(source) {
+  // 修改行程、拖拽保存、局部重排时优先复用当前 tripResult 里的 constraints_used，
+  // 保证后续编辑不会把首次生成时的结构化约束丢掉。
   const constraints = source?.constraints_used || source?.constraints || source || {};
   return normalizeFlowConstraints({
     budget_level: constraints?.budget_level,
@@ -74,6 +78,8 @@ export function useTrip({
   const tripDays = useMemo(() => normalizeTripDays(tripResult), [tripResult]);
   const updateTripResult = useCallback((data) => {
     setTripResult(data || null);
+    // 约束满足状态和冲突报告都挂在 trip_data 上，
+    // 因此切换正式行程结果时要同步重置冲突 UI 与替代方案选择状态。
     setConflictReport(data?.conflict_report || createEmptyConflictReport());
     setSelectedAlternative(null);
     setLockedDays(new Set());
@@ -103,6 +109,8 @@ export function useTrip({
         trip_data: nextTrip,
         constraints: resolveTripConstraints(nextTrip),
       };
+      // 即使只是本地编辑后的持久化，也要显式带上 constraints，
+      // 这样后端才能重算 constraints_satisfied 与 conflict_report。
       const data = await updateFlowTripData(payload);
       if (data?.session_id && data.session_id !== activeSessionId) {
         setActiveSessionId(data.session_id);
@@ -153,6 +161,8 @@ export function useTrip({
         replan_instruction: String(normalizedInput?.replanInstruction || "").trim() || null,
         constraints: resolveTripConstraints(tripResult),
       };
+      // replan_day 不再只依赖后端从 current_trip 隐式继承约束，
+      // 当前前端会把已生效的 constraints_used 显式带回去，保证局部重排继续受约束控制。
       const data = await replanFlowDay(payload);
       if (data?.session_id && data.session_id !== activeSessionId) {
         setActiveSessionId(data.session_id);
@@ -231,6 +241,8 @@ export function useTrip({
               accumulatedText += deltaText;
             }
             if (step === "warning") {
+              // warning 事件比 finalize 更早到达，前端先用它把冲突区亮起来，
+              // finalize 到达后再以最终 conflict_report 做一次权威覆盖。
               const warningReport = event?.payload?.conflict_report || createEmptyConflictReport();
               setConflictReport(warningReport);
               setSelectedAlternative(null);
@@ -243,6 +255,8 @@ export function useTrip({
             streamSessionId = event?.session_id || null;
             const eventPayload = event?.payload || {};
             streamTripData = eventPayload?.trip_data || null;
+            // finalize 中的 trip_data/conflict_report 才是最终持久化版本，
+            // 这里要覆盖 warning 阶段的临时状态，避免前后不一致。
             setConflictReport(eventPayload?.conflict_report || streamTripData?.conflict_report || createEmptyConflictReport());
             setSelectedAlternative(null);
             if (onTripData) {

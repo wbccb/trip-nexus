@@ -98,6 +98,7 @@ class ContentCrawler:
             response.raise_for_status()
             if response.encoding == "ISO-8859-1":
                 response.encoding = response.apparent_encoding
+            # L1 是最低成本的通用正文提取，适合博客、攻略站、媒体站等开放网页。
             return self._parse_html(response.text, url)
         except Exception as e:
             logger.warning(f"Error fetching {url}: {e}")
@@ -109,6 +110,8 @@ class ContentCrawler:
             response.raise_for_status()
             if response.encoding == "ISO-8859-1":
                 response.encoding = response.apparent_encoding
+            # L2 仍基于 requests + HTML，只是在已知平台上启用更激进的 selector 覆盖，
+            # 目标是提高知乎/B站/小红书/微博公开页首屏正文的命中率。
             return self._parse_html_platform(response.text, url, source_platform)
         except Exception as e:
             logger.warning(f"Error in l2 extractor {url}: {e}")

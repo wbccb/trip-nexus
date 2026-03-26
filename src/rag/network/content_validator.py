@@ -53,6 +53,8 @@ def _detect_noise_error(content_text: str) -> str:
 def validate_content_quality(content_text: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
     # 这里的质量门禁服务于“能否直接入库并参与检索”，不是做学术意义上的文本质量评分。
     # 因此它更关注三个问题：有没有正文、正文是否像真实内容、正文是否被平台拦截/污染。
+    # metadata 先保留为统一接口参数，即使当前只显式使用了部分字段，
+    # 后续仍可以在不改函数签名的情况下按平台/风险/提取层做差异化阈值扩展。
     normalized_text = str(content_text or "").strip()
     char_count = len(normalized_text)
     density = _calc_text_density(normalized_text)
