@@ -124,10 +124,12 @@ export default function App() {
     conflictReport,
     handleFlowSubmit,
     handleFlowReplanDay,
+    lockedDays,
     loadingTrip,
     persistFlowTripResult,
     selectedAlternative,
     setConflictReport,
+    setLockedDays,
     setSelectedAlternative,
     tripDays,
     tripResult,
@@ -504,6 +506,7 @@ export default function App() {
                   children: (
                     <TripTab
                       conflictReport={conflictReport}
+                      lockedDays={lockedDays}
                       loadingTrip={loadingTrip}
                       selectedAlternative={selectedAlternative}
                       tripDays={tripDays}
@@ -516,6 +519,7 @@ export default function App() {
                         await persistFlowTripResult(nextTrip)
                       }}
                       onConflictReportChange={setConflictReport}
+                      onLockedDaysChange={setLockedDays}
                       onSelectAlternative={setSelectedAlternative}
                       onSelectPoi={handleSelectPoi}
                       onTripChange={async (nextTrip) => {

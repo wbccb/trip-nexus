@@ -919,7 +919,26 @@ class LlmManager:
                 case "reorder":
                     edit_note = "需调整行程顺序，确保路线更合理"
                 case "modify":
-                    edit_note = f"需重新调整行程：{edit_cmd.get('msg', '根据新要求调整')}"
+                    edit_segments = [f"需重新调整行程：{edit_cmd.get('msg', '根据新要求调整')}"]
+                    scope = edit_cmd.get("scope") or {}
+                    scope_day = scope.get("day")
+                    scope_time_range = str(scope.get("time_range") or "").strip().lower()
+                    time_range_label_map = {
+                        "morning": "上午（00:00-12:00）",
+                        "afternoon": "下午（12:00-17:00）",
+                        "evening": "晚间（17:00-24:00）",
+                    }
+                    if scope_day:
+                        time_label = time_range_label_map.get(scope_time_range, "整天")
+                        edit_segments.append(f"仅允许修改第{scope_day}天的{time_label}范围。")
+                    locked_days = [int(day) for day in (edit_cmd.get("locked_days") or []) if str(day).isdigit()]
+                    if locked_days:
+                        locked_text = "、".join([f"第{day}天" for day in sorted(set(locked_days))])
+                        edit_segments.append(f"以下天数已锁定不可修改：{locked_text}。")
+                    replan_instruction = str(edit_cmd.get("replan_instruction") or "").strip()
+                    if replan_instruction:
+                        edit_segments.append(f"用户补充要求：{replan_instruction}")
+                    edit_note = " ".join(edit_segments)
 
         # 优化提示词模板，更适合指令遵循型模型
         template = """

@@ -1,4 +1,4 @@
-import { Alert, Button, Card, Divider, Form, Input, Modal, Space, Spin, Tag, Tooltip } from "antd"
+import { Alert, Button, Card, Divider, Dropdown, Form, Input, Modal, Space, Spin, Tag, Tooltip } from "antd"
 import { DndContext, PointerSensor, closestCenter, useSensor, useSensors } from "@dnd-kit/core"
 import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
@@ -167,9 +167,11 @@ function SortableTripItem({ item, onEdit, onDelete, onCardClick, isSelected, ite
 
 export default function TripTab({
   conflictReport,
+  lockedDays,
   loadingTrip,
   onApplyAlternative,
   onConflictReportChange,
+  onLockedDaysChange,
   onSelectAlternative,
   tripDays,
   tripResult,
@@ -181,6 +183,10 @@ export default function TripTab({
 }) {
   const [draftTrip, setDraftTrip] = useState(tripResult || null)
   const [editingItem, setEditingItem] = useState(null)
+  const [replanDialog, setReplanDialog] = useState({ open: false, day: null, timeRange: null })
+  const [replanInstruction, setReplanInstruction] = useState("")
+  const [replanSubmitting, setReplanSubmitting] = useState(false)
+  const [lastAgentEscalation, setLastAgentEscalation] = useState(null)
   const [editForm] = Form.useForm()
   const cardRefs = useRef({})
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }))
@@ -362,18 +368,70 @@ export default function TripTab({
   const handleEditCancel = useCallback(() => {
     setEditingItem(null)
   }, [])
-  const handleReplan = useCallback(
-    async (dayKey) => {
-      if (!onReplanDay || previewAlternative) {
+  const lockedDaySet = useMemo(() => {
+    if (lockedDays instanceof Set) {
+      return lockedDays
+    }
+    return new Set(Array.isArray(lockedDays) ? lockedDays : [])
+  }, [lockedDays])
+  const toggleLockedDay = useCallback(
+    (dayKey) => {
+      if (!onLockedDaysChange || previewAlternative) {
         return
       }
-      const result = await onReplanDay(Number(dayKey))
-      if (result) {
-        setDraftTrip(result)
+      const dayNumber = Number(dayKey)
+      const nextLockedDays = new Set(Array.from(lockedDaySet))
+      if (nextLockedDays.has(dayNumber)) {
+        nextLockedDays.delete(dayNumber)
+      } else {
+        nextLockedDays.add(dayNumber)
       }
+      onLockedDaysChange(nextLockedDays)
     },
-    [onReplanDay, previewAlternative],
+    [lockedDaySet, onLockedDaysChange, previewAlternative],
   )
+  const openReplanDialog = useCallback(
+    (dayKey, timeRange = null) => {
+      if (previewAlternative) {
+        return
+      }
+      setReplanInstruction("")
+      setReplanDialog({
+        open: true,
+        day: Number(dayKey),
+        timeRange,
+      })
+    },
+    [previewAlternative],
+  )
+  const handleReplanCancel = useCallback(() => {
+    setReplanDialog({ open: false, day: null, timeRange: null })
+    setReplanInstruction("")
+  }, [])
+  const handleReplanConfirm = useCallback(async () => {
+    if (!onReplanDay || !replanDialog?.day) {
+      return
+    }
+    setReplanSubmitting(true)
+    try {
+      const response = await onReplanDay({
+        day: replanDialog.day,
+        scope: {
+          day: replanDialog.day,
+          time_range: replanDialog.timeRange,
+        },
+        lockedDays: Array.from(lockedDaySet),
+        replanInstruction,
+      })
+      if (response?.trip_data) {
+        setDraftTrip(response.trip_data)
+      }
+      setLastAgentEscalation(response?.agent_escalation || null)
+      handleReplanCancel()
+    } finally {
+      setReplanSubmitting(false)
+    }
+  }, [handleReplanCancel, lockedDaySet, onReplanDay, replanDialog, replanInstruction])
   const handleApplyAlternative = useCallback(async () => {
     if (!previewAlternative?.trip_data || !onApplyAlternative) {
       return
@@ -479,6 +537,14 @@ export default function TripTab({
                   </Space>
                 </Card>
               )}
+              {lastAgentEscalation?.escalated && (
+                <Alert
+                  type="info"
+                  showIcon
+                  message="本次局部重排触发了相邻天联动"
+                  description={lastAgentEscalation?.message || "系统已按最小改动原则联动微调相邻天。"}
+                />
+              )}
               <Divider />
               <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
                 <div className="trip-day-list">
@@ -486,11 +552,23 @@ export default function TripTab({
                     const dayKey = String(day.day)
                     const items = Array.isArray(day.items) ? day.items : []
                     const sortableIds = items.map((_, index) => `${dayKey}-${index}`)
+                    const isLocked = lockedDaySet.has(Number(dayKey))
+                    const replanMenuItems = [
+                      { key: "full_day", label: "重排整天" },
+                      { key: "morning", label: "重排上午" },
+                      { key: "afternoon", label: "重排下午" },
+                      { key: "evening", label: "重排晚间" },
+                    ]
                     return (
-                      <div key={dayKey} className="trip-day-block">
+                      <div key={dayKey} className="trip-day-block" style={isLocked ? { opacity: 0.78 } : undefined}>
                         <div className="trip-day-header">
                           <div className="trip-day-title">
                             第 {dayKey} 天
+                            {isLocked && (
+                              <Tag color="default" style={{ marginLeft: 8 }}>
+                                锁定保护
+                              </Tag>
+                            )}
                             {Array.isArray(conflictsByDay[dayKey]) && conflictsByDay[dayKey].length > 0 && (
                               <Tooltip
                                 title={conflictsByDay[dayKey]
@@ -504,9 +582,19 @@ export default function TripTab({
                             )}
                           </div>
                           <div className="trip-day-actions">
-                            <Button size="small" onClick={() => handleReplan(dayKey)} disabled={Boolean(previewAlternative)}>
-                              重规划当日
+                            <Button size="small" onClick={() => toggleLockedDay(dayKey)} disabled={Boolean(previewAlternative)}>
+                              {isLocked ? "解锁" : "锁定"}
                             </Button>
+                            <Dropdown
+                              menu={{
+                                items: replanMenuItems,
+                                onClick: ({ key }) => openReplanDialog(dayKey, key === "full_day" ? null : key),
+                              }}
+                              disabled={Boolean(previewAlternative) || isLocked}
+                              trigger={["click"]}
+                            >
+                              <Button size="small">重规划当日</Button>
+                            </Dropdown>
                           </div>
                         </div>
                         <SortableContext items={sortableIds} strategy={verticalListSortingStrategy}>
@@ -563,6 +651,30 @@ export default function TripTab({
             <Input.TextArea rows={3} />
           </Form.Item>
         </Form>
+      </Modal>
+      <Modal
+        title={`重排第 ${replanDialog?.day || ""} 天${replanDialog?.timeRange === "morning" ? "上午" : replanDialog?.timeRange === "afternoon" ? "下午" : replanDialog?.timeRange === "evening" ? "晚间" : ""}`}
+        open={Boolean(replanDialog?.open)}
+        onOk={handleReplanConfirm}
+        onCancel={handleReplanCancel}
+        okText="开始重排"
+        cancelText="取消"
+        confirmLoading={replanSubmitting}
+      >
+        <Space direction="vertical" size="middle" className="full-width">
+          <Alert
+            type="info"
+            showIcon
+            message="局部重排会尽量保持未选中的时段和未锁定天不变"
+            description={`当前锁定天：${Array.from(lockedDaySet).sort((a, b) => a - b).join("、") || "无"}`}
+          />
+          <Input.TextArea
+            rows={4}
+            value={replanInstruction}
+            onChange={(event) => setReplanInstruction(event.target.value)}
+            placeholder="可选补充要求，例如：下午改成室内活动，减少步行。"
+          />
+        </Space>
       </Modal>
     </div>
   )

@@ -392,17 +392,34 @@ class TripUpdateResponse(BaseModel):
     trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
 
 
+class ReplanScope(BaseModel):
+    day: int = Field(..., description="目标重排天（1-indexed）")
+    time_range: Optional[str] = Field(None, description="重排范围：morning/afternoon/evening，None=整天")
+
+
+class AgentEscalationInfo(BaseModel):
+    escalated: bool = Field(False, description="是否触发相邻天联动重排")
+    reasons: List[str] = Field(default_factory=list, description="触发原因列表")
+    message: str = Field("", description="面向用户的说明文本")
+
+
 class TripReplanDayRequest(BaseModel):
     user_id: str = Field(..., description="用户唯一ID")
     device_id: str = Field(..., description="设备唯一ID")
     session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
     day: int = Field(..., description="需要重新规划的天数")
+    scope: Optional[ReplanScope] = Field(None, description="精细重排范围，存在时优先于 day")
+    locked_days: List[int] = Field(default_factory=list, description="锁定不参与重排的天数")
+    replan_instruction: Optional[str] = Field(None, description="用户补充重排指令")
     constraints: Optional[Dict[str, Any]] = Field(None, description="可选约束参数，重排单日时显式透传")
 
 
 class TripReplanDayResponse(BaseModel):
     session_id: str = Field(..., description="会话ID")
     trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
+    replanned_scope: Dict[str, Any] = Field(default_factory=dict, description="实际重排范围")
+    agent_escalation: Optional[AgentEscalationInfo] = Field(None, description="相邻天联动重排信息")
+    conflict_report: Optional[Dict[str, Any]] = Field(None, description="重排后的冲突报告")
 
 
 class FlowMetricItem(BaseModel):
@@ -1419,6 +1436,172 @@ def _normalize_daily_plan(trip_data: Dict[str, Any]) -> Dict[str, List[Dict[str,
     if isinstance(daily_plan_raw, list):
         return {"1": daily_plan_raw}
     return {}
+
+
+def _normalize_locked_days(locked_days: List[int], target_day: int) -> List[int]:
+    normalized: List[int] = []
+    for value in locked_days or []:
+        try:
+            day = int(value)
+        except (TypeError, ValueError):
+            continue
+        if day <= 0 or day == target_day or day in normalized:
+            continue
+        normalized.append(day)
+    return sorted(normalized)
+
+
+def _parse_time_range_minutes(time_text: Any) -> Tuple[Optional[int], Optional[int]]:
+    match = re.match(r"^\s*(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})\s*$", str(time_text or ""))
+    if not match:
+        return None, None
+    start_minutes = int(match.group(1)) * 60 + int(match.group(2))
+    end_minutes = int(match.group(3)) * 60 + int(match.group(4))
+    if end_minutes <= start_minutes:
+        return None, None
+    return start_minutes, end_minutes
+
+
+def _resolve_scope_bounds(time_range: Optional[str]) -> Tuple[int, int]:
+    scope = str(time_range or "").strip().lower()
+    if scope == "morning":
+        return 0, 12 * 60
+    if scope == "afternoon":
+        return 12 * 60, 17 * 60
+    if scope == "evening":
+        return 17 * 60, 24 * 60
+    return 0, 24 * 60
+
+
+def _item_overlaps_scope(item: Dict[str, Any], time_range: Optional[str]) -> bool:
+    if not time_range:
+        return True
+    start_minutes, end_minutes = _parse_time_range_minutes(item.get("time"))
+    if start_minutes is None or end_minutes is None:
+        return False
+    scope_start, scope_end = _resolve_scope_bounds(time_range)
+    return end_minutes > scope_start and start_minutes < scope_end
+
+
+def _sort_day_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _sort_key(item: Dict[str, Any]) -> Tuple[int, int]:
+        start_minutes, end_minutes = _parse_time_range_minutes(item.get("time"))
+        return (
+            start_minutes if start_minutes is not None else 24 * 60 + 1,
+            end_minutes if end_minutes is not None else 24 * 60 + 1,
+        )
+
+    return sorted([item for item in items if isinstance(item, dict)], key=_sort_key)
+
+
+def _merge_day_items_by_scope(
+    original_items: List[Dict[str, Any]],
+    replanned_items: List[Dict[str, Any]],
+    time_range: Optional[str],
+) -> List[Dict[str, Any]]:
+    if not time_range:
+        return _sort_day_items(replanned_items)
+    kept_items = [item for item in original_items if isinstance(item, dict) and not _item_overlaps_scope(item, time_range)]
+    scoped_items = [item for item in replanned_items if isinstance(item, dict) and _item_overlaps_scope(item, time_range)]
+    return _sort_day_items(kept_items + scoped_items)
+
+
+def _extract_item_city(item: Dict[str, Any], fallback_city: str) -> str:
+    city = str(item.get("city") or "").strip()
+    if city:
+        return city
+    address = str(item.get("address") or "").strip()
+    match = re.search(r"([^，,\s]+(?:市|州|地区|盟))", address)
+    if match:
+        return match.group(1)
+    return fallback_city
+
+
+def _build_replan_context(
+    current_trip: Dict[str, Any],
+    target_day: int,
+    time_range: Optional[str],
+    locked_days: List[int],
+    replan_instruction: str,
+) -> List[str]:
+    daily_plan = _normalize_daily_plan(current_trip)
+    current_day_items = daily_plan.get(str(target_day)) or []
+    context_blocks = [
+        f"当前完整行程：{json.dumps(current_trip, ensure_ascii=False)}",
+        f"当前第{target_day}天原始安排：{json.dumps(current_day_items, ensure_ascii=False)}",
+    ]
+    if time_range:
+        context_blocks.append(f"本次仅允许重排第{target_day}天的 {time_range} 时段，其余时段必须尽量保持不变。")
+    if locked_days:
+        locked_payload = {str(day): daily_plan.get(str(day), []) for day in locked_days}
+        context_blocks.append(f"以下天数已锁定，不可修改：{json.dumps(locked_payload, ensure_ascii=False)}")
+    if replan_instruction:
+        context_blocks.append(f"用户补充要求：{replan_instruction}")
+    return context_blocks
+
+
+def _detect_replan_escalation(
+    current_trip: Dict[str, Any],
+    target_day: int,
+    time_range: Optional[str],
+    locked_days: List[int],
+) -> Dict[str, Any]:
+    daily_plan = _normalize_daily_plan(current_trip)
+    total_days = len(daily_plan)
+    fallback_city = str(current_trip.get("destination") or "").strip()
+    reasons: List[str] = []
+    impacted_days: List[int] = []
+
+    current_day_items = daily_plan.get(str(target_day)) or []
+    next_day_items = daily_plan.get(str(target_day + 1)) or []
+    prev_day_items = daily_plan.get(str(target_day - 1)) or []
+
+    # 核心逻辑：这里不直接上复杂 Agent，而是先用“相邻天时间/城市衔接”做启发式检测，
+    # 识别出最常见的跨天依赖，再决定是否联动微调前后一天。
+    if time_range in [None, "afternoon", "evening"] and next_day_items:
+        current_last = current_day_items[-1] if current_day_items else {}
+        next_first = next_day_items[0] if next_day_items else {}
+        current_city = _extract_item_city(current_last, fallback_city)
+        next_city = _extract_item_city(next_first, fallback_city)
+        next_start, _ = _parse_time_range_minutes(next_first.get("time"))
+        if current_city and next_city and current_city != next_city:
+            reasons.append("cross_day_dependency")
+            impacted_days.append(target_day + 1)
+        elif next_start is not None and next_start <= 9 * 60:
+            reasons.append("tight_next_day_window")
+            impacted_days.append(target_day + 1)
+
+    if time_range in [None, "morning"] and prev_day_items:
+        prev_last = prev_day_items[-1] if prev_day_items else {}
+        current_first = current_day_items[0] if current_day_items else {}
+        prev_city = _extract_item_city(prev_last, fallback_city)
+        current_city = _extract_item_city(current_first, fallback_city)
+        _, prev_end = _parse_time_range_minutes(prev_last.get("time"))
+        if prev_city and current_city and prev_city != current_city:
+            reasons.append("cross_day_dependency")
+            impacted_days.append(target_day - 1)
+        elif prev_end is not None and prev_end >= 18 * 60:
+            reasons.append("tight_previous_day_window")
+            impacted_days.append(target_day - 1)
+
+    impacted_days = [day for day in sorted(set(impacted_days)) if day not in locked_days and 1 <= day <= total_days]
+    escalated = bool(impacted_days)
+    if not escalated and reasons:
+        return {
+            "escalated": False,
+            "reasons": ["fallback_locked_day"],
+            "message": "检测到相邻天衔接依赖，但受锁定范围限制，本次降级为仅重排目标天。",
+            "impacted_days": [],
+        }
+    if escalated:
+        impacted_text = "、".join([f"第{day}天" for day in impacted_days])
+        return {
+            "escalated": True,
+            "reasons": sorted(set(reasons)),
+            "message": f"检测到与相邻天存在交通或时间衔接依赖，已联动微调 {impacted_text}。",
+            "impacted_days": impacted_days,
+        }
+    return {"escalated": False, "reasons": [], "message": "", "impacted_days": []}
 
 
 def _build_agent_thread_id(user_id: str, device_id: str) -> str:
@@ -3195,7 +3378,12 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
     current_trip = storage.get_trip_data(session_id)
     if not current_trip:
         raise HTTPException(status_code=404, detail="当前会话未找到行程数据")
-    day_value = int(payload.day)
+    scope_day = int(payload.scope.day) if payload.scope else int(payload.day)
+    scope_time_range = str(payload.scope.time_range or "").strip().lower() if payload.scope else ""
+    if scope_time_range not in {"", "morning", "afternoon", "evening"}:
+        raise HTTPException(status_code=400, detail="time_range 仅支持 morning/afternoon/evening")
+    time_range = scope_time_range or None
+    locked_days = _normalize_locked_days(payload.locked_days, scope_day)
     llm_manager = _get_llm_manager()
     normalized_constraints = _normalize_trip_constraints(payload.constraints or current_trip.get("constraints_used") or {})
     user_input = {
@@ -3208,25 +3396,107 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
         "pace": normalized_constraints.get("pace", "cultural"),
         "special_constraints": normalized_constraints.get("special_constraints") or {},
     }
+    # 这里把“目标范围 / 锁定天 / 用户补充指令”全部压进 edit_cmd，
+    # 让 LLM 在重排时有明确边界，避免把局部修改误扩散到全行程。
+    scope_label_map = {
+        "morning": "上午",
+        "afternoon": "下午",
+        "evening": "晚间",
+    }
+    scope_label = scope_label_map.get(time_range, "整天")
+    replan_instruction = str(payload.replan_instruction or "").strip()
     edit_cmd = {
         "type": "modify",
-        "msg": f"仅重新规划第{day_value}天行程，其余天保持不变",
+        "msg": f"仅重新规划第{scope_day}天{scope_label}行程，其余天保持最小改动",
+        "scope": {"day": scope_day, "time_range": time_range},
+        "locked_days": locked_days,
+        "replan_instruction": replan_instruction,
     }
-    replanned_trip = llm_manager.generate_trip(user_input, [], edit_cmd)
+    replan_context = _build_replan_context(
+        current_trip=current_trip,
+        target_day=scope_day,
+        time_range=time_range,
+        locked_days=locked_days,
+        replan_instruction=replan_instruction,
+    )
+    logger.info(
+        "局部重排开始 session_id=%s day=%s time_range=%s locked_days=%s",
+        session_id,
+        scope_day,
+        time_range or "full_day",
+        locked_days,
+    )
+    replanned_trip = llm_manager.generate_trip(user_input, replan_context, edit_cmd)
     if not replanned_trip:
         raise HTTPException(status_code=500, detail="重新规划失败")
-    current_daily_plan = _normalize_daily_plan(current_trip)
+    original_daily_plan = _normalize_daily_plan(current_trip)
+    current_daily_plan = dict(original_daily_plan)
     replanned_daily_plan = _normalize_daily_plan(replanned_trip)
-    day_key = str(day_value)
-    if day_key in replanned_daily_plan:
-        current_daily_plan[day_key] = replanned_daily_plan[day_key]
+    day_key = str(scope_day)
+    original_day_items = current_daily_plan.get(day_key, [])
+    replanned_day_items = replanned_daily_plan.get(day_key, [])
+    if replanned_day_items:
+        current_daily_plan[day_key] = _merge_day_items_by_scope(
+            original_day_items=original_day_items,
+            replanned_items=replanned_day_items,
+            time_range=time_range,
+        )
+
+    escalation_meta = _detect_replan_escalation(current_trip, scope_day, time_range, locked_days)
+    if escalation_meta.get("escalated"):
+        impacted_days = escalation_meta.get("impacted_days") or []
+        # 对相邻受影响天只做最小联动：上一天只允许动 evening，下一天只允许动 morning。
+        # 这样既能处理跨天交通衔接，又能把改动范围控制在最小必要集合里。
+        for impacted_day in impacted_days:
+            impacted_key = str(impacted_day)
+            impacted_items = replanned_daily_plan.get(impacted_key) or []
+            if not impacted_items:
+                continue
+            impacted_scope = "morning" if impacted_day > scope_day else "evening"
+            current_daily_plan[impacted_key] = _merge_day_items_by_scope(
+                original_items=current_daily_plan.get(impacted_key, []),
+                replanned_items=impacted_items,
+                time_range=impacted_scope,
+            )
+
+    # 锁定天始终以原始数据为准，哪怕模型误改了，也在 merge 末尾硬回退。
+    for locked_day in locked_days:
+        locked_key = str(locked_day)
+        if locked_key in replanned_daily_plan and replanned_daily_plan.get(locked_key) != original_daily_plan.get(locked_key):
+            logger.warning("局部重排命中锁定天回退 session_id=%s day=%s", session_id, locked_day)
+        if locked_key in original_daily_plan:
+            current_daily_plan[locked_key] = original_daily_plan.get(locked_key, [])
+
     merged_trip = dict(current_trip)
     merged_trip["daily_plan"] = current_daily_plan
     merged_trip["constraints_used"] = normalized_constraints
     merged_trip["constraints_satisfied"] = _build_constraint_statuses(merged_trip, normalized_constraints)
-    merged_trip["conflict_report"] = llm_manager.build_conflict_report(merged_trip, normalized_constraints).model_dump()
+    conflict_report = llm_manager.build_conflict_report(merged_trip, normalized_constraints).model_dump()
+    merged_trip["conflict_report"] = conflict_report
     storage.store_trip_data(session_id, merged_trip)
-    return TripReplanDayResponse(session_id=session_id, trip_data=merged_trip)
+    logger.info(
+        "局部重排完成 session_id=%s day=%s time_range=%s escalated=%s conflict=%s",
+        session_id,
+        scope_day,
+        time_range or "full_day",
+        bool(escalation_meta.get("escalated")),
+        bool(conflict_report.get("has_conflicts")),
+    )
+    return TripReplanDayResponse(
+        session_id=session_id,
+        trip_data=merged_trip,
+        replanned_scope={
+            "day": scope_day,
+            "time_range": time_range,
+            "locked_days": locked_days,
+        },
+        agent_escalation=AgentEscalationInfo(
+            escalated=bool(escalation_meta.get("escalated")),
+            reasons=list(escalation_meta.get("reasons") or []),
+            message=str(escalation_meta.get("message") or ""),
+        ),
+        conflict_report=conflict_report,
+    )
 
 
 @app.get("/api/knowledge/bases", response_model=KnowledgeBaseListResponse)

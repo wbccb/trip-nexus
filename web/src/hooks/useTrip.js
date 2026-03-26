@@ -69,12 +69,14 @@ export function useTrip({
   const [tripResult, setTripResult] = useState(null);
   const [conflictReport, setConflictReport] = useState(createEmptyConflictReport());
   const [selectedAlternative, setSelectedAlternative] = useState(null);
+  const [lockedDays, setLockedDays] = useState(new Set());
   const [loadingTrip, setLoadingTrip] = useState(false);
   const tripDays = useMemo(() => normalizeTripDays(tripResult), [tripResult]);
   const updateTripResult = useCallback((data) => {
     setTripResult(data || null);
     setConflictReport(data?.conflict_report || createEmptyConflictReport());
     setSelectedAlternative(null);
+    setLockedDays(new Set());
   }, []);
   const buildDefaultKnowledgeQuery = useCallback((values) => {
     const destination = String(values?.destination || "").trim();
@@ -106,21 +108,49 @@ export function useTrip({
         setActiveSessionId(data.session_id);
         localStorage.setItem(SESSION_STORAGE_KEY, data.session_id);
       }
+      setLockedDays(new Set());
     },
     [activeSessionId, setActiveSessionId],
   );
 
   // 单日重排：触发主流程的指定天重规划能力
   const handleFlowReplanDay = useCallback(
-    async (day) => {
+    async (replanInput) => {
+      const normalizedInput =
+        typeof replanInput === "number"
+          ? { day: replanInput }
+          : replanInput && typeof replanInput === "object"
+            ? replanInput
+            : null;
+      const day = Number(normalizedInput?.scope?.day || normalizedInput?.day || 0);
       if (!day) {
         return null;
       }
+      const scope =
+        normalizedInput?.scope && typeof normalizedInput.scope === "object"
+          ? {
+              day,
+              time_range: normalizedInput.scope.time_range || null,
+            }
+          : null;
+      // 锁定天由页面状态与本次操作显式传参共同决定，避免局部重排时丢锁定上下文。
+      const mergedLockedDays = Array.from(
+        new Set([
+          ...Array.from(lockedDays),
+          ...(Array.isArray(normalizedInput?.lockedDays) ? normalizedInput.lockedDays : []),
+        ]),
+      )
+        .map((item) => Number(item))
+        .filter((item) => Number.isInteger(item) && item > 0 && item !== day)
+        .sort((a, b) => a - b);
       const payload = {
         user_id: DEFAULT_USER_ID,
         device_id: DEFAULT_DEVICE_ID,
         session_id: activeSessionId,
         day,
+        scope,
+        locked_days: mergedLockedDays,
+        replan_instruction: String(normalizedInput?.replanInstruction || "").trim() || null,
         constraints: resolveTripConstraints(tripResult),
       };
       const data = await replanFlowDay(payload);
@@ -130,12 +160,12 @@ export function useTrip({
       }
       if (data?.trip_data) {
         setTripResult(data.trip_data);
-        setConflictReport(data.trip_data?.conflict_report || createEmptyConflictReport());
+        setConflictReport(data?.conflict_report || data.trip_data?.conflict_report || createEmptyConflictReport());
         setSelectedAlternative(null);
       }
-      return data?.trip_data || null;
+      return data || null;
     },
-    [activeSessionId, setActiveSessionId, tripResult],
+    [activeSessionId, lockedDays, setActiveSessionId, tripResult],
   );
 
   // 主流程提交：发起流式规划并消费统一 SSE 事件
@@ -262,8 +292,10 @@ export function useTrip({
   return {
     conflictReport,
     handleFlowSubmit,
+    lockedDays,
     selectedAlternative,
     setConflictReport,
+    setLockedDays,
     setSelectedAlternative,
     loadingTrip,
     tripDays,
