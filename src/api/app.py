@@ -3529,7 +3529,7 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
         #   不在该时间段内的旧项全部保留
         # 这样能保证“上午重排不会把晚上晚餐或酒店入住也冲掉”。
         current_daily_plan[day_key] = _merge_day_items_by_scope(
-            original_day_items=original_day_items,
+            original_items=original_day_items,
             replanned_items=replanned_day_items,
             time_range=time_range,
         )
