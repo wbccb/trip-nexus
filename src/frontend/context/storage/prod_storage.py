@@ -178,6 +178,145 @@ class ProdConversationStorage(BaseConversationStorage):
                 conn.close()
         return ""
 
+    def store_session(self, user_id: str, session_id: str):
+        """存储会话（MySQL）"""
+        try:
+            conn = self._get_mysql_connection()
+            cursor = conn.cursor()
+            now = datetime.datetime.now()
+            name = f"会话 {session_id[:8]}"
+            query = """
+            INSERT INTO session_list (session_id, user_id, name, update_time)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE update_time = %s
+            """
+            cursor.execute(query, (session_id, user_id, name, now, now))
+            conn.commit()
+        except Exception as e:
+            log_event(logger, logging.ERROR, "MySQL 存储会话失败", {"原因": str(e)})
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()
+
+    def get_session_list(self, user_id: str) -> List[Dict]:
+        """获取会话列表（MySQL）"""
+        try:
+            conn = self._get_mysql_connection()
+            cursor = conn.cursor(dictionary=True)
+            query = "SELECT * FROM session_list WHERE user_id = %s ORDER BY update_time DESC"
+            cursor.execute(query, (user_id,))
+            return cursor.fetchall()
+        except Exception as e:
+            log_event(logger, logging.ERROR, "MySQL 获取会话列表失败", {"原因": str(e)})
+            return []
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()
+
+    def get_session_meta(self, session_id: str) -> Optional[Dict]:
+        """获取会话元数据（MySQL）"""
+        try:
+            conn = self._get_mysql_connection()
+            cursor = conn.cursor(dictionary=True)
+            query = "SELECT * FROM session_list WHERE session_id = %s"
+            cursor.execute(query, (session_id,))
+            return cursor.fetchone()
+        except Exception as e:
+            log_event(logger, logging.ERROR, "MySQL 获取会话元数据失败", {"原因": str(e)})
+            return None
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()
+
+    def store_session_chat(self, session_id: str, message: str):
+        """存储聊天记录（MySQL）"""
+        try:
+            conn = self._get_mysql_connection()
+            cursor = conn.cursor()
+            now = datetime.datetime.now()
+            query = "INSERT INTO session_chat (session_id, message, update_time) VALUES (%s, %s, %s)"
+            cursor.execute(query, (session_id, message, now))
+            conn.commit()
+        except Exception as e:
+            log_event(logger, logging.ERROR, "MySQL 存储聊天记录失败", {"原因": str(e)})
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()
+
+    def get_session_chat_list(self, session_id: str) -> List[str]:
+        """获取聊天记录列表（MySQL）"""
+        try:
+            conn = self._get_mysql_connection()
+            cursor = conn.cursor()
+            query = "SELECT message FROM session_chat WHERE session_id = %s ORDER BY update_time ASC"
+            cursor.execute(query, (session_id,))
+            return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            log_event(logger, logging.ERROR, "MySQL 获取聊天记录失败", {"原因": str(e)})
+            return []
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()
+
+    def delete_session_chat_by_id(self, chat_id: int):
+        """删除单条聊天记录（MySQL）"""
+        try:
+            conn = self._get_mysql_connection()
+            cursor = conn.cursor()
+            query = "DELETE FROM session_chat WHERE id = %s"
+            cursor.execute(query, (chat_id,))
+            conn.commit()
+        except Exception as e:
+            log_event(logger, logging.ERROR, "MySQL 删除聊天记录失败", {"原因": str(e)})
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()
+
+    def store_trip_data(self, session_id: str, trip_data: Dict):
+        """存储行程数据（MySQL）"""
+        try:
+            conn = self._get_mysql_connection()
+            cursor = conn.cursor()
+            data_json = json.dumps(trip_data, ensure_ascii=False)
+            now = datetime.datetime.now()
+            query = """
+            INSERT INTO trip_data_store (session_id, data_json, last_updated)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE data_json = %s, last_updated = %s
+            """
+            cursor.execute(query, (session_id, data_json, now, data_json, now))
+            conn.commit()
+        except Exception as e:
+            log_event(logger, logging.ERROR, "MySQL 存储行程数据失败", {"原因": str(e)})
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()
+
+    def get_trip_data(self, session_id: str) -> Optional[Dict]:
+        """获取行程数据（MySQL）"""
+        try:
+            conn = self._get_mysql_connection()
+            cursor = conn.cursor(dictionary=True)
+            query = "SELECT data_json FROM trip_data_store WHERE session_id = %s"
+            cursor.execute(query, (session_id,))
+            result = cursor.fetchone()
+            if result:
+                return json.loads(result['data_json'])
+        except Exception as e:
+            log_event(logger, logging.ERROR, "MySQL 获取行程数据失败", {"原因": str(e)})
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()
+        return None
+
     def delete_session(self, session_id: str):
         redis_keys = [
             f"session:{session_id}:short_term",

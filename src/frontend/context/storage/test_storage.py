@@ -307,6 +307,13 @@ class TestConversationStorage(BaseConversationStorage):
         cursor.execute("SELECT * FROM session_list WHERE user_id = ? ORDER BY update_time DESC", (user_id,))
         return cursor.fetchall()
 
+    def get_session_meta(self, session_id: str) -> Optional[Dict]:
+        """获取会话元数据（包含 user_id 权属信息）"""
+        cursor = self.sqlite_conn.cursor()
+        cursor.execute("SELECT * FROM session_list WHERE session_id = ?", (session_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
     def delete_session(self, session_id: str):
         cursor = self.sqlite_conn.cursor()
         cursor.execute("""

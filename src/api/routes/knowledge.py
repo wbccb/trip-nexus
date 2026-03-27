@@ -140,6 +140,7 @@ def knowledge_search(
 
 
 @router.post("/answer", response_model=KnowledgeAnswerResponse)
+@router.post("/answer_from_evidence", response_model=KnowledgeAnswerResponse)
 def knowledge_answer(
     payload: KnowledgeAnswerRequest,
     request: Request,
@@ -172,6 +173,7 @@ def knowledge_answer(
 
 
 @router.post("/base/create", response_model=KnowledgeBaseCreateResponse)
+@router.post("/bases", response_model=KnowledgeBaseCreateResponse)
 def create_knowledge_base(
     payload: KnowledgeBaseCreateRequest,
     request: Request,
@@ -206,6 +208,7 @@ def create_knowledge_base(
 
 
 @router.get("/base/list", response_model=KnowledgeBaseListResponse)
+@router.get("/bases", response_model=KnowledgeBaseListResponse)
 def list_knowledge_bases(
     request: Request,
     current_user: AuthenticatedUser = Depends(get_current_user),
@@ -227,6 +230,7 @@ def list_knowledge_bases(
 
 
 @router.delete("/base/{knowledge_base_id}", response_model=KnowledgeBaseDeleteResponse)
+@router.delete("/bases/{knowledge_base_id}", response_model=KnowledgeBaseDeleteResponse)
 def delete_knowledge_base(
     knowledge_base_id: str,
     request: Request,
@@ -258,6 +262,7 @@ def delete_knowledge_base(
 
 
 @router.post("/base/{knowledge_base_id}/upload", response_model=KnowledgeUploadResponse)
+@router.post("/bases/{knowledge_base_id}/upload", response_model=KnowledgeUploadResponse)
 async def upload_knowledge_file(
     knowledge_base_id: str,
     request: Request,
@@ -319,6 +324,47 @@ async def upload_knowledge_file(
         _reset_observability_context(guard_token)
 
 
+@router.post("/preprocess/url", response_model=KnowledgePreprocessUrlResponse)
+def preprocess_knowledge_url_public(
+    payload: KnowledgePreprocessUrlRequest,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgePreprocessUrlResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/knowledge/preprocess/url",
+    )
+    try:
+        url = str(payload.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="url 不能为空")
+        pre_payload = preprocess_url(url)
+        resolved_url = str(pre_payload.get("resolved_url") or url)
+        source_platform = _infer_source_platform(resolved_url)
+        source_risk_level = str(pre_payload.get("risk_level") or "low")
+        resolve_error_code = str(pre_payload.get("error_code") or "") or None
+        parse_preview = _run_url_auto_parse_preview(resolved_url, source_platform, source_risk_level, resolve_error_code)
+        return KnowledgePreprocessUrlResponse(
+            success=True,
+            normalized_url=str(pre_payload.get("normalized_url") or ""),
+            resolved_url=resolved_url,
+            source_platform=source_platform,
+            source_risk_level=source_risk_level,
+            resolve_error_code=resolve_error_code,
+            extractor_layer=parse_preview.get("extractor_layer"),
+            quality_score=parse_preview.get("quality_score"),
+            ingest_error_code=parse_preview.get("ingest_error_code"),
+            failure_reason=parse_preview.get("failure_reason"),
+            content_lang=parse_preview.get("content_lang"),
+            requires_user_assist=bool(parse_preview.get("requires_user_assist")),
+            parsed_content_preview=str(parse_preview.get("parsed_content_preview") or ""),
+            parsed_content_chars=int(parse_preview.get("parsed_content_chars") or 0),
+        )
+    finally:
+        _reset_observability_context(guard_token)
+
+
 @router.post("/base/{knowledge_base_id}/preprocess_url", response_model=KnowledgePreprocessUrlResponse)
 def preprocess_knowledge_url(
     knowledge_base_id: str,
@@ -368,6 +414,7 @@ def preprocess_knowledge_url(
 
 
 @router.post("/base/{knowledge_base_id}/ingest_url", response_model=KnowledgeIngestUrlResponse)
+@router.post("/bases/{knowledge_base_id}/ingest/url", response_model=KnowledgeIngestUrlResponse)
 def ingest_knowledge_url(
     knowledge_base_id: str,
     payload: KnowledgeIngestUrlRequest,
@@ -466,6 +513,7 @@ def ingest_knowledge_url(
 
 
 @router.get("/base/{knowledge_base_id}/sources", response_model=KnowledgeSourceListResponse)
+@router.get("/bases/{knowledge_base_id}/sources", response_model=KnowledgeSourceListResponse)
 def list_knowledge_sources(
     knowledge_base_id: str,
     request: Request,
@@ -495,6 +543,7 @@ def list_knowledge_sources(
 
 
 @router.delete("/base/{knowledge_base_id}/sources/{source_id}", response_model=KnowledgeSourceDeleteResponse)
+@router.delete("/bases/{knowledge_base_id}/sources/{source_id}", response_model=KnowledgeSourceDeleteResponse)
 def delete_knowledge_source(
     knowledge_base_id: str,
     source_id: str,
@@ -543,6 +592,8 @@ def delete_knowledge_source(
 
 
 @router.put("/base/{knowledge_base_id}/sources/{source_id}", response_model=KnowledgeSourceUpdateResponse)
+@router.put("/bases/{knowledge_base_id}/sources/{source_id}", response_model=KnowledgeSourceUpdateResponse)
+@router.patch("/bases/{knowledge_base_id}/sources/{source_id}", response_model=KnowledgeSourceUpdateResponse)
 def update_knowledge_source(
     knowledge_base_id: str,
     source_id: str,
@@ -612,6 +663,7 @@ def update_knowledge_source(
 
 
 @router.get("/base/debug_snapshot", response_model=KnowledgeDebugSnapshotResponse)
+@router.get("/debug/snapshot", response_model=KnowledgeDebugSnapshotResponse)
 def knowledge_debug_snapshot(
     request: Request,
     current_user: AuthenticatedUser = Depends(get_current_user),

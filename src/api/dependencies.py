@@ -3,7 +3,7 @@ import json
 import logging
 import time
 from functools import lru_cache
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, Request
 
@@ -100,8 +100,7 @@ def _get_map_renderer() -> TripMap:
 
 
 def _get_knowledge_store() -> VectorStore:
-    config = _get_config()
-    return VectorStore(config)
+    return VectorStore()
 
 
 def _normalize_knowledge_base_id(raw_id: str) -> str:

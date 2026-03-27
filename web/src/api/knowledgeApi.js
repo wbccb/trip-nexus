@@ -1,6 +1,10 @@
-// 知识库检索相关接口封装
-import { apiPost } from "./httpClient.js";
-import { API_BASE } from "./httpClient.js";
+import {
+  apiDelete,
+  apiGet,
+  apiPatch,
+  apiPost,
+  apiPostForm,
+} from "./httpClient.js";
 
 // 检索知识库
 export async function searchKnowledge(
@@ -25,13 +29,7 @@ export async function generateKnowledgeAnswer(query, evidence) {
 }
 
 export async function listKnowledgeBases() {
-  const response = await fetch(`${API_BASE}/api/knowledge/bases`);
-  if (!response.ok) {
-    throw new Error(
-      `GET /api/knowledge/bases failed with status ${response.status}`,
-    );
-  }
-  return response.json();
+  return apiGet("/api/knowledge/bases");
 }
 
 export async function createKnowledgeBase(name) {
@@ -39,36 +37,18 @@ export async function createKnowledgeBase(name) {
 }
 
 export async function deleteKnowledgeBase(knowledgeBaseId) {
-  const response = await fetch(
-    `${API_BASE}/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}`,
-    {
-      method: "DELETE",
-    },
+  return apiDelete(
+    `/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}`,
   );
-  if (!response.ok) {
-    throw new Error(
-      `DELETE /api/knowledge/bases failed with status ${response.status}`,
-    );
-  }
-  return response.json();
 }
 
 export async function uploadKnowledgeDocument(knowledgeBaseId, file) {
   const formData = new FormData();
   formData.append("file", file);
-  const response = await fetch(
-    `${API_BASE}/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/upload`,
-    {
-      method: "POST",
-      body: formData,
-    },
+  return apiPostForm(
+    `/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/upload`,
+    formData,
   );
-  if (!response.ok) {
-    throw new Error(
-      `POST /api/knowledge/bases/{id}/upload failed with status ${response.status}`,
-    );
-  }
-  return response.json();
 }
 
 export async function ingestKnowledgeUrl(knowledgeBaseId, payload) {
@@ -89,40 +69,19 @@ export async function preprocessKnowledgeUrl(payload) {
 export async function listKnowledgeSources(knowledgeBaseId) {
   // sources 接口返回的是“来源聚合视图”，不是底层分块列表；
   // 其中既包含已入库来源，也可能包含等待用户补救的 failed 来源。
-  const response = await fetch(
-    `${API_BASE}/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/sources`,
+  return apiGet(
+    `/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/sources`,
   );
-  if (!response.ok) {
-    throw new Error(
-      `GET /api/knowledge/bases/{id}/sources failed with status ${response.status}`,
-    );
-  }
-  return response.json();
 }
 
 export async function getKnowledgeDebugSnapshot() {
-  const response = await fetch(`${API_BASE}/api/knowledge/debug/snapshot`);
-  if (!response.ok) {
-    throw new Error(
-      `GET /api/knowledge/debug/snapshot failed with status ${response.status}`,
-    );
-  }
-  return response.json();
+  return apiGet("/api/knowledge/debug/snapshot");
 }
 
 export async function deleteKnowledgeSource(knowledgeBaseId, sourceId) {
-  const response = await fetch(
-    `${API_BASE}/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/sources/${encodeURIComponent(sourceId)}`,
-    {
-      method: "DELETE",
-    },
+  return apiDelete(
+    `/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/sources/${encodeURIComponent(sourceId)}`,
   );
-  if (!response.ok) {
-    throw new Error(
-      `DELETE /api/knowledge/bases/{id}/sources/{source_id} failed with status ${response.status}`,
-    );
-  }
-  return response.json();
 }
 
 export async function updateKnowledgeSource(
@@ -130,20 +89,8 @@ export async function updateKnowledgeSource(
   sourceId,
   payload,
 ) {
-  const response = await fetch(
-    `${API_BASE}/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/sources/${encodeURIComponent(sourceId)}`,
-    {
-      method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload || {}),
-    },
+  return apiPatch(
+    `/api/knowledge/bases/${encodeURIComponent(knowledgeBaseId)}/sources/${encodeURIComponent(sourceId)}`,
+    payload || {},
   );
-  if (!response.ok) {
-    throw new Error(
-      `PATCH /api/knowledge/bases/{id}/sources/{source_id} failed with status ${response.status}`,
-    );
-  }
-  return response.json();
 }

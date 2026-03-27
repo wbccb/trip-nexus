@@ -57,8 +57,13 @@ class BaseConversationStorage(ABC):
         pass
 
     @abstractmethod
-    def get_session_list(self, session_id: str) -> List[Dict]:
+    def get_session_list(self, user_id: str) -> List[Dict]:
         """会话数据列表（数据库）"""
+        pass
+
+    @abstractmethod
+    def get_session_meta(self, session_id: str) -> Optional[Dict]:
+        """获取单个会话的元数据（数据库）"""
         pass
 
     @abstractmethod

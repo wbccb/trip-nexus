@@ -2,7 +2,8 @@
 import { AUTH_TOKEN_KEY } from "../constants/appConfig.js";
 
 // 获取 API 基础地址，默认指向本地后端
-export const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+export const API_BASE =
+  import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 
 export function getAuthToken() {
   // 所有页面都通过这一个入口读取 token，避免不同模块各自拼 localStorage key。
@@ -42,6 +43,12 @@ function emitUnauthorized() {
   window.dispatchEvent(new CustomEvent("tripnexus:unauthorized"));
 }
 
+function emitForbiddenSession() {
+  // 如果当前访问的会话 ID 不属于当前用户（403），广播该事件，
+  // 提醒 useSessions 钩子清理本地残留的 session_id 并尝试新建或切换。
+  window.dispatchEvent(new CustomEvent("tripnexus:forbidden-session"));
+}
+
 function buildFriendlyErrorMessage(status, detail, method, path) {
   const detailText = String(detail || "").trim();
   if (status === 429) {
@@ -74,7 +81,13 @@ async function parseJsonResponse(response, method, path) {
     } catch (error) {
       detail = "";
     }
-    throw new Error(buildFriendlyErrorMessage(response.status, detail, method, path));
+    // 如果是 403 且内容包含“无权访问该会话”，说明本地 session_id 权属不对，触发清理事件
+    if (response.status === 403 && String(detail).includes("无权访问该会话")) {
+      emitForbiddenSession();
+    }
+    throw new Error(
+      buildFriendlyErrorMessage(response.status, detail, method, path),
+    );
   }
   return response.json();
 }
@@ -106,6 +119,16 @@ export async function apiPost(path, body) {
   return parseJsonResponse(response, "POST", path);
 }
 
+export async function apiPostForm(path, formData) {
+  const url = `${API_BASE}${path}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: buildHeaders(),
+    body: formData,
+  });
+  return parseJsonResponse(response, "POST", path);
+}
+
 export async function apiDelete(path) {
   const url = `${API_BASE}${path}`;
   const response = await fetch(url, {
@@ -126,4 +149,16 @@ export async function apiPut(path, body) {
     body: JSON.stringify(body || {}),
   });
   return parseJsonResponse(response, "PUT", path);
+}
+
+export async function apiPatch(path, body) {
+  const url = `${API_BASE}${path}`;
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: buildHeaders({
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify(body || {}),
+  });
+  return parseJsonResponse(response, "PATCH", path);
 }

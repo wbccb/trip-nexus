@@ -17,7 +17,7 @@ import { logDebug } from "../utils/debugLogger.js";
 
 const KNOWLEDGE_BASE_STORAGE_KEY = "tripnexus_selected_knowledge_base_id";
 
-export function useKnowledge() {
+export function useKnowledge({ isAuthenticated } = {}) {
   const [knowledgeQuery, setKnowledgeQuery] = useState("");
   const [knowledgeResult, setKnowledgeResult] = useState(null);
   const [loadingKnowledge, setLoadingKnowledge] = useState(false);
@@ -116,6 +116,10 @@ export function useKnowledge() {
   );
 
   const refreshKnowledgeBases = useCallback(async () => {
+    if (!isAuthenticated) {
+      setKnowledgeBases([]);
+      return;
+    }
     try {
       setLoadingKnowledgeBases(true);
       const data = await listKnowledgeBases();
@@ -140,11 +144,17 @@ export function useKnowledge() {
     } finally {
       setLoadingKnowledgeBases(false);
     }
-  }, [selectedKnowledgeBaseId]);
+  }, [isAuthenticated, selectedKnowledgeBaseId]);
 
   useEffect(() => {
+    if (!isAuthenticated) {
+      setKnowledgeBases([]);
+      setKnowledgeSources([]);
+      setSourceStats({ total: 0, parsed: 0, fallback: 0, failed: 0 });
+      return;
+    }
     refreshKnowledgeBases();
-  }, [refreshKnowledgeBases, refreshKnowledgeSources]);
+  }, [isAuthenticated, refreshKnowledgeBases, refreshKnowledgeSources]);
 
   useEffect(() => {
     if (typeof window === "undefined") {

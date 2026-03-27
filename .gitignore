@@ -12,6 +12,7 @@ venv/
 # 本地数据库
 chroma_db/
 chroma
+chroma_db_*
 
 # 日志和临时文件
 *.log

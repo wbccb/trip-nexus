@@ -98,6 +98,26 @@ export function useSessions({ isAuthenticated }) {
     ensureSession();
   }, [ensureSession, isAuthenticated, loadSessions]);
 
+  useEffect(() => {
+    // 监听 403 “无权访问该会话”事件。
+    // 这通常发生在：用户在 A 账号下创建了会话，退出后换 B 账号登录，
+    // 但浏览器本地缓存的 session_id 还是 A 的，此时回源请求会报 403。
+    const handleForbiddenSession = () => {
+      console.warn("Detected stale/forbidden session, clearing local cache...");
+      localStorage.removeItem(SESSION_STORAGE_KEY);
+      setActiveSessionId(null);
+      // 清理后重新尝试初始化（会触发新建会话）
+      startNewSession();
+    };
+    window.addEventListener("tripnexus:forbidden-session", handleForbiddenSession);
+    return () => {
+      window.removeEventListener(
+        "tripnexus:forbidden-session",
+        handleForbiddenSession,
+      );
+    };
+  }, [startNewSession]);
+
   return {
     activeSessionId,
     deleteSessionById,

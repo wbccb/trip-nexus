@@ -3,7 +3,6 @@ from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional, Any, Iterable, Callable
 
-from langchain_ollama import OllamaLLM
 import copy
 import json
 import re
@@ -235,6 +234,14 @@ class LlmManager:
                 temperature=temperature,  # 温度参数
                 extra_body=OPENAI_CHAT_TEMPLATE_KWARGS,  # 统一关闭深度思考，优先响应速度
             )
+
+        try:
+            from langchain_ollama import OllamaLLM
+        except ImportError as e:
+            raise RuntimeError(
+                "当前环境缺少 langchain_ollama，无法初始化 provider=ollama。"
+                "请先执行 `pip install langchain-ollama` 或切换 provider=openai_compatible。"
+            ) from e
 
         log_event(logger, logging.INFO, "初始化 Ollama 模型", {"模型": model_name, "地址": base_url})
         return OllamaLLM(  # 创建 Ollama 模型实例

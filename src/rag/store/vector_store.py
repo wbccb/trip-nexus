@@ -6,7 +6,9 @@ from chromadb import PersistentClient
 from src.config import Config
 from src.rag.module.intent_recognition import _get_sentence_transformer
 import logging
+import os
 import re
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +50,7 @@ class VectorStore:
     def _init_db(self):
         """初始化向量数据库"""
         try:
-            self.client = PersistentClient(path=self.persist_directory)
+            self.client = self._build_client()
             self.client.get_or_create_collection(name=self.collection_name)
             self.vector_db = Chroma(
                 collection_name=self.collection_name,
@@ -59,6 +61,26 @@ class VectorStore:
         except Exception as e:
             logger.error(f"Failed to initialize ChromaDB: {e}")
             raise
+
+    def _build_client(self):
+        """构建 Chroma client，初始化失败时自动修复持久化目录后重试。"""
+        try:
+            return PersistentClient(path=self.persist_directory)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            logger.warning(f"PersistentClient init failed, start repair: {exc}")
+            self._repair_persist_directory()
+            return PersistentClient(path=self.persist_directory)
+
+    def _repair_persist_directory(self) -> None:
+        """修复持久化目录：备份损坏目录并重建空目录。"""
+        target_dir = os.path.abspath(self.persist_directory)
+        if os.path.isdir(target_dir):
+            backup_dir = f"{target_dir}_broken_{int(time.time())}"
+            os.rename(target_dir, backup_dir)
+            logger.warning(f"Chroma persist directory moved to backup: {backup_dir}")
+        os.makedirs(target_dir, exist_ok=True)
 
     def switch_collection(self, collection_name: str, create_if_missing: bool = True) -> None:
         """切换当前集合，用于多知识库并行管理。"""

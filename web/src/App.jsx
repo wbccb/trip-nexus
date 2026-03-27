@@ -128,7 +128,7 @@ export default function App() {
     setSelectedKnowledgeBaseId,
     sourceStats,
     uploadingKnowledge,
-  } = useKnowledge()
+  } = useKnowledge({ isAuthenticated })
   const {
     conflictReport,
     handleFlowSubmit,
