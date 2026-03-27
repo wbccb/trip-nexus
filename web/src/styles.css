@@ -16,8 +16,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 24px;
-  height: 64px;
+  padding: 10px 24px;
+  height: 84px;
 }
 
 .app-title {
