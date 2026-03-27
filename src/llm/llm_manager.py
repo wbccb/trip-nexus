@@ -1,7 +1,7 @@
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional, Any, Iterable
+from typing import Dict, List, Optional, Any, Iterable, Callable
 
 from langchain_ollama import OllamaLLM
 import copy
@@ -22,7 +22,13 @@ from src.observability import (
     ErrorCodes,
     normalize_exception,
     get_global_recorder,
+    log_event,
+    log_llm_end,
+    log_llm_start,
+    summarize_value,
 )
+import tiktoken
+import logging
 
 
 class DailyPlanItem(BaseModel):
@@ -49,8 +55,7 @@ class TripPlan(BaseModel):
     )
 
 
-def _ts() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+logger = logging.getLogger(__name__)
 
 
 def _strip_think_content(text: Any) -> str:
@@ -62,17 +67,16 @@ def _strip_think_content(text: Any) -> str:
 
 
 def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
-    if text is None:
-        return ""
-    text_value = str(text)
-    if len(text_value) <= head + tail + 5:
-        return text_value
-    return f"{text_value[:head]}....{text_value[-tail:]}"
+    return summarize_value(text, head=head, tail=tail)
 
 
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
-    preview = _format_log_text(cleaned_text)
-    print(f"[{_ts()}][LlmManager] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
+    log_event(
+        logger,
+        logging.INFO,
+        f"LLM 输出摘要: {tag}",
+        {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)},
+    )
 
 
 def _collect_template_fields(template: str) -> List[str]:
@@ -91,7 +95,7 @@ def _validate_template_fields(template: str, allowed_fields: List[str], template
     if unexpected:
         raise ValueError(f"{template_name} 存在未转义或未声明的占位符: {unexpected}")
     if missing:
-        print(f"[{_ts()}][LlmManager] 模板校验提示 {template_name} 缺少占位符: {missing}")
+        log_event(logger, logging.WARNING, f"模板校验提示: {template_name}", {"缺少占位符": missing})
 
 
 BUDGET_LEVEL_MAP = {
@@ -163,6 +167,49 @@ class LlmManager:
         self._metrics = get_global_recorder()
         # 初始化流式适配器，用于统一 stream/invoke 行为
         self._streaming_adapter = LlmStreamingAdapter()
+        # API 层可以把一个观察器挂进来，用于记录真实 LLM 调用对应的 token 消耗和审计信息。
+        self._usage_observer: Optional[Callable[[Dict[str, Any]], None]] = None
+        self._token_encoder = tiktoken.get_encoding("cl100k_base")
+
+    def set_usage_observer(self, observer: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+        """注册 LLM 调用观察器，供 API 层落库 token_usage_log。"""
+        self._usage_observer = observer
+
+    def estimate_tokens(self, text: Any) -> int:
+        """使用统一编码器估算 token 数，保证各入口统计口径一致。"""
+        if text in [None, ""]:
+            return 0
+        try:
+            return len(self._token_encoder.encode(str(text)))
+        except Exception:
+            return 0
+
+    def _notify_usage(
+        self,
+        *,
+        stage: str,
+        llm_role: str,
+        model_name: str,
+        prompt_text: str,
+        output_text: str,
+    ) -> None:
+        """把单次 LLM 调用的输入输出摘要上报给观察器。"""
+        if not self._usage_observer:
+            return
+        prompt_tokens = self.estimate_tokens(prompt_text)
+        completion_tokens = self.estimate_tokens(output_text)
+        self._usage_observer(
+            {
+                "stage": stage,
+                "role": llm_role,
+                "model_name": str(model_name or ""),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "prompt_text": str(prompt_text or ""),
+                "output_text": str(output_text or ""),
+            }
+        )
 
     def _create_llm(self, cfg: Dict[str, Any]):
         provider = cfg.get("provider") or "ollama"  # 读取提供方配置，缺省为 ollama
@@ -180,7 +227,7 @@ class LlmManager:
                 ) from e
 
             api_key = cfg.get("api_key") or ""  # 读取 API Key，缺省为空字符串
-            print(f"[{_ts()}][LlmManager] 初始化 OpenAI 兼容模型: {model_name} @ {base_url}")  # 记录初始化日志
+            log_event(logger, logging.INFO, "初始化 OpenAI 兼容模型", {"模型": model_name, "地址": base_url})
             return ChatOpenAI(  # 创建 OpenAI 兼容模型实例
                 model=model_name,  # 模型名称
                 api_key=api_key,  # API Key
@@ -189,7 +236,7 @@ class LlmManager:
                 extra_body=OPENAI_CHAT_TEMPLATE_KWARGS,  # 统一关闭深度思考，优先响应速度
             )
 
-        print(f"[{_ts()}][LlmManager] 初始化 Ollama 模型: {model_name} @ {base_url}")  # 记录 Ollama 初始化日志
+        log_event(logger, logging.INFO, "初始化 Ollama 模型", {"模型": model_name, "地址": base_url})
         return OllamaLLM(  # 创建 Ollama 模型实例
             base_url=base_url,  # Ollama Base URL
             model=model_name,  # 模型名称
@@ -200,7 +247,7 @@ class LlmManager:
         )
 
     def update_llm_config(self, config: Dict[str, Any]) -> None:
-        print(f"[{_ts()}][LlmManager] update_llm_config called with keys: {list(config.keys())}")
+        log_event(logger, logging.INFO, "更新 LLM 配置", {"配置键": list(config.keys())})
         analysis_cfg = {
             "provider": config.get("analysis_provider") or config.get("provider") or "ollama",
             "base_url": config.get("analysis_base_url") or config.get("base_url") or "http://localhost:11434",
@@ -215,8 +262,17 @@ class LlmManager:
             "api_key": config.get("generation_api_key") or config.get("api_key") or "",
             "temperature": float(config.get("generation_temperature", config.get("temperature", 0.7))),
         }
-        print(f"[{_ts()}][LlmManager] analysis_cfg: {analysis_cfg}")
-        print(f"[{_ts()}][LlmManager] generation_cfg: {generation_cfg}")
+        log_event(
+            logger,
+            logging.INFO,
+            "LLM 配置已生效",
+            {
+                "分析模型": analysis_cfg.get("model_name"),
+                "生成模型": generation_cfg.get("model_name"),
+                "分析提供方": analysis_cfg.get("provider"),
+                "生成提供方": generation_cfg.get("provider"),
+            },
+        )
         self._analysis_config = analysis_cfg
         self._generation_config = generation_cfg
         self.analysis_llm = self._create_llm(self._analysis_config)
@@ -316,12 +372,30 @@ class LlmManager:
 """
         # 将工具绑定到云端模型，让模型自行产出 tool_calls
         bound_llm = self.analysis_llm.bind_tools(tools)
-        print("准备触发大模型调用: functionCall获取当前需要使用的工具名")
+        started_at = log_llm_start(
+            logger,
+            stage="工具选择",
+            model=str((self._analysis_config or {}).get("model_name") or ""),
+            prompt=prompt,
+            extra={"上下文条数": len(normalized_context)},
+        )
         response = bound_llm.invoke(prompt)
         response_text = response.content if hasattr(response, "content") else response
         cleaned_response_text = _strip_think_content(response_text)
+        self._notify_usage(
+            stage="function_call_router",
+            llm_role="analysis",
+            model_name=str((self._analysis_config or {}).get("model_name") or ""),
+            prompt_text=prompt,
+            output_text=cleaned_response_text,
+        )
         _log_llm_output("function_call_response", cleaned_response_text)
-        print(f"[LLMManager] functionCall获取当前需要使用的工具名，!!!LLM触发 => 得到大模型原始响应: {response}")
+        log_llm_end(
+            logger,
+            stage="工具选择",
+            started_at=started_at,
+            output=cleaned_response_text,
+        )
 
         # 兼容不同模型返回结构，优先读取 tool_calls
         tool_calls = getattr(response, "tool_calls", None)
@@ -330,7 +404,7 @@ class LlmManager:
 
         # 模型未触发工具时直接返回，不进行额外兜底路由
         if not tool_calls:
-            print(f"[LLMManager] 从response拿不到tool_calls")
+            log_event(logger, logging.INFO, "工具选择完成，未命中工具")
             return {
                 "needs_tool": False,
                 "decision": {"needs_tool": False, "tool_name": "", "params": {}, "source": "function_call"},
@@ -349,7 +423,7 @@ class LlmManager:
 
         # 工具名为空时直接返回，避免误调用
         if not tool_name:
-            print(f"[LLMManager] 从tool_calls拿不到工具名: {json.dumps(first_call, ensure_ascii=False, default=str)}")
+            log_event(logger, logging.WARNING, "工具选择结果缺少工具名", {"原始结果": first_call})
             return {
                 "needs_tool": False,
                 "decision": {"needs_tool": False, "tool_name": "", "params": {}, "source": "function_call"},
@@ -357,7 +431,7 @@ class LlmManager:
                 "fallback": False,
             }
 
-        print(f"[LLMManager] 使用云端模型的 FunctionCall 能力完成工具选择与执行，!!!LLM触发 => 得到工具名:{tool_name}, 参数:{params}")
+        log_event(logger, logging.INFO, "工具选择完成", {"工具名": tool_name, "参数": params})
 
 
         # 执行工具并返回标准化结果
@@ -375,10 +449,11 @@ class LlmManager:
         result_size = len(result_items) if isinstance(result_items, list) else None
         success_flag = result.get("success") if isinstance(result, dict) else None
         error_message = result.get("error") if isinstance(result, dict) else None
-        print(
-            "[LLMManager] 工具执行结果 "
-            f"tool={tool_name} success={success_flag} "
-            f"size={result_size} error={error_message}"
+        log_event(
+            logger,
+            logging.INFO if success_flag is not False else logging.WARNING,
+            "工具执行完成",
+            {"工具名": tool_name, "成功": success_flag, "结果数量": result_size, "错误": error_message},
         )
         return res
 
@@ -459,25 +534,45 @@ class LlmManager:
         )
         cfg = self._generation_config if llm_role == "generation" else self._analysis_config
         request_id = f"{llm_role}-{start_ts.strftime('%H%M%S%f')}"
-        print(
-            f"[{_ts()}][LlmManager] llm_http_request_start stage={stage} role={llm_role} "
-            f"provider={cfg.get('provider')} base_url={cfg.get('base_url')} model={cfg.get('model_name')} "
-            f"request_id={request_id}"
+        log_event(
+            logger,
+            logging.INFO,
+            "LLM 流式调用开始",
+            {
+                "阶段": stage,
+                "角色": llm_role,
+                "模型": cfg.get("model_name"),
+                "提供方": cfg.get("provider"),
+                "请求ID": request_id,
+                "提示词长度": len(prompt),
+            },
         )
 
         def _stream_wrapper() -> Iterable[str]:
             nonlocal output_chars
+            output_parts: List[str] = []
             for delta in self._streaming_adapter.stream_llm_text(llm, prompt):
                 output_chars += len(str(delta))
+                output_parts.append(str(delta or ""))
                 yield delta
             elapsed_ms = int((datetime.now() - start_ts).total_seconds() * 1000)
+            full_output_text = "".join(output_parts)
+            self._notify_usage(
+                stage=stage,
+                llm_role=llm_role,
+                model_name=str(cfg.get("model_name") or ""),
+                prompt_text=prompt,
+                output_text=full_output_text,
+            )
             self._metrics.record(
                 "llm_stream_end",
                 {"role": llm_role, "elapsed_ms": elapsed_ms, "output_len": output_chars},
             )
-            print(
-                f"[{_ts()}][LlmManager] llm_http_request_end stage={stage} role={llm_role} "
-                f"elapsed_ms={elapsed_ms} output_len={output_chars} request_id={request_id}"
+            log_event(
+                logger,
+                logging.INFO,
+                "LLM 流式调用结束",
+                {"阶段": stage, "角色": llm_role, "耗时毫秒": elapsed_ms, "输出长度": output_chars, "请求ID": request_id},
             )
 
         return _stream_wrapper()
@@ -535,7 +630,7 @@ class LlmManager:
                 return trip_data
             raise TypeError(f"解析器返回了意外类型: {type(trip_data)}")
         except Exception as e:
-            print(f"[{_ts()}][LlmManager] 行程 JSON 解析失败: {e}")
+            log_event(logger, logging.WARNING, "行程 JSON 解析失败", {"原因": str(e)})
             return None
 
     def stream_trip_generation(
@@ -748,6 +843,13 @@ class LlmManager:
         raw_response = self.analysis_llm.invoke(prompt)
         response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
         cleaned_response_text = _strip_think_content(response_text)
+        self._notify_usage(
+            stage="tool_decision",
+            llm_role="analysis",
+            model_name=str((self._analysis_config or {}).get("model_name") or ""),
+            prompt_text=prompt,
+            output_text=cleaned_response_text,
+        )
         _log_llm_output("tool_decision_response", cleaned_response_text)
         # 解析失败时降级为“不调用工具”，确保流程可继续
         clean_response = self.extract_json_from_string(cleaned_response_text)
@@ -781,7 +883,7 @@ class LlmManager:
         # 第二步：执行工具并返回统一结果结构
         result = self.call_tool(tool_name, params)
         res = {"needs_tool": True, "decision": decision, "result": result}
-        print(f"[LLMManager] 使用云端模型的 FunctionCall 能力完成工具选择与执行=> 工具名:{tool_name}, 参数:{params}, 结果:{res}")
+        log_event(logger, logging.INFO, "工具路由执行完成", {"工具名": tool_name, "参数": params, "结果摘要": res})
         return res
 
     def _build_tool_query(self, user_input: Optional[Dict[str, Any]] = None, edit_cmd: Optional[Dict[str, Any]] = None, query: Optional[str] = None) -> str:
@@ -1045,18 +1147,19 @@ class LlmManager:
         )
 
         # 打印提示词构建的关键输入，便于定位 user_input/context/edit_note 引起的格式化异常
-        print(f"[{_ts()}][LlmManager] 构建行程生成提示词，用户输入={user_input}，上下文条数={len(context)}, 编辑指令={edit_note}")
-        # 打印 user_input 的所有字段，确保每个属性都可见
-        print(f"[{_ts()}][LlmManager] user_input.destination={user_input.get('destination')}")
-        print(f"[{_ts()}][LlmManager] user_input.days={user_input.get('days')}")
-        print(f"[{_ts()}][LlmManager] user_input.budget={user_input.get('budget')}")
-        print(f"[{_ts()}][LlmManager] user_input.preference(raw)={user_input.get('preference')}")
-        print(f"[{_ts()}][LlmManager] user_input.keys={list(user_input.keys())}")
-        print("\n")
-        # 打印上下文细节，逐条展示，便于确认是否存在空值或异常格式
-        for idx, ctx in enumerate(context or []):
-            print(f"[{_ts()}][LlmManager] context[{idx}]={ctx}")
-            print("\n")
+        log_event(
+            logger,
+            logging.INFO,
+            "构建行程提示词",
+            {
+                "目的地": user_input.get("destination"),
+                "天数": user_input.get("days"),
+                "预算": user_input.get("budget"),
+                "偏好": user_input.get("preference"),
+                "上下文条数": len(context or []),
+                "编辑指令": edit_note,
+            },
+        )
         # 安全处理 preference，保证后续 join 不报错
         preference = user_input.get("preference", [])
         # 如果 preference 是单字符串，转换为列表，保证统一处理逻辑
@@ -1067,18 +1170,8 @@ class LlmManager:
             preference = [str(preference)] if preference is not None else []
         # 拼接 preference 文本，供提示词 format 使用
         preference_str = ", ".join([str(p) for p in preference if p])
-        # 打印归一化后的 preference 结果，确认拼接是否正确
-        # print(f"[{_ts()}][LlmManager] preference(normalized)={preference}")
-        # print(f"[{_ts()}][LlmManager] preference_str={preference_str}")
         # 预先组装上下文文本，避免 format 时隐藏错误
         context_text = "\n".join(context) if context else "无参考攻略"
-        # 打印最终 format 输入的每一个属性，确保全部字段齐全
-        # print(f"[{_ts()}][LlmManager] format.destination={user_input.get('destination')}")
-        # print(f"[{_ts()}][LlmManager] format.days={user_input.get('days')}")
-        # print(f"[{_ts()}][LlmManager] format.budget={user_input.get('budget')}")
-        # print(f"[{_ts()}][LlmManager] format.preference={preference_str}")
-        # print(f"[{_ts()}][LlmManager] format.context={context_text}")
-        # print(f"[{_ts()}][LlmManager] format.edit_note={edit_note}")
         constraints_section = self._build_constraint_prompt_section(user_input)
         # 执行提示词格式化，若字段缺失会在此处抛出异常，前面的日志可辅助定位
         res = prompt.format(
@@ -1090,7 +1183,6 @@ class LlmManager:
             edit_note=edit_note,
             constraints_section=constraints_section,
         )
-        # print(f"[{_ts()}][LlmManager] 返回构建完成的提示词文本={res}")
         # 返回构建完成的提示词文本
         return res
 
@@ -1307,7 +1399,7 @@ class LlmManager:
             deduped_conflicts = list(deduped.values())
             return ConflictReport(has_conflicts=bool(deduped_conflicts), conflicts=deduped_conflicts, alternatives=[])
         except Exception as exc:
-            print(f"[{_ts()}][LlmManager] 冲突检测降级，原因={exc}")
+            log_event(logger, logging.WARNING, "冲突检测降级", {"原因": str(exc)})
             return ConflictReport(has_conflicts=False)
 
     def _generate_alternatives(
@@ -1381,7 +1473,7 @@ class LlmManager:
                 )
             return alternatives[:2]
         except Exception as exc:
-            print(f"[{_ts()}][LlmManager] 替代方案生成降级，原因={exc}")
+            log_event(logger, logging.WARNING, "替代方案生成降级", {"原因": str(exc)})
             return []
 
     def build_conflict_report(self, trip_data: Dict[str, Any], constraints: Optional[Dict[str, Any]] = None) -> ConflictReport:
@@ -1409,7 +1501,7 @@ class LlmManager:
         return f"行程硬约束信息：目的地 {destination}，天数 {days}。天气、交通时长与费用、POI 开放时间与票价等将通过外部工具和 API 获取，并在规划和修改行程时作为需要严格遵守的约束条件。"
 
     def extract_json_from_string(self, response: str) -> str:
-        print(f"[{_ts()}][LlmManager] extract_json_from_string 原始响应长度={len(str(response))}")
+        log_event(logger, logging.DEBUG, "开始提取 JSON", {"原始响应长度": len(str(response))})
 
         # < think >
         # 好，我来分析一下用户的需求。用户说要从上海出发去广州，5
@@ -1477,13 +1569,19 @@ class LlmManager:
             {"attempt": attempt, "prompt_len": len(prompt)},
         )
         start_ts = datetime.now()
-        print(f"[{_ts()}][LlmManager] 第{attempt}次行程生成调用开始")
         request_id = f"generation-{start_ts.strftime('%H%M%S%f')}"
         cfg = self._generation_config
-        print(
-            f"[{_ts()}][LlmManager] llm_http_request_start stage=trip_generation_invoke role=generation "
-            f"provider={cfg.get('provider')} base_url={cfg.get('base_url')} model={cfg.get('model_name')} "
-            f"request_id={request_id} attempt={attempt}"
+        log_event(
+            logger,
+            logging.INFO,
+            "LLM 行程生成开始",
+            {
+                "请求ID": request_id,
+                "模型": cfg.get("model_name"),
+                "提供方": cfg.get("provider"),
+                "尝试次数": attempt,
+                "提示词长度": len(prompt),
+            },
         )
         raw_response = self.generation_llm.invoke(prompt)
         if hasattr(raw_response, "content"):
@@ -1492,16 +1590,24 @@ class LlmManager:
             response_text = raw_response
 
         cleaned_response_text = _strip_think_content(response_text)
+        self._notify_usage(
+            stage="trip_generation_invoke",
+            llm_role="generation",
+            model_name=str((self._generation_config or {}).get("model_name") or ""),
+            prompt_text=prompt,
+            output_text=cleaned_response_text,
+        )
         _log_llm_output("trip_generation_response", cleaned_response_text)
         clean_response = self.extract_json_from_string(cleaned_response_text)
         trip_data = self.parser.parse(clean_response)
 
         cost = (datetime.now() - start_ts).total_seconds()
-        print(
-            f"[{_ts()}][LlmManager] llm_http_request_end stage=trip_generation_invoke role=generation "
-            f"elapsed_s={cost:.2f} response_len={len(str(response_text))} request_id={request_id} attempt={attempt}"
+        log_event(
+            logger,
+            logging.INFO,
+            "LLM 行程生成结束",
+            {"请求ID": request_id, "耗时秒": cost, "响应长度": len(str(response_text)), "尝试次数": attempt},
         )
-        print(f"[{_ts()}][LlmManager] 第{attempt}次生成成功，耗时 {cost:.2f}s")
         self._metrics.record(
             "llm_generate_trip_success",
             {"attempt": attempt, "elapsed_ms": int(cost * 1000), "output_len": len(str(response_text))},
@@ -1528,16 +1634,24 @@ class LlmManager:
             
         prompt = self.build_prompt(user_input, merged_context, edit_cmd)
         
-        print(f"[{_ts()}][LlmManager] generate_trip_pure start, destination={user_input.get('destination')}, days={user_input.get('days')}")
+        log_event(
+            logger,
+            logging.INFO,
+            "开始纯生成行程",
+            {"目的地": user_input.get("destination"), "天数": user_input.get("days")},
+        )
         return self._execute_trip_generation(prompt)
 
     def generate_trip(self, user_input: Dict[str, Any], context: List[str],
                       edit_cmd: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        print("-------------------------------一次性generate_trip（非流式）生成 触发-------------------------------")
         """生成行程：通过可视化界面操作输入文字进行行程的生成"""
         prompt = self.build_trip_prompt(user_input, context, edit_cmd)
-
-        print(f"[{_ts()}][LlmManager] generate_trip start, destination={user_input.get('destination')}, days={user_input.get('days')}, attempt_count=2")
+        log_event(
+            logger,
+            logging.INFO,
+            "开始生成行程",
+            {"目的地": user_input.get("destination"), "天数": user_input.get("days"), "模式": "非流式"},
+        )
         return self._execute_trip_generation(prompt)
 
     def analyze_user_message(
@@ -1548,15 +1662,17 @@ class LlmManager:
     ) -> Dict[str, Any]:
         """仅做第 1 次调用：实体抽取 + 意图识别"""
         analysis_prompt = self._build_analysis_prompt(query, context, current_trip)
-        print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 prompt 构建完成，query={query}")
-
         self._metrics.record(
             "llm_analyze_start",
             {"prompt_len": len(analysis_prompt), "context_size": len(context or [])},
         )
-        start_ts = datetime.now()
-        print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 => LLM 调用开始")
-        request_id = f"analysis-{start_ts.strftime('%H%M%S%f')}"
+        start_ts = log_llm_start(
+            logger,
+            stage="实体抽取与意图识别",
+            model=str((self._analysis_config or {}).get("model_name") or ""),
+            prompt=analysis_prompt,
+            extra={"查询": query, "上下文条数": len(context or [])},
+        )
         raw_analysis_response = self.analysis_llm.invoke(analysis_prompt)
         if hasattr(raw_analysis_response, "content"):
             analysis_response = raw_analysis_response.content
@@ -1565,11 +1681,24 @@ class LlmManager:
 
         cost = (datetime.now() - start_ts).total_seconds()
         cleaned_response = _strip_think_content(analysis_response)
+        self._notify_usage(
+            stage="intent_analysis",
+            llm_role="analysis",
+            model_name=str((self._analysis_config or {}).get("model_name") or ""),
+            prompt_text=analysis_prompt,
+            output_text=cleaned_response,
+        )
         _log_llm_output("analyze_user_message_response", cleaned_response)
-        print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 LLM 调用结束，耗时 {cost:.2f}s，原始响应长度={len(str(analysis_response))}")
+        log_llm_end(
+            logger,
+            stage="实体抽取与意图识别",
+            started_at=start_ts,
+            output=cleaned_response,
+            extra={"原始响应长度": len(str(analysis_response))},
+        )
 
         intent_data = self._parse_intent(cleaned_response)
-        print(f"[{_ts()}][LlmManager] 实体抽取+意图识别 解析出的意图数据={intent_data}")
+        log_event(logger, logging.INFO, "意图识别完成", {"意图": intent_data.get("intent"), "参数": intent_data.get("parameters")})
         self._metrics.record(
             "llm_analyze_success",
             {"elapsed_ms": int(cost * 1000), "output_len": len(str(analysis_response))},
@@ -1758,7 +1887,7 @@ class LlmManager:
             return intent_data
 
         except Exception as e:
-            print(f"[{_ts()}][LlmManager] 意图解析失败: {str(e)}, 使用默认意图")
+            log_event(logger, logging.WARNING, "意图解析失败，改用默认意图", {"原因": str(e)})
             return self._get_default_intent()
 
     def _get_default_intent(self) -> Dict[str, Any]:
@@ -1801,9 +1930,14 @@ class LlmManager:
                 for _, v in daily_plan.items():
                     if isinstance(v, list):
                         total_items += len(v)
-            print(f"[{_ts()}][LlmManager] 生成的行程数据概览: days={trip_data.get('days')}, daily_plan_days={len(daily_plan)}, items={total_items}")
+            log_event(
+                logger,
+                logging.INFO,
+                "行程生成完成",
+                {"天数": trip_data.get("days"), "已规划天数": len(daily_plan), "行程项数量": total_items},
+            )
         else:
-            print(f"[{_ts()}][LlmManager] 生成的行程数据类型: {type(trip_data)}, str_len={len(str(trip_data))}")
+            log_event(logger, logging.INFO, "行程生成返回非标准结构", {"类型": str(type(trip_data)), "文本长度": len(str(trip_data))})
 
         if trip_data:
             destination = user_input.get("destination", "目的地")
@@ -1835,7 +1969,12 @@ class LlmManager:
         context: List[Dict[str, str]],
         constraints: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        print(f"[{_ts()}][LlmManager] 处理行程修改请求，intent={intent_data.get('intent')}, params_keys={list((intent_data.get('parameters') or {}).keys())}")
+        log_event(
+            logger,
+            logging.INFO,
+            "开始处理行程修改",
+            {"意图": intent_data.get("intent"), "参数键": list((intent_data.get("parameters") or {}).keys())},
+        )
         prepared = self.prepare_trip_request_from_modification(intent_data, current_trip, context, constraints=constraints)
         user_input = prepared.get("user_input") or {}
         context_texts = prepared.get("context_texts") or []
@@ -1850,9 +1989,9 @@ class LlmManager:
                 for _, v in daily_plan.items():
                     if isinstance(v, list):
                         total_items += len(v)
-            print(f"[{_ts()}][LlmManager] 处理行程修改完成: daily_plan_days={len(daily_plan)}, items={total_items}")
+            log_event(logger, logging.INFO, "行程修改完成", {"已规划天数": len(daily_plan), "行程项数量": total_items})
         else:
-            print(f"[{_ts()}][LlmManager] 处理行程修改完成: type={type(modified_trip)}, str_len={len(str(modified_trip))}")
+            log_event(logger, logging.INFO, "行程修改返回非标准结构", {"类型": str(type(modified_trip)), "文本长度": len(str(modified_trip))})
 
         if modified_trip:
             return {

@@ -17,16 +17,18 @@ import {
   Typography,
   message,
 } from "antd"
+import AdminPage from "./components/AdminPage.jsx"
 import KnowledgeTab from "./components/KnowledgeTab.jsx"
+import LoginPage from "./components/LoginPage.jsx"
 import SessionSider from "./components/SessionSider.jsx"
 import TripTab from "./components/TripTab.jsx"
 import TripMap from "./components/TripMap.jsx"
 import { getSessionHistory, getSessionTrip, sendChatMessage } from "./api/index.js"
 import {
   DEFAULT_DEVICE_ID,
-  DEFAULT_USER_ID,
   SESSION_STORAGE_KEY,
 } from "./constants/appConfig.js"
+import { useAuth } from "./hooks/useAuth.js"
 import { useKnowledge } from "./hooks/useKnowledge.js"
 import { useSessions } from "./hooks/useSessions.js"
 import { useTrip } from "./hooks/useTrip.js"
@@ -80,6 +82,9 @@ function buildConstraintSummary(values) {
 }
 
 export default function App() {
+  // App 现在是“认证壳 + 业务工作台”双态结构：
+  // 未登录只渲染 LoginPage，已登录后再装载会话、知识库、行程、管理后台等业务能力。
+  const { authLoading, authReady, authUser, isAuthenticated, login, logout, register } = useAuth()
   const {
     activeSessionId,
     deleteSessionById,
@@ -89,7 +94,7 @@ export default function App() {
     sessions,
     setActiveSessionId,
     startNewSession,
-  } = useSessions()
+  } = useSessions({ isAuthenticated })
   const {
     handleCreateKnowledgeBase,
     handleDeleteKnowledgeBase,
@@ -166,6 +171,7 @@ export default function App() {
   })
   const [lastFlowKnowledgeDebug, setLastFlowKnowledgeDebug] = useState(null)
   const [tripForm] = Form.useForm()
+  const isAdmin = authUser?.role === "admin"
 
   const sessionTitle = useMemo(() => {
     const activeSession = sessions.find((item) => item.session_id === activeSessionId)
@@ -262,7 +268,6 @@ export default function App() {
     try {
       setSendingChat(true)
       const payload = {
-        user_id: DEFAULT_USER_ID,
         device_id: DEFAULT_DEVICE_ID,
         session_id: activeSessionId,
         message: value,
@@ -433,6 +438,102 @@ export default function App() {
     })
   }
 
+  if (!authReady) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center" }}>
+        <Spin size="large" />
+      </div>
+    )
+  }
+
+  if (!isAuthenticated) {
+    return <LoginPage loading={authLoading} onLogin={login} onRegister={register} />
+  }
+
+  // Tab 列表在这里集中拼装，而不是散在 JSX 里临时判断，
+  // 这样“普通用户无管理页，管理员多一个管理页”这类权限差异会更直观。
+  const tabItems = [
+    {
+      key: "trip",
+      label: "行程详情",
+      children: (
+        <TripTab
+          conflictReport={conflictReport}
+          lockedDays={lockedDays}
+          loadingTrip={loadingTrip}
+          selectedAlternative={selectedAlternative}
+          tripDays={tripDays}
+          tripResult={tripResult}
+          selectedPoiId={selectedPoiId}
+          onApplyAlternative={async (nextTrip) => {
+            updateTripResult(nextTrip)
+            setConflictReport({ has_conflicts: false, conflicts: [], alternatives: [] })
+            setSelectedAlternative(null)
+            await persistFlowTripResult(nextTrip)
+          }}
+          onConflictReportChange={setConflictReport}
+          onLockedDaysChange={setLockedDays}
+          onSelectAlternative={setSelectedAlternative}
+          onSelectPoi={handleSelectPoi}
+          onTripChange={async (nextTrip) => {
+            updateTripResult(nextTrip)
+            await persistFlowTripResult(nextTrip)
+          }}
+          onReplanDay={handleFlowReplanDay}
+        />
+      ),
+    },
+    {
+      key: "knowledge",
+      label: "旅行灵感",
+      children: (
+        <KnowledgeTab
+          knowledgeBases={knowledgeBases}
+          knowledgeDebugSnapshot={knowledgeDebugSnapshot}
+          knowledgeGenerateQuery={knowledgeGenerateQuery}
+          knowledgeQuery={knowledgeQuery}
+          knowledgeResult={knowledgeResult}
+          knowledgeScope={knowledgeScope}
+          knowledgeSources={knowledgeSources}
+          lastFlowKnowledgeDebug={lastFlowKnowledgeDebug}
+          sourceStats={sourceStats}
+          loadingKnowledgeDebugSnapshot={loadingKnowledgeDebugSnapshot}
+          loadingKnowledgeSources={loadingKnowledgeSources}
+          ingestingKnowledge={ingestingKnowledge}
+          preprocessingKnowledgeUrl={preprocessingKnowledgeUrl}
+          knowledgeUrlPreprocessResult={knowledgeUrlPreprocessResult}
+          lastIngestResult={lastIngestResult}
+          loadingKnowledge={loadingKnowledge}
+          loadingKnowledgeBases={loadingKnowledgeBases}
+          onCreateKnowledgeBase={handleCreateKnowledgeBase}
+          onDeleteKnowledgeBase={handleDeleteKnowledgeBase}
+          onDeleteKnowledgeSource={handleDeleteKnowledgeSource}
+          onIngestKnowledgeUrl={handleIngestKnowledgeUrl}
+          onPreprocessKnowledgeUrl={handlePreprocessKnowledgeUrl}
+          onLoadKnowledgeDebugSnapshot={handleLoadKnowledgeDebugSnapshot}
+          onRefreshKnowledgeSources={refreshKnowledgeSources}
+          onUpdateKnowledgeSource={handleUpdateKnowledgeSource}
+          onSelectKnowledgeBase={setSelectedKnowledgeBaseId}
+          onUploadKnowledgeDocument={handleUploadKnowledgeDocument}
+          onChangeGenerateQuery={setKnowledgeGenerateQuery}
+          onChangeQuery={setKnowledgeQuery}
+          onChangeKnowledgeScope={setKnowledgeScope}
+          onSearch={handleKnowledgeSearch}
+          selectedKnowledgeBaseId={selectedKnowledgeBaseId}
+          uploadingKnowledge={uploadingKnowledge}
+        />
+      ),
+    },
+  ]
+
+  if (isAdmin) {
+    tabItems.push({
+      key: "admin",
+      label: "管理",
+      children: <AdminPage />,
+    })
+  }
+
   return (
     <Layout className="app-root">
       <Header className="app-header">
@@ -443,6 +544,14 @@ export default function App() {
           <Typography.Text className="app-subtitle">
             目的地规划 · 生成行程 · 地图概览
           </Typography.Text>
+        </div>
+        <div className="header-right" style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <Typography.Text>
+            {authUser?.nickname || authUser?.email || "已登录用户"}
+          </Typography.Text>
+          <Button size="small" onClick={logout}>
+            退出登录
+          </Button>
         </div>
       </Header>
       <Content className="app-content">
@@ -503,79 +612,7 @@ export default function App() {
           <div className="app-main">
             <Tabs
               defaultActiveKey="knowledge"
-              items={[
-                {
-                  key: "trip",
-                  label: "行程详情",
-                  children: (
-                    <TripTab
-                      conflictReport={conflictReport}
-                      lockedDays={lockedDays}
-                      loadingTrip={loadingTrip}
-                      selectedAlternative={selectedAlternative}
-                      tripDays={tripDays}
-                      tripResult={tripResult}
-                      selectedPoiId={selectedPoiId}
-                      onApplyAlternative={async (nextTrip) => {
-                        updateTripResult(nextTrip)
-                        setConflictReport({ has_conflicts: false, conflicts: [], alternatives: [] })
-                        setSelectedAlternative(null)
-                        await persistFlowTripResult(nextTrip)
-                      }}
-                      onConflictReportChange={setConflictReport}
-                      onLockedDaysChange={setLockedDays}
-                      onSelectAlternative={setSelectedAlternative}
-                      onSelectPoi={handleSelectPoi}
-                      onTripChange={async (nextTrip) => {
-                        updateTripResult(nextTrip)
-                        await persistFlowTripResult(nextTrip)
-                      }}
-                      onReplanDay={handleFlowReplanDay}
-                    />
-                  ),
-                },
-                {
-                  key: "knowledge",
-                  label: "旅行灵感",
-                  children: (
-                    <KnowledgeTab
-                      knowledgeBases={knowledgeBases}
-                      knowledgeDebugSnapshot={knowledgeDebugSnapshot}
-                      knowledgeGenerateQuery={knowledgeGenerateQuery}
-                      knowledgeQuery={knowledgeQuery}
-                      knowledgeResult={knowledgeResult}
-                      knowledgeScope={knowledgeScope}
-                      knowledgeSources={knowledgeSources}
-                      lastFlowKnowledgeDebug={lastFlowKnowledgeDebug}
-                      sourceStats={sourceStats}
-                      loadingKnowledgeDebugSnapshot={loadingKnowledgeDebugSnapshot}
-                      loadingKnowledgeSources={loadingKnowledgeSources}
-                      ingestingKnowledge={ingestingKnowledge}
-                      preprocessingKnowledgeUrl={preprocessingKnowledgeUrl}
-                      knowledgeUrlPreprocessResult={knowledgeUrlPreprocessResult}
-                      lastIngestResult={lastIngestResult}
-                      loadingKnowledge={loadingKnowledge}
-                      loadingKnowledgeBases={loadingKnowledgeBases}
-                      onCreateKnowledgeBase={handleCreateKnowledgeBase}
-                      onDeleteKnowledgeBase={handleDeleteKnowledgeBase}
-                      onDeleteKnowledgeSource={handleDeleteKnowledgeSource}
-                      onIngestKnowledgeUrl={handleIngestKnowledgeUrl}
-                      onPreprocessKnowledgeUrl={handlePreprocessKnowledgeUrl}
-                      onLoadKnowledgeDebugSnapshot={handleLoadKnowledgeDebugSnapshot}
-                      onRefreshKnowledgeSources={refreshKnowledgeSources}
-                      onUpdateKnowledgeSource={handleUpdateKnowledgeSource}
-                      onSelectKnowledgeBase={setSelectedKnowledgeBaseId}
-                      onUploadKnowledgeDocument={handleUploadKnowledgeDocument}
-                      onChangeGenerateQuery={setKnowledgeGenerateQuery}
-                      onChangeQuery={setKnowledgeQuery}
-                      onChangeKnowledgeScope={setKnowledgeScope}
-                      onSearch={handleKnowledgeSearch}
-                      selectedKnowledgeBaseId={selectedKnowledgeBaseId}
-                      uploadingKnowledge={uploadingKnowledge}
-                    />
-                  ),
-                }
-              ]} 
+              items={tabItems} 
             />
           </div>
           {/* <div className="app-right">

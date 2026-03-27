@@ -1,6 +1,7 @@
 // 主流程相关接口封装
 // 引入基础地址与通用请求方法
-import { API_BASE, apiPost } from "./httpClient.js";
+import { API_BASE, apiPost, getAuthToken } from "./httpClient.js";
+import { logDebug } from "../utils/debugLogger.js";
 
 // 主流程流式接口：负责发起 /api/flow/stream 并消费 SSE 事件
 export async function streamMainFlow(payload, onEvent, options = {}) {
@@ -32,11 +33,17 @@ export async function streamMainFlow(payload, onEvent, options = {}) {
       url.searchParams.set("last_sequence", currentSequence);
     }
     try {
+      logDebug("主流程", "开始请求流式规划", {
+        messageId: currentMessageId,
+        lastSequence: currentSequence,
+        attempt: attempt + 1,
+      });
       // 发起流式请求
       const response = await fetch(url.toString(), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          ...(getAuthToken() ? { Authorization: `Bearer ${getAuthToken()}` } : {}),
         },
         body: JSON.stringify(payload || {}),
       });
@@ -46,6 +53,10 @@ export async function streamMainFlow(payload, onEvent, options = {}) {
           `POST /api/flow/stream failed with status ${response.status}`,
         );
       }
+      logDebug("主流程", "流式连接建立成功", {
+        status: response.status,
+        messageId: currentMessageId,
+      });
       // 无 body 视为异常
       if (!response.body) {
         throw new Error("stream body is not available");
@@ -109,14 +120,28 @@ export async function streamMainFlow(payload, onEvent, options = {}) {
         }
       }
       // 一次请求成功完成后结束函数
+      logDebug("主流程", "流式规划结束", {
+        messageId: currentMessageId,
+        lastSequence: currentSequence,
+      });
       return;
     } catch (error) {
       // 累加重试次数
       attempt += 1;
       // 超过最大重试次数则上抛错误
       if (attempt > maxRetries) {
+        logDebug("主流程", "流式规划失败且达到最大重试次数", {
+          __level: "error",
+          attempt,
+          error: String(error?.message || error),
+        });
         throw error;
       }
+      logDebug("主流程", "流式规划失败，准备重试", {
+        __level: "warn",
+        attempt,
+        error: String(error?.message || error),
+      });
       // 等待后重试
       await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
     }
@@ -150,6 +175,11 @@ function parseSseEvent(rawChunk) {
     return JSON.parse(dataText);
   } catch (error) {
     // 解析失败时返回空
+    logDebug("主流程", "SSE 事件解析失败", {
+      __level: "warn",
+      rawChunk: rawChunk,
+      error: String(error?.message || error),
+    });
     return null;
   }
 }

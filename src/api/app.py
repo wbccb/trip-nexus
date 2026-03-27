@@ -1,6 +1,7 @@
 # API 服务入口，提供行程生成、会话列表、知识库检索的 HTTP 接口
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
+import contextvars
 import json
 import hashlib
 from langchain_core.documents.base import Document
@@ -17,13 +18,24 @@ from io import BytesIO
 from functools import lru_cache  # 用于缓存全局单例对象，减少重复初始化
 from typing import Any, Dict, List, Optional, Set, Tuple  # 提供类型注解，便于接口契约清晰
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile  # FastAPI 框架与错误处理
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile  # FastAPI 框架与错误处理
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware  # 允许前端跨域访问
 from pydantic import BaseModel, Field  # 数据模型与字段校验
 from pypdf import PdfReader
 
 from src.config import Config  # 读取项目配置
+from src.auth.jwt_handler import build_access_token
+from src.auth.middleware import (
+    AuthenticatedUser,
+    get_auth_db_connection,
+    get_current_user,
+    get_optional_user,
+    init_auth_tables,
+    require_admin,
+)
+from src.auth.oauth import get_supported_oauth_providers
+from src.auth.password import hash_password, verify_password
 from src.frontend.context.conversation_manager import ConversationManager
 from src.frontend.context.entity import Message, MessageType
 from src.frontend.context.storage import get_conversation_storage  # 获取会话存储实现
@@ -36,13 +48,20 @@ from src.rag.network.url_preprocessor import infer_source_platform, preprocess_u
 from src.rag.store.vector_store import VectorStore
 from src.agent import run_agent_loop_sync
 from src.models.conflicts import ConflictReport
+from src.models.user import PublicUserProfile
+from src.observability import setup_logging
 
+setup_logging()
 logger = logging.getLogger(__name__)
+_REQUEST_OBSERVABILITY_CONTEXT: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
+    "tripnexus_request_observability_context",
+    default={},
+)
 
 
 class StartSessionRequest(BaseModel):
     """创建新会话的请求体"""
-    user_id: str = Field(..., description="用户唯一ID")
+    user_id: Optional[str] = Field(None, description="用户唯一ID，鉴权模式下会自动从 JWT 提取")
     device_id: str = Field(..., description="设备唯一ID")
 
 
@@ -61,7 +80,7 @@ class SessionItem(BaseModel):
 
 class FlowRequestBase(BaseModel):
     """主流程请求基础模型，描述一次规划任务的核心输入。"""
-    user_id: str = Field(..., description="用户唯一ID")
+    user_id: Optional[str] = Field(None, description="用户唯一ID，鉴权模式下会自动从 JWT 提取")
     device_id: str = Field(..., description="设备唯一ID")
     session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
     destination: str = Field(..., description="目的地城市")
@@ -346,7 +365,7 @@ class ChatHistoryItem(BaseModel):
 
 
 class ChatSendRequest(BaseModel):
-    user_id: str = Field(..., description="用户唯一ID")
+    user_id: Optional[str] = Field(None, description="用户唯一ID，鉴权模式下会自动从 JWT 提取")
     device_id: str = Field(..., description="设备唯一ID")
     session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
     message: str = Field(..., description="用户输入消息")
@@ -386,7 +405,7 @@ class MapGeoJsonResponse(BaseModel):
 
 
 class TripUpdateRequest(BaseModel):
-    user_id: str = Field(..., description="用户唯一ID")
+    user_id: Optional[str] = Field(None, description="用户唯一ID，鉴权模式下会自动从 JWT 提取")
     device_id: str = Field(..., description="设备唯一ID")
     session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
     trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
@@ -416,7 +435,7 @@ class AgentEscalationInfo(BaseModel):
 class TripReplanDayRequest(BaseModel):
     # day 保留旧版整天重排兼容；scope 存在时优先使用 scope.day/time_range。
     # locked_days / replan_instruction / constraints 则共同约束“允许怎么改、哪些地方绝对不能动”。
-    user_id: str = Field(..., description="用户唯一ID")
+    user_id: Optional[str] = Field(None, description="用户唯一ID，鉴权模式下会自动从 JWT 提取")
     device_id: str = Field(..., description="设备唯一ID")
     session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
     day: int = Field(..., description="需要重新规划的天数")
@@ -524,6 +543,116 @@ class ReleaseGateResponse(BaseModel):
     replay_snapshot: Dict[str, Any] = Field(default_factory=dict, description="回放报告快照")
 
 
+class AuthRegisterRequest(BaseModel):
+    email: str = Field(..., description="登录邮箱")
+    password: str = Field(..., description="登录密码")
+    nickname: Optional[str] = Field(None, description="昵称")
+
+
+class AuthLoginRequest(BaseModel):
+    email: str = Field(..., description="登录邮箱")
+    password: str = Field(..., description="登录密码")
+
+
+class AuthRefreshResponse(BaseModel):
+    token: str = Field(..., description="新的访问 token")
+
+
+class AuthResponse(BaseModel):
+    user_id: int = Field(..., description="用户 ID")
+    token: str = Field(..., description="访问 token")
+    role: str = Field(..., description="用户角色")
+    profile: PublicUserProfile = Field(..., description="当前用户信息")
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(..., description="登录邮箱")
+
+
+class ForgotPasswordResponse(BaseModel):
+    message: str = Field(..., description="提示信息")
+    reset_token: Optional[str] = Field(None, description="开发模式透出的重置 token")
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., description="重置 token")
+    new_password: str = Field(..., description="新密码")
+
+
+class SimpleMessageResponse(BaseModel):
+    message: str = Field(..., description="操作结果")
+
+
+class UserProfileUpdateRequest(BaseModel):
+    nickname: Optional[str] = Field(None, description="昵称")
+
+
+class UserPasswordUpdateRequest(BaseModel):
+    old_password: str = Field(..., description="旧密码")
+    new_password: str = Field(..., description="新密码")
+
+
+class AdminUserListResponse(BaseModel):
+    total: int = Field(..., description="用户总数")
+    items: List[PublicUserProfile] = Field(default_factory=list, description="用户列表")
+
+
+class AdminUserStatusUpdateRequest(BaseModel):
+    status: str = Field(..., description="用户状态 active/banned")
+
+
+class AdminUserQuotaUpdateRequest(BaseModel):
+    token_quota: int = Field(..., description="Token 配额")
+
+
+class AdminDashboardResponse(BaseModel):
+    total_users: int = Field(0, description="总用户数")
+    active_users: int = Field(0, description="活跃用户数")
+    banned_users: int = Field(0, description="封禁用户数")
+    admin_users: int = Field(0, description="管理员数量")
+    total_token_quota: int = Field(0, description="总配额")
+    total_token_used: int = Field(0, description="总消耗")
+    quota_remaining: int = Field(0, description="剩余配额")
+
+
+class TokenUsageLogItem(BaseModel):
+    id: int = Field(..., description="日志主键")
+    user_id: int = Field(..., description="用户 ID")
+    session_id: str = Field("", description="会话 ID")
+    request_path: str = Field(..., description="接口路径")
+    model_name: str = Field("", description="模型名称")
+    prompt_tokens: int = Field(0, description="输入 token")
+    completion_tokens: int = Field(0, description="输出 token")
+    total_tokens: int = Field(0, description="总 token")
+    stage: str = Field("", description="调用阶段")
+    message_id: str = Field("", description="消息 ID")
+    created_at: str = Field(..., description="创建时间")
+
+
+class TokenUsageLogListResponse(BaseModel):
+    total: int = Field(0, description="总条数")
+    items: List[TokenUsageLogItem] = Field(default_factory=list, description="日志列表")
+
+
+class AuditLogItem(BaseModel):
+    id: int = Field(..., description="日志主键")
+    user_id: Optional[int] = Field(None, description="用户 ID")
+    user_email: str = Field("", description="用户邮箱")
+    action: str = Field(..., description="动作")
+    session_id: str = Field("", description="会话 ID")
+    message_id: str = Field("", description="消息 ID")
+    request_path: str = Field("", description="接口路径")
+    status: str = Field("", description="状态")
+    detail_json: str = Field("{}", description="详情 JSON")
+    ip_address: str = Field("", description="IP 地址")
+    created_at: str = Field(..., description="创建时间")
+
+
+class AuditLogListResponse(BaseModel):
+    total: int = Field(0, description="总条数")
+    items: List[AuditLogItem] = Field(default_factory=list, description="审计日志列表")
+
+
 @lru_cache(maxsize=1)
 def _get_config() -> Config:
     """缓存 Config 实例，避免重复读取环境变量"""
@@ -568,6 +697,7 @@ def _get_llm_manager() -> LlmManager:
             "generation_temperature": config.GENERATION_TEMPERATURE,  # 生成阶段温度
         }
     )
+    llm_manager.set_usage_observer(_llm_usage_observer)
     return llm_manager
 
 
@@ -588,6 +718,394 @@ def _get_rag_pipeline() -> AIRetrievalPipeline:
 @lru_cache(maxsize=1)
 def _get_map_renderer() -> TripMap:
     return TripMap()
+
+
+def _row_to_public_user_profile(row: Dict[str, Any]) -> PublicUserProfile:
+    # 对外返回用户资料时统一走这个转换函数，
+    # 这样可以明确只暴露安全字段，避免把 password_hash、token_version 之类内部字段泄漏给前端。
+    return PublicUserProfile(
+        user_id=int(row.get("id") or 0),
+        email=str(row.get("email") or ""),
+        nickname=str(row.get("nickname") or ""),
+        role=str(row.get("role") or "user"),
+        status=str(row.get("status") or "active"),
+        token_quota=int(row.get("token_quota") or 0),
+        token_used=int(row.get("token_used") or 0),
+        created_at=str(row.get("created_at") or ""),
+        updated_at=str(row.get("updated_at") or ""),
+    )
+
+
+def _build_auth_response(user_row: Dict[str, Any]) -> AuthResponse:
+    # register / login 最终都返回同一种 AuthResponse，
+    # 保证前端拿到的响应结构稳定：token + role + profile 一次拿全。
+    config = _get_config()
+    token = build_access_token(
+        user_id=int(user_row.get("id") or 0),
+        email=str(user_row.get("email") or ""),
+        role=str(user_row.get("role") or "user"),
+        token_version=int(user_row.get("token_version") or 0),
+        secret_key=config.JWT_SECRET_KEY,
+        expire_minutes=config.JWT_EXPIRE_MINUTES,
+        algorithm=config.JWT_ALGORITHM,
+    )
+    return AuthResponse(
+        user_id=int(user_row.get("id") or 0),
+        token=token,
+        role=str(user_row.get("role") or "user"),
+        profile=_row_to_public_user_profile(user_row),
+    )
+
+
+def _get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    # 邮箱是当前账号体系唯一登录键，因此 register / login / forgot-password 都会复用这条查询。
+    init_auth_tables()
+    conn = get_auth_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE lower(email) = lower(?)", (str(email or "").strip(),))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _count_all_users() -> int:
+    # 首个注册用户自动升为 admin，用这个计数判断是否是“系统第一位用户”。
+    init_auth_tables()
+    conn = get_auth_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(1) AS total FROM users")
+        row = cursor.fetchone()
+        return int((dict(row) if row else {}).get("total") or 0)
+    finally:
+        conn.close()
+
+
+def _get_user_row(user_id: int) -> Optional[Dict[str, Any]]:
+    init_auth_tables()
+    conn = get_auth_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE id = ?", (int(user_id),))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _estimate_tokens_text(text: Any) -> int:
+    """复用 LlmManager 的统一编码器口径估算 token 数。"""
+    try:
+        return _get_llm_manager().estimate_tokens(text)
+    except Exception:
+        return 0
+
+
+def _set_observability_context(
+    *,
+    user_id: int,
+    user_email: str,
+    request_path: str,
+    session_id: str = "",
+    message_id: str = "",
+    ip_address: str = "",
+) -> contextvars.Token:
+    return _REQUEST_OBSERVABILITY_CONTEXT.set(
+        {
+            "user_id": int(user_id or 0),
+            "user_email": str(user_email or ""),
+            "request_path": str(request_path or ""),
+            "session_id": str(session_id or ""),
+            "message_id": str(message_id or ""),
+            "ip_address": str(ip_address or ""),
+        }
+    )
+
+
+def _reset_observability_context(token: contextvars.Token) -> None:
+    _REQUEST_OBSERVABILITY_CONTEXT.reset(token)
+
+
+def _record_audit_log(
+    *,
+    action: str,
+    status: str,
+    detail: Optional[Dict[str, Any]] = None,
+    user_id: Optional[int] = None,
+    user_email: str = "",
+    request_path: str = "",
+    ip_address: str = "",
+    session_id: str = "",
+    message_id: str = "",
+) -> None:
+    """统一记录审计日志，覆盖认证、后台管理、额度门禁与会话时间线等关键动作。"""
+    init_auth_tables()
+    ctx = _REQUEST_OBSERVABILITY_CONTEXT.get({})
+    conn = get_auth_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO audit_log (
+                user_id, user_email, action, session_id, message_id,
+                request_path, status, detail_json, ip_address
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(user_id if user_id is not None else (ctx.get("user_id") or 0)) or None,
+                str(user_email or ctx.get("user_email") or ""),
+                str(action or ""),
+                str(session_id or ctx.get("session_id") or ""),
+                str(message_id or ctx.get("message_id") or ""),
+                str(request_path or ctx.get("request_path") or ""),
+                str(status or ""),
+                json.dumps(detail or {}, ensure_ascii=False),
+                str(ip_address or ctx.get("ip_address") or ""),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _record_token_usage(
+    *,
+    user_id: int,
+    request_path: str,
+    model_name: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+    stage: str,
+    session_id: str = "",
+    message_id: str = "",
+) -> None:
+    """把单次 LLM 调用的 token 估算写入日志，并累计到 users.token_used。"""
+    if int(total_tokens or 0) <= 0:
+        return
+    init_auth_tables()
+    conn = get_auth_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO token_usage_log (
+                user_id, session_id, request_path, model_name,
+                prompt_tokens, completion_tokens, total_tokens, stage, message_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(user_id),
+                str(session_id or ""),
+                str(request_path or ""),
+                str(model_name or ""),
+                int(prompt_tokens or 0),
+                int(completion_tokens or 0),
+                int(total_tokens or 0),
+                str(stage or ""),
+                str(message_id or ""),
+            ),
+        )
+        cursor.execute(
+            "UPDATE users SET token_used = token_used + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (int(total_tokens or 0), int(user_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _llm_usage_observer(payload: Dict[str, Any]) -> None:
+    """由 LlmManager 回调触发，把真实模型调用映射到当前请求上下文里。"""
+    ctx = _REQUEST_OBSERVABILITY_CONTEXT.get({})
+    if not ctx or not ctx.get("user_id"):
+        return
+    _record_token_usage(
+        user_id=int(ctx.get("user_id") or 0),
+        session_id=str(ctx.get("session_id") or ""),
+        request_path=str(ctx.get("request_path") or ""),
+        message_id=str(ctx.get("message_id") or ""),
+        model_name=str(payload.get("model_name") or ""),
+        prompt_tokens=int(payload.get("prompt_tokens") or 0),
+        completion_tokens=int(payload.get("completion_tokens") or 0),
+        total_tokens=int(payload.get("total_tokens") or 0),
+        stage=str(payload.get("stage") or ""),
+    )
+
+
+def _get_request_ip(request: Optional[Request]) -> str:
+    if request is None or request.client is None:
+        return ""
+    return str(request.client.host or "")
+
+
+def _enforce_rate_limit(
+    *,
+    subject_key: str,
+    bucket: str,
+    request_path: str,
+    ip_address: str,
+    max_requests: int,
+    window_seconds: int,
+) -> None:
+    """基础限流：按 subject_key + bucket 统计窗口内请求量，超过阈值直接拒绝。"""
+    init_auth_tables()
+    now_ts = int(time.time())
+    window_start = now_ts - max(1, int(window_seconds))
+    conn = get_auth_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM rate_limit_log WHERE created_at < ?", (window_start,))
+        cursor.execute(
+            """
+            SELECT COUNT(1) AS total FROM rate_limit_log
+            WHERE subject_key = ? AND bucket = ? AND created_at >= ?
+            """,
+            (str(subject_key or ""), str(bucket or ""), window_start),
+        )
+        row = cursor.fetchone()
+        current_count = int((dict(row) if row else {}).get("total") or 0)
+        if current_count >= int(max_requests):
+            _record_audit_log(
+                action="rate_limit_blocked",
+                status="blocked",
+                request_path=request_path,
+                ip_address=ip_address,
+                detail={
+                    "bucket": bucket,
+                    "subject_key": subject_key,
+                    "window_seconds": int(window_seconds),
+                    "max_requests": int(max_requests),
+                },
+            )
+            raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+        cursor.execute(
+            """
+            INSERT INTO rate_limit_log (subject_key, bucket, request_path, ip_address, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (str(subject_key or ""), str(bucket or ""), str(request_path or ""), str(ip_address or ""), now_ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _assert_within_quota(current_user: AuthenticatedUser) -> None:
+    # 当前 Phase 2 的额度控制是“入口门禁”方案：
+    # 只要用户已用额度达到上限，就直接阻断聊天/主流程/知识检索等高成本能力。
+    # 真实 token_used 自动累计会在监控模块继续接入。
+    token_quota = int(current_user.token_quota or 0)
+    token_used = int(current_user.token_used or 0)
+    if token_quota > 0 and token_used >= token_quota:
+        _record_audit_log(
+            action="quota_blocked",
+            status="blocked",
+            detail={"token_quota": token_quota, "token_used": token_used},
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+        )
+        raise HTTPException(status_code=429, detail="Token 额度已用完，请联系管理员")
+
+
+def _resolve_effective_user_id(payload_user_id: Optional[str], current_user: AuthenticatedUser) -> str:
+    current_id = str(current_user.user_id)
+    provided_id = str(payload_user_id or "").strip()
+    if provided_id and provided_id != current_id:
+        logger.warning("忽略与 JWT 不一致的 user_id payload_user_id=%s current_user_id=%s", provided_id, current_id)
+    return current_id
+
+
+def _assert_session_owned(session_id: str, current_user: AuthenticatedUser) -> None:
+    # 会话归属校验是 JWT 之后的第二道边界：
+    # 即使用户拿到了别人的 session_id，也不能跨用户读取、删除或继续该会话。
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
+    rows = _get_storage().get_session_list(str(current_user.user_id))
+    owned_session_ids = {
+        str(row["session_id"]) if isinstance(row, dict) or hasattr(row, "__getitem__") else ""
+        for row in (rows or [])
+    }
+    if session_id not in owned_session_ids:
+        raise HTTPException(status_code=403, detail="无权访问该会话")
+
+
+def _apply_authenticated_request_guard(
+    *,
+    request: Optional[Request],
+    current_user: AuthenticatedUser,
+    request_path: str,
+    bucket: str,
+    session_id: str = "",
+    message_id: str = "",
+) -> contextvars.Token:
+    """为已登录用户请求统一挂上上下文并做按用户限流。"""
+    config = _get_config()
+    ip_address = _get_request_ip(request)
+    max_requests = config.ADMIN_RATE_LIMIT_MAX_REQUESTS if current_user.role == "admin" else config.RATE_LIMIT_MAX_REQUESTS
+    token = _set_observability_context(
+        user_id=current_user.user_id,
+        user_email=current_user.email,
+        request_path=request_path,
+        session_id=session_id,
+        message_id=message_id,
+        ip_address=ip_address,
+    )
+    _enforce_rate_limit(
+        subject_key=f"user:{current_user.user_id}",
+        bucket=bucket,
+        request_path=request_path,
+        ip_address=ip_address,
+        max_requests=max_requests,
+        window_seconds=config.RATE_LIMIT_WINDOW_SECONDS,
+    )
+    return token
+
+
+def _apply_authenticated_audit_context(
+    *,
+    request: Optional[Request],
+    current_user: AuthenticatedUser,
+    request_path: str,
+    session_id: str = "",
+    message_id: str = "",
+) -> contextvars.Token:
+    """只挂观测上下文、不做额外限流，适合低成本读写接口补全会话时间线。"""
+    # 主链上的高成本接口已经走 _apply_authenticated_request_guard 了。
+    # 这里单独拆一个“只上上下文”的版本，是为了让 sessions/trip/knowledge 这类普通接口
+    # 也能统一记录 audit_log，同时不改变它们原本的频控语义。
+    return _set_observability_context(
+        user_id=current_user.user_id,
+        user_email=current_user.email,
+        request_path=request_path,
+        session_id=session_id,
+        message_id=message_id,
+        ip_address=_get_request_ip(request),
+    )
+
+
+def _apply_auth_request_guard(request: Optional[Request], request_path: str, bucket: str) -> contextvars.Token:
+    """为 register/login/forgot/reset 这类匿名认证接口按 IP 做限流。"""
+    config = _get_config()
+    ip_address = _get_request_ip(request)
+    token = _set_observability_context(
+        user_id=0,
+        user_email="",
+        request_path=request_path,
+        ip_address=ip_address,
+    )
+    _enforce_rate_limit(
+        subject_key=f"ip:{ip_address or 'unknown'}",
+        bucket=bucket,
+        request_path=request_path,
+        ip_address=ip_address,
+        max_requests=config.AUTH_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=config.RATE_LIMIT_WINDOW_SECONDS,
+    )
+    return token
 
 
 KNOWLEDGE_COLLECTION_PREFIX = "kb_"
@@ -2489,6 +3007,7 @@ def _build_release_gate_from_data(metrics_summary: Dict[str, Any], replay_report
 async def _run_flow_stream(
     message_id: str,
     session_id: str,
+    user_id: str,
     llm_manager: LlmManager,
     payload: FlowStreamRequest,
 ) -> None:
@@ -2651,7 +3170,7 @@ async def _run_flow_stream(
                     "payload": {"reasons": escalation_reasons},
                 },
             )
-            thread_id = _build_agent_thread_id(payload.user_id, payload.device_id)
+            thread_id = _build_agent_thread_id(user_id, payload.device_id)
             logger.info(
                 "主流程进入Agent thread_id=%s message_id=%s session_id=%s context_count=%s reasons=%s",
                 thread_id,
@@ -2823,7 +3342,7 @@ async def _run_flow_stream(
             {
                 "message_id": message_id,
                 "session_id": session_id,
-                "user_id": payload.user_id,
+                "user_id": user_id,
                 "device_id": payload.device_id,
                 "mode": flow_mode,
                 "intent": metrics.get("intent") or "",
@@ -2883,6 +3402,14 @@ async def _run_flow_stream(
                 },
             },
         )
+        _record_audit_log(
+            action="flow_stream_completed",
+            status="success",
+            user_id=int(user_id or 0),
+            session_id=session_id,
+            message_id=message_id,
+            detail={"message_id": message_id, "session_id": session_id, "has_trip_data": bool(trip_data)},
+        )
     except Exception as exc:
         logger.exception("主流程异常 message_id=%s session_id=%s error=%s", message_id, session_id, str(exc))
         last_sequence += 1
@@ -2905,7 +3432,7 @@ async def _run_flow_stream(
             {
                 "message_id": message_id,
                 "session_id": session_id,
-                "user_id": payload.user_id,
+                "user_id": user_id,
                 "device_id": payload.device_id,
                 "mode": flow_mode,
                 "intent": str(metrics.get("intent") or ""),
@@ -2921,148 +3448,839 @@ async def _run_flow_stream(
                 "error": str(exc),
             }
         )
+        _record_audit_log(
+            action="flow_stream_completed",
+            status="failed",
+            user_id=int(user_id or 0),
+            session_id=session_id,
+            message_id=message_id,
+            detail={"message_id": message_id, "session_id": session_id, "error": str(exc)},
+        )
+
+
+@app.get("/api/auth/providers")
+def list_auth_providers() -> Dict[str, Dict[str, str]]:
+    return {"providers": get_supported_oauth_providers()}
+
+
+@app.post("/api/auth/register", response_model=AuthResponse)
+def register(payload: AuthRegisterRequest, request: Request) -> AuthResponse:
+    # 注册逻辑直接落到新的 auth.db 用户表，不再依赖旧的固定 user_id。
+    # 这里把“首个注册用户自动成为 admin”的产品规则也一起固化进来了。
+    guard_token = _apply_auth_request_guard(request, "/api/auth/register", "auth_register")
+    try:
+        email = str(payload.email or "").strip().lower()
+        if not email:
+            raise HTTPException(status_code=400, detail="email 不能为空")
+        if _get_user_by_email(email):
+            _record_audit_log(action="auth_register", status="duplicate", detail={"email": email})
+            raise HTTPException(status_code=409, detail="该邮箱已注册")
+        try:
+            password_hash = hash_password(payload.password)
+        except ValueError as exc:
+            _record_audit_log(action="auth_register", status="invalid", detail={"email": email})
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        nickname = str(payload.nickname or "").strip() or email.split("@")[0]
+        role = "admin" if _count_all_users() == 0 else "user"
+        init_auth_tables()
+        conn = get_auth_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO users (email, password_hash, nickname, role, status, token_quota, token_used, token_version)
+                VALUES (?, ?, ?, ?, 'active', 1000000, 0, 0)
+                """,
+                (email, password_hash, nickname, role),
+            )
+            conn.commit()
+            user_id = int(cursor.lastrowid or 0)
+        finally:
+            conn.close()
+        user_row = _get_user_row(user_id)
+        if not user_row:
+            raise HTTPException(status_code=500, detail="用户创建失败")
+        _record_audit_log(action="auth_register", status="success", user_id=user_id, user_email=email, detail={"role": role})
+        return _build_auth_response(user_row)
+    finally:
+        _reset_observability_context(guard_token)
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login(payload: AuthLoginRequest, request: Request) -> AuthResponse:
+    # 登录只接受邮箱 + 密码，不再保留旧版默认用户透传方案。
+    guard_token = _apply_auth_request_guard(request, "/api/auth/login", "auth_login")
+    try:
+        email = str(payload.email or "").strip().lower()
+        user_row = _get_user_by_email(email)
+        if not user_row:
+            _record_audit_log(action="auth_login", status="failed", detail={"email": email, "reason": "user_not_found"})
+            raise HTTPException(status_code=401, detail="邮箱或密码错误")
+        if str(user_row.get("status") or "active") != "active":
+            _record_audit_log(action="auth_login", status="blocked", user_id=int(user_row.get("id") or 0), user_email=email, detail={"reason": "banned"})
+            raise HTTPException(status_code=403, detail="账号已被禁用")
+        if not verify_password(payload.password, str(user_row.get("password_hash") or "")):
+            _record_audit_log(action="auth_login", status="failed", user_id=int(user_row.get("id") or 0), user_email=email, detail={"reason": "wrong_password"})
+            raise HTTPException(status_code=401, detail="邮箱或密码错误")
+        _record_audit_log(action="auth_login", status="success", user_id=int(user_row.get("id") or 0), user_email=email, detail={"role": str(user_row.get("role") or "user")})
+        return _build_auth_response(user_row)
+    finally:
+        _reset_observability_context(guard_token)
+
+
+@app.post("/api/auth/refresh", response_model=AuthRefreshResponse)
+def refresh_token(current_user: AuthenticatedUser = Depends(get_current_user)) -> AuthRefreshResponse:
+    user_row = _get_user_row(current_user.user_id)
+    if not user_row:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    auth_response = _build_auth_response(user_row)
+    return AuthRefreshResponse(token=auth_response.token)
+
+
+@app.post("/api/auth/forgot-password", response_model=ForgotPasswordResponse)
+def forgot_password(payload: ForgotPasswordRequest, request: Request) -> ForgotPasswordResponse:
+    # 目前这是开发态实现：
+    # 先把 reset token 真正落库，再把 token 直接返回给前端/调用方做联调，
+    # 后续接 SMTP 时只需要把“返回 token”替换成“发邮件”。
+    guard_token = _apply_auth_request_guard(request, "/api/auth/forgot-password", "auth_forgot_password")
+    try:
+        email = str(payload.email or "").strip().lower()
+        user_row = _get_user_by_email(email)
+        if not user_row:
+            _record_audit_log(action="auth_forgot_password", status="accepted", detail={"email": email, "matched": False})
+            return ForgotPasswordResponse(message="如果邮箱存在，重置链接已发送")
+        reset_token = uuid4().hex
+        expires_at = datetime.now() + timedelta(minutes=_get_config().PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
+        conn = get_auth_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO password_reset_tokens (user_id, token, expires_at, used) VALUES (?, ?, ?, 0)",
+                (int(user_row.get("id") or 0), reset_token, expires_at.isoformat()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _record_audit_log(action="auth_forgot_password", status="success", user_id=int(user_row.get("id") or 0), user_email=email, detail={"matched": True})
+        return ForgotPasswordResponse(message="开发模式已生成重置 token", reset_token=reset_token)
+    finally:
+        _reset_observability_context(guard_token)
+
+
+@app.post("/api/auth/reset-password", response_model=SimpleMessageResponse)
+def reset_password(payload: ResetPasswordRequest, request: Request) -> SimpleMessageResponse:
+    # 重置密码后会同时把 token_version + 1，
+    # 这样旧 token 不需要逐个撤销，也会因为版本号不一致而整体失效。
+    guard_token = _apply_auth_request_guard(request, "/api/auth/reset-password", "auth_reset_password")
+    try:
+        try:
+            next_password_hash = hash_password(payload.new_password)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        conn = get_auth_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM password_reset_tokens
+                WHERE token = ? AND used = 0
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(payload.token or "").strip(),),
+            )
+            token_row = cursor.fetchone()
+            if not token_row:
+                _record_audit_log(action="auth_reset_password", status="failed", detail={"reason": "invalid_token"})
+                raise HTTPException(status_code=400, detail="重置 token 无效")
+            token_data = dict(token_row)
+            if datetime.fromisoformat(str(token_data.get("expires_at"))) < datetime.now():
+                _record_audit_log(action="auth_reset_password", status="failed", detail={"reason": "expired_token"})
+                raise HTTPException(status_code=400, detail="重置 token 已过期")
+            cursor.execute(
+                """
+                UPDATE users
+                SET password_hash = ?, token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (next_password_hash, int(token_data.get("user_id") or 0)),
+            )
+            cursor.execute(
+                "UPDATE password_reset_tokens SET used = 1, used_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), int(token_data.get("id") or 0)),
+            )
+            conn.commit()
+            updated_user = _get_user_row(int(token_data.get("user_id") or 0)) or {}
+        finally:
+            conn.close()
+        _record_audit_log(
+            action="auth_reset_password",
+            status="success",
+            user_id=int(updated_user.get("id") or 0),
+            user_email=str(updated_user.get("email") or ""),
+        )
+        return SimpleMessageResponse(message="密码重置成功")
+    finally:
+        _reset_observability_context(guard_token)
+
+
+@app.get("/api/user/profile", response_model=PublicUserProfile)
+def get_user_profile(current_user: AuthenticatedUser = Depends(get_current_user)) -> PublicUserProfile:
+    user_row = _get_user_row(current_user.user_id)
+    if not user_row:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return _row_to_public_user_profile(user_row)
+
+
+@app.put("/api/user/profile", response_model=PublicUserProfile)
+def update_user_profile(
+    payload: UserProfileUpdateRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> PublicUserProfile:
+    nickname = str(payload.nickname or "").strip()
+    if not nickname:
+        raise HTTPException(status_code=400, detail="nickname 不能为空")
+    conn = get_auth_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET nickname = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (nickname, current_user.user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    user_row = _get_user_row(current_user.user_id)
+    if not user_row:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return _row_to_public_user_profile(user_row)
+
+
+@app.put("/api/user/password", response_model=SimpleMessageResponse)
+def update_user_password(
+    payload: UserPasswordUpdateRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> SimpleMessageResponse:
+    user_row = _get_user_row(current_user.user_id)
+    if not user_row:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if not verify_password(payload.old_password, str(user_row.get("password_hash") or "")):
+        raise HTTPException(status_code=401, detail="旧密码错误")
+    try:
+        next_password_hash = hash_password(payload.new_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    conn = get_auth_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE users
+            SET password_hash = ?, token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (next_password_hash, current_user.user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return SimpleMessageResponse(message="密码更新成功，请重新登录")
+
+
+@app.get("/api/admin/users", response_model=AdminUserListResponse)
+def admin_list_users(
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数"),
+    keyword: Optional[str] = Query(None, description="搜索关键字"),
+    request: Request = None,
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> AdminUserListResponse:
+    # Admin 用户列表同时承担两件事：
+    # 1) 提供管理页表格数据
+    # 2) 作为后续用户检索、运营后台分页的基础查询接口
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path="/api/admin/users",
+        bucket="admin_users_list",
+    )
+    try:
+        init_auth_tables()
+        conn = get_auth_db_connection()
+        try:
+            cursor = conn.cursor()
+            like_keyword = f"%{str(keyword or '').strip()}%"
+            where_clause = ""
+            params: List[Any] = []
+            if str(keyword or "").strip():
+                where_clause = "WHERE email LIKE ? OR nickname LIKE ?"
+                params.extend([like_keyword, like_keyword])
+            cursor.execute(f"SELECT COUNT(1) AS total FROM users {where_clause}", params)
+            total_row = cursor.fetchone()
+            total = int((dict(total_row) if total_row else {}).get("total") or 0)
+            params.extend([page_size, (page - 1) * page_size])
+            cursor.execute(
+                f"""
+                SELECT id, email, nickname, role, status, token_quota, token_used, created_at, updated_at
+                FROM users
+                {where_clause}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            )
+            rows = cursor.fetchall() or []
+            items = [_row_to_public_user_profile(dict(row)) for row in rows]
+            return AdminUserListResponse(total=total, items=items)
+        finally:
+            conn.close()
+    finally:
+        _reset_observability_context(guard_token)
+
+
+@app.put("/api/admin/users/{user_id}/status", response_model=PublicUserProfile)
+def admin_update_user_status(
+    user_id: int,
+    payload: AdminUserStatusUpdateRequest,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> PublicUserProfile:
+    # 用户状态切换目前只支持 active / banned 两种，
+    # 被 ban 的用户会在登录和业务鉴权阶段同时被拦截。
+    next_status = str(payload.status or "").strip().lower()
+    if next_status not in {"active", "banned"}:
+        raise HTTPException(status_code=400, detail="status 仅支持 active/banned")
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path=f"/api/admin/users/{user_id}/status",
+        bucket="admin_user_status",
+    )
+    try:
+        target_user = _get_user_row(user_id)
+        if not target_user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        conn = get_auth_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (next_status, user_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        refreshed_user = _get_user_row(user_id)
+        if not refreshed_user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        _record_audit_log(
+            action="admin_update_user_status",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"target_user_id": user_id, "status": next_status},
+        )
+        return _row_to_public_user_profile(refreshed_user)
+    finally:
+        _reset_observability_context(guard_token)
+
+
+@app.put("/api/admin/users/{user_id}/quota", response_model=PublicUserProfile)
+def admin_update_user_quota(
+    user_id: int,
+    payload: AdminUserQuotaUpdateRequest,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> PublicUserProfile:
+    # 额度修改是纯管理动作，不会自动重算 token_used；
+    # 它的作用是给后续入口门禁提供最新的配额上限。
+    next_quota = int(payload.token_quota or 0)
+    if next_quota < 0:
+        raise HTTPException(status_code=400, detail="token_quota 不能小于 0")
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path=f"/api/admin/users/{user_id}/quota",
+        bucket="admin_user_quota",
+    )
+    try:
+        target_user = _get_user_row(user_id)
+        if not target_user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        conn = get_auth_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET token_quota = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (next_quota, user_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        refreshed_user = _get_user_row(user_id)
+        if not refreshed_user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        _record_audit_log(
+            action="admin_update_user_quota",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"target_user_id": user_id, "token_quota": next_quota},
+        )
+        return _row_to_public_user_profile(refreshed_user)
+    finally:
+        _reset_observability_context(guard_token)
+
+
+@app.get("/api/admin/dashboard", response_model=AdminDashboardResponse)
+def admin_dashboard(
+    request: Request,
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> AdminDashboardResponse:
+    # Dashboard 先聚焦“用户规模 + 额度概况”两个维度，
+    # 为后续监控模块再继续接 token 消耗明细、成本面板留扩展位。
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path="/api/admin/dashboard",
+        bucket="admin_dashboard",
+    )
+    try:
+        init_auth_tables()
+        conn = get_auth_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(1) AS total_users,
+                    SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_users,
+                    SUM(CASE WHEN status = 'banned' THEN 1 ELSE 0 END) AS banned_users,
+                    SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) AS admin_users,
+                    COALESCE(SUM(token_quota), 0) AS total_token_quota,
+                    COALESCE(SUM(token_used), 0) AS total_token_used
+                FROM users
+                """
+            )
+            row = cursor.fetchone()
+            payload = dict(row) if row else {}
+            total_quota = int(payload.get("total_token_quota") or 0)
+            total_used = int(payload.get("total_token_used") or 0)
+            return AdminDashboardResponse(
+                total_users=int(payload.get("total_users") or 0),
+                active_users=int(payload.get("active_users") or 0),
+                banned_users=int(payload.get("banned_users") or 0),
+                admin_users=int(payload.get("admin_users") or 0),
+                total_token_quota=total_quota,
+                total_token_used=total_used,
+                quota_remaining=max(total_quota - total_used, 0),
+            )
+        finally:
+            conn.close()
+    finally:
+        _reset_observability_context(guard_token)
+
+
+@app.get("/api/admin/users/{user_id}/token-usage", response_model=TokenUsageLogListResponse)
+def admin_user_token_usage(
+    user_id: int,
+    request: Request,
+    limit: int = Query(50, ge=1, le=200, description="返回数量"),
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> TokenUsageLogListResponse:
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path=f"/api/admin/users/{user_id}/token-usage",
+        bucket="admin_user_token_usage",
+    )
+    try:
+        init_auth_tables()
+        conn = get_auth_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(1) AS total FROM token_usage_log WHERE user_id = ?", (user_id,))
+            total_row = cursor.fetchone()
+            total = int((dict(total_row) if total_row else {}).get("total") or 0)
+            cursor.execute(
+                """
+                SELECT id, user_id, session_id, request_path, model_name, prompt_tokens,
+                       completion_tokens, total_tokens, stage, message_id, created_at
+                FROM token_usage_log
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            )
+            rows = cursor.fetchall() or []
+            items = [TokenUsageLogItem(**dict(row)) for row in rows]
+            return TokenUsageLogListResponse(total=total, items=items)
+        finally:
+            conn.close()
+    finally:
+        _reset_observability_context(guard_token)
+
+
+@app.get("/api/admin/audit-logs", response_model=AuditLogListResponse)
+def admin_audit_logs(
+    request: Request,
+    limit: int = Query(100, ge=1, le=500, description="返回数量"),
+    action: Optional[str] = Query(None, description="动作筛选"),
+    user_id: Optional[int] = Query(None, description="用户 ID 筛选"),
+    session_id: Optional[str] = Query(None, description="会话 ID 筛选"),
+    message_id: Optional[str] = Query(None, description="消息 ID 筛选"),
+    request_path: Optional[str] = Query(None, description="接口路径筛选"),
+    current_user: AuthenticatedUser = Depends(require_admin),
+) -> AuditLogListResponse:
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path="/api/admin/audit-logs",
+        bucket="admin_audit_logs",
+    )
+    try:
+        init_auth_tables()
+        conn = get_auth_db_connection()
+        try:
+            cursor = conn.cursor()
+            where_clauses: List[str] = []
+            params: List[Any] = []
+            # 管理后台现在需要把审计日志当作“请求时间线”来用，
+            # 所以查询条件不再只支持 action，而是同时支持 user/session/message/request_path 多维筛选。
+            if str(action or "").strip():
+                where_clauses.append("action = ?")
+                params.append(str(action).strip())
+            if user_id is not None:
+                where_clauses.append("user_id = ?")
+                params.append(int(user_id))
+            if str(session_id or "").strip():
+                where_clauses.append("session_id = ?")
+                params.append(str(session_id).strip())
+            if str(message_id or "").strip():
+                where_clauses.append("message_id = ?")
+                params.append(str(message_id).strip())
+            if str(request_path or "").strip():
+                where_clauses.append("request_path = ?")
+                params.append(str(request_path).strip())
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            cursor.execute(f"SELECT COUNT(1) AS total FROM audit_log {where_sql}", tuple(params))
+            total_row = cursor.fetchone()
+            total = int((dict(total_row) if total_row else {}).get("total") or 0)
+            cursor.execute(
+                f"""
+                SELECT id, user_id, user_email, action, session_id, message_id,
+                       request_path, status, detail_json, ip_address, created_at
+                FROM audit_log
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                tuple(params + [limit]),
+            )
+            rows = cursor.fetchall() or []
+            items = [AuditLogItem(**dict(row)) for row in rows]
+            return AuditLogListResponse(total=total, items=items)
+        finally:
+            conn.close()
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.get("/api/health")
-def health_check() -> Dict[str, str]:
+def health_check(current_user: Optional[AuthenticatedUser] = Depends(get_optional_user)) -> Dict[str, Any]:
     """健康检查接口"""
-    return {"status": "ok"}
+    init_auth_tables()
+    return {
+        "status": "ok",
+        "auth": "enabled",
+        "authenticated": bool(current_user),
+    }
 
 
 @app.post("/api/sessions/start", response_model=StartSessionResponse)
-def start_session(payload: StartSessionRequest) -> StartSessionResponse:
+def start_session(
+    request: Request,
+    payload: StartSessionRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> StartSessionResponse:
     """创建新会话并返回会话ID"""
-    storage = _get_storage()
-    session_id = storage.generate_session_id(payload.user_id, payload.device_id)
-    storage.store_session(payload.user_id, session_id)
-    return StartSessionResponse(session_id=session_id)
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/sessions/start",
+    )
+    try:
+        storage = _get_storage()
+        user_id = str(current_user.user_id)
+        session_id = storage.generate_session_id(user_id, payload.device_id)
+        storage.store_session(user_id, session_id)
+        _record_audit_log(
+            action="session_start",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            session_id=session_id,
+            detail={"device_id": payload.device_id},
+        )
+        return StartSessionResponse(session_id=session_id)
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.get("/api/sessions/list", response_model=List[SessionItem])
-def list_sessions(user_id: str = Query(..., description="用户ID")) -> List[SessionItem]:
+def list_sessions(request: Request, current_user: AuthenticatedUser = Depends(get_current_user)) -> List[SessionItem]:
     """获取指定用户的会话列表"""
-    storage = _get_storage()
-    rows = storage.get_session_list(user_id)
-    return [SessionItem(**_row_to_session_item(row)) for row in rows]
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/sessions/list",
+    )
+    try:
+        storage = _get_storage()
+        rows = storage.get_session_list(str(current_user.user_id))
+        items = [SessionItem(**_row_to_session_item(row)) for row in rows]
+        _record_audit_log(
+            action="session_list",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"session_count": len(items)},
+        )
+        return items
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.get("/api/sessions/history", response_model=List[ChatHistoryItem])
-def session_history(session_id: str = Query(..., description="会话ID")) -> List[ChatHistoryItem]:
-    storage = _get_storage()
+def session_history(
+    request: Request,
+    session_id: str = Query(..., description="会话ID"),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> List[ChatHistoryItem]:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/sessions/history",
+        session_id=session_id,
+    )
     try:
-        history_messages = storage.get_session_chat_list(session_id)
-        if history_messages:
-            parsed_messages = []
-            for message_json in history_messages:
-                try:
-                    message_obj = Message.model_validate_json(message_json)
-                    parsed_messages.append(ChatHistoryItem(**_normalize_message_payload(message_obj)))
-                except Exception:
-                    continue
-            return parsed_messages
-        short_term_context = storage.get_short_term_context(session_id)
-        if isinstance(short_term_context, dict):
-            messages = short_term_context.get("messages") or []
-            return [ChatHistoryItem(**item) for item in messages if isinstance(item, dict)]
-        return []
-    except Exception:
-        return []
+        _assert_session_owned(session_id, current_user)
+        storage = _get_storage()
+        try:
+            history_messages = storage.get_session_chat_list(session_id)
+            if history_messages:
+                parsed_messages = []
+                for message_json in history_messages:
+                    try:
+                        message_obj = Message.model_validate_json(message_json)
+                        parsed_messages.append(ChatHistoryItem(**_normalize_message_payload(message_obj)))
+                    except Exception:
+                        continue
+                _record_audit_log(
+                    action="session_history",
+                    status="success",
+                    user_id=current_user.user_id,
+                    user_email=current_user.email,
+                    session_id=session_id,
+                    detail={"message_count": len(parsed_messages)},
+                )
+                return parsed_messages
+            short_term_context = storage.get_short_term_context(session_id)
+            if isinstance(short_term_context, dict):
+                messages = short_term_context.get("messages") or []
+                result = [ChatHistoryItem(**item) for item in messages if isinstance(item, dict)]
+                _record_audit_log(
+                    action="session_history",
+                    status="success",
+                    user_id=current_user.user_id,
+                    user_email=current_user.email,
+                    session_id=session_id,
+                    detail={"message_count": len(result)},
+                )
+                return result
+            _record_audit_log(
+                action="session_history",
+                status="success",
+                user_id=current_user.user_id,
+                user_email=current_user.email,
+                session_id=session_id,
+                detail={"message_count": 0},
+            )
+            return []
+        except Exception:
+            _record_audit_log(
+                action="session_history",
+                status="fallback_empty",
+                user_id=current_user.user_id,
+                user_email=current_user.email,
+                session_id=session_id,
+            )
+            return []
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.get("/api/sessions/trip", response_model=TripDataResponse)
-def session_trip(session_id: str = Query(..., description="会话ID")) -> TripDataResponse:
-    storage = _get_storage()
-    trip_data = storage.get_trip_data(session_id)
-    return TripDataResponse(session_id=session_id, trip_data=trip_data)
+def session_trip(
+    request: Request,
+    session_id: str = Query(..., description="会话ID"),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> TripDataResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/sessions/trip",
+        session_id=session_id,
+    )
+    try:
+        _assert_session_owned(session_id, current_user)
+        storage = _get_storage()
+        trip_data = storage.get_trip_data(session_id)
+        _record_audit_log(
+            action="session_trip",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            session_id=session_id,
+            detail={"has_trip_data": bool(trip_data)},
+        )
+        return TripDataResponse(session_id=session_id, trip_data=trip_data)
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.delete("/api/sessions/delete", response_model=DeleteSessionResponse)
-def delete_session(session_id: str = Query(..., description="会话ID")) -> DeleteSessionResponse:
-    storage = _get_storage()
-    storage.delete_session(session_id)
-    return DeleteSessionResponse(session_id=session_id, success=True)
+def delete_session(
+    request: Request,
+    session_id: str = Query(..., description="会话ID"),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> DeleteSessionResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/sessions/delete",
+        session_id=session_id,
+    )
+    try:
+        _assert_session_owned(session_id, current_user)
+        storage = _get_storage()
+        storage.delete_session(session_id)
+        _record_audit_log(
+            action="session_delete",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            session_id=session_id,
+        )
+        return DeleteSessionResponse(session_id=session_id, success=True)
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.post("/api/chat/send", response_model=ChatSendResponse)
-def send_chat(payload: ChatSendRequest) -> ChatSendResponse:
+def send_chat(
+    payload: ChatSendRequest,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> ChatSendResponse:
+    _assert_within_quota(current_user)
     if not payload.message:
         raise HTTPException(status_code=400, detail="message 不能为空")
-    session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
-    storage = _get_storage()
-    llm_manager = _get_llm_manager()
-    conversation_manager = _get_conversation_manager()
-    context_messages = _get_context_messages(storage, session_id)
-    current_trip = storage.get_trip_data(session_id)
-    intent_data = llm_manager.analyze_user_message(payload.message, context_messages, current_trip)
-    user_message = Message(
-        role=MessageType.USER,
-        content=payload.message,
-        timestamp=datetime.now(),
-        metadata={},
+    user_id = str(current_user.user_id)
+    session_id = _ensure_session_id(user_id, payload.device_id, payload.session_id)
+    if payload.session_id:
+        _assert_session_owned(session_id, current_user)
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path="/api/chat/send",
+        bucket="chat_send",
+        session_id=session_id,
     )
-    conversation_manager.process_new_message(
-        payload.user_id,
-        payload.device_id,
-        user_message,
-        session_id,
-        intent_data=intent_data,
-    )
-    intent = intent_data.get("intent")
-    response_text = ""
-    trip_data = None
-    needs_more_info = False
-    if intent == "general_conversation":
-        tool_call = llm_manager.call_tool_by_llm(payload.message, context_messages)
-        if tool_call.get("needs_tool") and tool_call.get("result"):
-            result_payload = tool_call.get("result")
-            if isinstance(result_payload, dict) and result_payload.get("success"):
-                response_text = f"工具结果：{result_payload.get('data')}"
-                print(f"目前用户的问题只需要调用工具返回即可，目前获取工具结果，准备返回数据: {response_text}")
-        if not response_text:
-            response_stream = llm_manager.stream_chat_response(payload.message, context_messages, current_trip)
-            response_text = "".join([str(delta) for delta in response_stream])
-            print(f"目前用户的问题 => 对话模式，工具调用无结果或者不需要工具调用，准备返回数据: {response_text}")
-    elif intent == "generate_trip":
-        result = llm_manager._handle_trip_generation(intent_data, context_messages)
-        response_text = result.get("response") or ""
-        trip_data = result.get("trip_data")
-        needs_more_info = bool(result.get("needs_more_info"))
-    elif intent in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
-        if current_trip:
-            result = llm_manager._handle_trip_modification(intent_data, current_trip, context_messages)
+    try:
+        storage = _get_storage()
+        llm_manager = _get_llm_manager()
+        conversation_manager = _get_conversation_manager()
+        context_messages = _get_context_messages(storage, session_id)
+        current_trip = storage.get_trip_data(session_id)
+        intent_data = llm_manager.analyze_user_message(payload.message, context_messages, current_trip)
+        user_message = Message(
+            role=MessageType.USER,
+            content=payload.message,
+            timestamp=datetime.now(),
+            metadata={},
+        )
+        conversation_manager.process_new_message(
+            user_id,
+            payload.device_id,
+            user_message,
+            session_id,
+            intent_data=intent_data,
+        )
+        intent = intent_data.get("intent")
+        response_text = ""
+        trip_data = None
+        needs_more_info = False
+        if intent == "general_conversation":
+            tool_call = llm_manager.call_tool_by_llm(payload.message, context_messages)
+            if tool_call.get("needs_tool") and tool_call.get("result"):
+                result_payload = tool_call.get("result")
+                if isinstance(result_payload, dict) and result_payload.get("success"):
+                    response_text = f"工具结果：{result_payload.get('data')}"
+            if not response_text:
+                response_stream = llm_manager.stream_chat_response(payload.message, context_messages, current_trip)
+                response_text = "".join([str(delta) for delta in response_stream])
+        elif intent == "generate_trip":
+            result = llm_manager._handle_trip_generation(intent_data, context_messages)
             response_text = result.get("response") or ""
             trip_data = result.get("trip_data")
+            needs_more_info = bool(result.get("needs_more_info"))
+        elif intent in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
+            if current_trip:
+                result = llm_manager._handle_trip_modification(intent_data, current_trip, context_messages)
+                response_text = result.get("response") or ""
+                trip_data = result.get("trip_data")
+            else:
+                response_text = "我需要先为您生成一个基础行程，然后才能进行调整。请先提供目的地、天数和预算信息。"
         else:
-            response_text = "我需要先为您生成一个基础行程，然后才能进行调整。请先提供目的地、天数和预算信息。"
-    else:
-        response_text = f"我理解您想{intent_data.get('summary', '进一步讨论行程')}. 请告诉我更多细节，比如目的地、旅行天数和您的偏好，我可以为您规划具体的行程。"
-    if trip_data:
-        storage.store_trip_data(session_id, trip_data)
-    # 去除思考链内容
-    cleaned_response = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
-    assistant_message = Message(
-        role=MessageType.ASSISTANT,
-        content=cleaned_response,
-        timestamp=datetime.now(),
-        metadata={
-            "intent": intent,
-            "needs_more_info": needs_more_info,
-            "has_trip_data": bool(trip_data),
-        },
-    )
-    conversation_manager.process_new_message(
-        payload.user_id,
-        payload.device_id,
-        assistant_message,
-        session_id,
-    )
-    return ChatSendResponse(
-        session_id=session_id,
-        response=response_text,
-        trip_data=trip_data,
-        intent=intent,
-        needs_more_info=needs_more_info,
-    )
+            response_text = f"我理解您想{intent_data.get('summary', '进一步讨论行程')}. 请告诉我更多细节，比如目的地、旅行天数和您的偏好，我可以为您规划具体的行程。"
+        if trip_data:
+            storage.store_trip_data(session_id, trip_data)
+        cleaned_response = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
+        assistant_message = Message(
+            role=MessageType.ASSISTANT,
+            content=cleaned_response,
+            timestamp=datetime.now(),
+            metadata={
+                "intent": intent,
+                "needs_more_info": needs_more_info,
+                "has_trip_data": bool(trip_data),
+            },
+        )
+        conversation_manager.process_new_message(
+            user_id,
+            payload.device_id,
+            assistant_message,
+            session_id,
+        )
+        _record_audit_log(
+            action="chat_send",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            session_id=session_id,
+            detail={"intent": intent, "has_trip_data": bool(trip_data)},
+        )
+        return ChatSendResponse(
+            session_id=session_id,
+            response=response_text,
+            trip_data=trip_data,
+            intent=intent,
+            needs_more_info=needs_more_info,
+        )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.post("/api/flow/stream")
@@ -3071,87 +4289,114 @@ async def stream_main_flow(
     request: Request,
     message_id: Optional[str] = Query(None, description="流式消息ID"),
     last_sequence: Optional[int] = Query(None, description="断线续传序号"),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     """单主流程唯一流式入口：启动或续传并输出统一 SSE 事件序列。"""
+    _assert_within_quota(current_user)
     if not payload.destination or payload.days <= 0:
         raise HTTPException(status_code=400, detail="destination 和 days 为必填且 days 必须大于 0")
-    session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
-    llm_manager = _get_llm_manager()
-    await _cleanup_flow_streams()
-    async with _flow_streams_lock:
-        stream_id = message_id or f"flow-{datetime.now().strftime('%H%M%S%f')}"
-        stream_state = _flow_streams.get(stream_id)
-        if not stream_state:
-            stream_state = {
-                "message_id": stream_id,
-                "session_id": session_id,
-                "events": [],
-                "done": False,
-                "running": False,
-                "pause_requested": False,
-                "last_status": "running",
-                "last_error": "",
-                "retry_count": 0,
-                "parent_message_id": "",
-                "last_payload": payload.model_dump(),
-                "created_at": time.time(),
-                "updated_at": time.time(),
-            }
-            _flow_streams[stream_id] = stream_state
-        else:
-            session_id = stream_state.get("session_id") or session_id
-            stream_state["last_payload"] = payload.model_dump()
-        if not stream_state.get("running") and not stream_state.get("done"):
-            stream_state["running"] = True
-            stream_state["pause_requested"] = False
-            asyncio.create_task(
-                _run_flow_stream(
-                    stream_id,
-                    session_id,
-                    llm_manager,
-                    payload,
-                )
-            )
-    header_sequence = request.headers.get("Last-Event-ID")
-    try:
-        header_sequence_value = int(header_sequence) if header_sequence else None
-    except Exception:
-        header_sequence_value = None
-    start_sequence = header_sequence_value if header_sequence_value is not None else last_sequence
-
-    async def event_generator():
-        current_sequence = int(start_sequence or 0)
-        while True:
-            if await request.is_disconnected():
-                break
-            async with _flow_streams_lock:
-                events = [
-                    event
-                    for event in stream_state.get("events", [])
-                    if int(event.get("sequence") or 0) > current_sequence
-                ]
-                done = bool(stream_state.get("done"))
-            if events:
-                for event in events:
-                    current_sequence = int(event.get("sequence") or current_sequence)
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                    if bool(event.get("is_final")):
-                        return
-            else:
-                if done:
-                    return
-                await asyncio.sleep(0.2)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache"},
+    user_id = str(current_user.user_id)
+    session_id = _ensure_session_id(user_id, payload.device_id, payload.session_id)
+    if payload.session_id:
+        _assert_session_owned(session_id, current_user)
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path="/api/flow/stream",
+        bucket="flow_stream",
+        session_id=session_id,
+        message_id=str(message_id or ""),
     )
+    llm_manager = _get_llm_manager()
+    try:
+        await _cleanup_flow_streams()
+        async with _flow_streams_lock:
+            stream_id = message_id or f"flow-{datetime.now().strftime('%H%M%S%f')}"
+            stream_state = _flow_streams.get(stream_id)
+            if not stream_state:
+                stream_state = {
+                    "message_id": stream_id,
+                    "session_id": session_id,
+                    "events": [],
+                    "done": False,
+                    "running": False,
+                    "pause_requested": False,
+                    "last_status": "running",
+                    "last_error": "",
+                    "retry_count": 0,
+                    "parent_message_id": "",
+                    "last_payload": payload.model_dump(),
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                }
+                _flow_streams[stream_id] = stream_state
+            else:
+                session_id = stream_state.get("session_id") or session_id
+                stream_state["last_payload"] = payload.model_dump()
+            if not stream_state.get("running") and not stream_state.get("done"):
+                stream_state["running"] = True
+                stream_state["pause_requested"] = False
+                asyncio.create_task(
+                    _run_flow_stream(
+                        stream_id,
+                        session_id,
+                        user_id,
+                        llm_manager,
+                        payload,
+                    )
+                )
+        header_sequence = request.headers.get("Last-Event-ID")
+        try:
+            header_sequence_value = int(header_sequence) if header_sequence else None
+        except Exception:
+            header_sequence_value = None
+        start_sequence = header_sequence_value if header_sequence_value is not None else last_sequence
+
+        async def event_generator():
+            current_sequence = int(start_sequence or 0)
+            while True:
+                if await request.is_disconnected():
+                    break
+                async with _flow_streams_lock:
+                    events = [
+                        event
+                        for event in stream_state.get("events", [])
+                        if int(event.get("sequence") or 0) > current_sequence
+                    ]
+                    done = bool(stream_state.get("done"))
+                if events:
+                    for event in events:
+                        current_sequence = int(event.get("sequence") or current_sequence)
+                        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                        if bool(event.get("is_final")):
+                            return
+                else:
+                    if done:
+                        return
+                    await asyncio.sleep(0.2)
+
+        _record_audit_log(
+            action="flow_stream_started",
+            status="accepted",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            session_id=session_id,
+            message_id=stream_id,
+            detail={"session_id": session_id},
+        )
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.get("/api/flow/status", response_model=FlowStatusResponse)
 async def get_flow_status(
     message_id: str = Query(..., description="流式消息ID"),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> FlowStatusResponse:
     """查询主流程当前状态，供前端展示与恢复控制判断。"""
     stream_state = await _get_flow_state(message_id)
@@ -3164,6 +4409,8 @@ async def get_flow_status(
     status_name = str(stream_state.get("last_status") or "running")
     if bool(stream_state.get("pause_requested")) and not bool(stream_state.get("done")):
         status_name = "paused"
+    if str(stream_state.get("session_id") or ""):
+        _assert_session_owned(str(stream_state.get("session_id") or ""), current_user)
     return FlowStatusResponse(
         message_id=str(stream_state.get("message_id") or message_id),
         session_id=str(stream_state.get("session_id") or ""),
@@ -3182,106 +4429,126 @@ async def get_flow_status(
 
 
 @app.post("/api/flow/control", response_model=FlowControlResponse)
-async def control_flow(payload: FlowControlRequest) -> FlowControlResponse:
+async def control_flow(
+    payload: FlowControlRequest,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> FlowControlResponse:
     """控制主流程执行，支持 pause/resume/retry 三类动作。"""
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path="/api/flow/control",
+        bucket="flow_control",
+        message_id=str(payload.message_id or ""),
+    )
     action = str(payload.action or "").strip().lower()
     if action not in {"pause", "resume", "retry"}:
         raise HTTPException(status_code=400, detail="action 仅支持 pause/resume/retry")
-    await _cleanup_flow_streams()
-    async with _flow_streams_lock:
-        stream_state = _flow_streams.get(payload.message_id)
-        if not stream_state:
-            raise HTTPException(status_code=404, detail="未找到对应主流程消息")
-        if action == "pause":
-            if bool(stream_state.get("done")):
+    try:
+        await _cleanup_flow_streams()
+        async with _flow_streams_lock:
+            stream_state = _flow_streams.get(payload.message_id)
+            if not stream_state:
+                raise HTTPException(status_code=404, detail="未找到对应主流程消息")
+            if str(stream_state.get("session_id") or ""):
+                _assert_session_owned(str(stream_state.get("session_id") or ""), current_user)
+            if action == "pause":
+                if bool(stream_state.get("done")):
+                    return FlowControlResponse(
+                        message_id=payload.message_id,
+                        action=action,
+                        accepted=False,
+                        status=str(stream_state.get("last_status") or "done"),
+                        detail="流程已结束，无法暂停",
+                    )
+                stream_state["pause_requested"] = True
+                stream_state["updated_at"] = time.time()
+                _record_audit_log(action="flow_control", status="success", user_id=current_user.user_id, user_email=current_user.email, detail={"action": action, "message_id": payload.message_id})
+                return FlowControlResponse(
+                    message_id=payload.message_id,
+                    action=action,
+                    accepted=True,
+                    status="paused",
+                    detail="已标记暂停，执行线程将在检查点暂停",
+                )
+            if action == "resume":
+                if bool(stream_state.get("done")):
+                    return FlowControlResponse(
+                        message_id=payload.message_id,
+                        action=action,
+                        accepted=False,
+                        status=str(stream_state.get("last_status") or "done"),
+                        detail="流程已结束，无法恢复",
+                    )
+                stream_state["pause_requested"] = False
+                stream_state["updated_at"] = time.time()
+                _record_audit_log(action="flow_control", status="success", user_id=current_user.user_id, user_email=current_user.email, detail={"action": action, "message_id": payload.message_id})
+                return FlowControlResponse(
+                    message_id=payload.message_id,
+                    action=action,
+                    accepted=True,
+                    status="running",
+                    detail="已恢复执行",
+                )
+            if bool(stream_state.get("running")):
                 return FlowControlResponse(
                     message_id=payload.message_id,
                     action=action,
                     accepted=False,
-                    status=str(stream_state.get("last_status") or "done"),
-                    detail="流程已结束，无法暂停",
+                    status="running",
+                    detail="流程运行中，暂不支持并发重试，请先暂停或等待结束",
                 )
-            stream_state["pause_requested"] = True
-            stream_state["updated_at"] = time.time()
-            return FlowControlResponse(
-                message_id=payload.message_id,
-                action=action,
-                accepted=True,
-                status="paused",
-                detail="已标记暂停，执行线程将在检查点暂停",
+            last_payload = stream_state.get("last_payload")
+            if not isinstance(last_payload, dict):
+                return FlowControlResponse(
+                    message_id=payload.message_id,
+                    action=action,
+                    accepted=False,
+                    status=str(stream_state.get("last_status") or "failed"),
+                    detail="缺少重试请求参数，无法重试",
+                )
+            retry_message_id = f"{payload.message_id}-retry-{datetime.now().strftime('%H%M%S%f')}"
+            stream_state["retry_count"] = _to_int(stream_state.get("retry_count"), 0) + 1
+            retry_payload = FlowStreamRequest(**last_payload)
+            retry_state = {
+                "message_id": retry_message_id,
+                "session_id": str(stream_state.get("session_id") or ""),
+                "events": [],
+                "done": False,
+                "running": True,
+                "pause_requested": False,
+                "last_status": "running",
+                "last_error": "",
+                "retry_count": _to_int(stream_state.get("retry_count"), 0),
+                "parent_message_id": payload.message_id,
+                "last_payload": retry_payload.model_dump(),
+                "created_at": time.time(),
+                "updated_at": time.time(),
+            }
+            _flow_streams[retry_message_id] = retry_state
+            llm_manager = _get_llm_manager()
+            session_id = str(stream_state.get("session_id") or retry_payload.session_id or "")
+            asyncio.create_task(
+                _run_flow_stream(
+                    retry_message_id,
+                    session_id,
+                    str(current_user.user_id),
+                    llm_manager,
+                    retry_payload,
+                )
             )
-        if action == "resume":
-            if bool(stream_state.get("done")):
-                return FlowControlResponse(
-                    message_id=payload.message_id,
-                    action=action,
-                    accepted=False,
-                    status=str(stream_state.get("last_status") or "done"),
-                    detail="流程已结束，无法恢复",
-                )
-            stream_state["pause_requested"] = False
-            stream_state["updated_at"] = time.time()
+            _record_audit_log(action="flow_control", status="success", user_id=current_user.user_id, user_email=current_user.email, detail={"action": action, "message_id": payload.message_id, "next_message_id": retry_message_id})
             return FlowControlResponse(
                 message_id=payload.message_id,
                 action=action,
                 accepted=True,
                 status="running",
-                detail="已恢复执行",
+                next_message_id=retry_message_id,
+                detail="已创建重试任务，请使用 next_message_id 继续拉流",
             )
-        if bool(stream_state.get("running")):
-            return FlowControlResponse(
-                message_id=payload.message_id,
-                action=action,
-                accepted=False,
-                status="running",
-                detail="流程运行中，暂不支持并发重试，请先暂停或等待结束",
-            )
-        last_payload = stream_state.get("last_payload")
-        if not isinstance(last_payload, dict):
-            return FlowControlResponse(
-                message_id=payload.message_id,
-                action=action,
-                accepted=False,
-                status=str(stream_state.get("last_status") or "failed"),
-                detail="缺少重试请求参数，无法重试",
-            )
-        retry_message_id = f"{payload.message_id}-retry-{datetime.now().strftime('%H%M%S%f')}"
-        stream_state["retry_count"] = _to_int(stream_state.get("retry_count"), 0) + 1
-        retry_payload = FlowStreamRequest(**last_payload)
-        retry_state = {
-            "message_id": retry_message_id,
-            "session_id": str(stream_state.get("session_id") or ""),
-            "events": [],
-            "done": False,
-            "running": True,
-            "pause_requested": False,
-            "last_status": "running",
-            "last_error": "",
-            "retry_count": _to_int(stream_state.get("retry_count"), 0),
-            "parent_message_id": payload.message_id,
-            "last_payload": retry_payload.model_dump(),
-            "created_at": time.time(),
-            "updated_at": time.time(),
-        }
-        _flow_streams[retry_message_id] = retry_state
-        llm_manager = _get_llm_manager()
-        session_id = str(stream_state.get("session_id") or retry_payload.session_id or "")
-        asyncio.create_task(
-            _run_flow_stream(
-                retry_message_id,
-                session_id,
-                llm_manager,
-                retry_payload,
-            )
-        )
-        return FlowControlResponse(
-            message_id=payload.message_id,
-            action=action,
-            accepted=True,
-            status="running",
-            next_message_id=retry_message_id,
-            detail="已创建重试任务，请使用 next_message_id 继续拉流",
-        )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.get("/api/flow/metrics", response_model=FlowMetricsListResponse)
@@ -3291,13 +4558,13 @@ def list_flow_metrics(
     mode: Optional[str] = Query(None, description="执行模式 fast/deep"),
     intent: Optional[str] = Query(None, description="意图筛选"),
     status: Optional[str] = Query(None, description="状态筛选 done/failed"),
-    user_id: Optional[str] = Query(None, description="用户ID"),
     device_id: Optional[str] = Query(None, description="设备ID"),
     session_id: Optional[str] = Query(None, description="会话ID"),
     agent_escalated: Optional[bool] = Query(None, description="是否升级Agent"),
     rag_hit: Optional[bool] = Query(None, description="是否命中RAG"),
     limit: int = Query(50, ge=1, le=500, description="分页条数"),
     offset: int = Query(0, ge=0, description="分页偏移"),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> FlowMetricsListResponse:
     """查询主流程指标明细，支持按模式、意图、状态与时间范围过滤。"""
     total, items = _query_flow_metrics_rows(
@@ -3306,7 +4573,7 @@ def list_flow_metrics(
         mode=mode,
         intent=intent,
         status=status,
-        user_id=user_id,
+        user_id=str(current_user.user_id),
         device_id=device_id,
         session_id=session_id,
         agent_escalated=agent_escalated,
@@ -3324,11 +4591,11 @@ def summary_flow_metrics(
     mode: Optional[str] = Query(None, description="执行模式 fast/deep"),
     intent: Optional[str] = Query(None, description="意图筛选"),
     status: Optional[str] = Query(None, description="状态筛选 done/failed"),
-    user_id: Optional[str] = Query(None, description="用户ID"),
     device_id: Optional[str] = Query(None, description="设备ID"),
     session_id: Optional[str] = Query(None, description="会话ID"),
     agent_escalated: Optional[bool] = Query(None, description="是否升级Agent"),
     rag_hit: Optional[bool] = Query(None, description="是否命中RAG"),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> FlowMetricsSummaryResponse:
     """查询主流程指标聚合摘要，输出成功率、时延分位与命中比例。"""
     summary = _query_flow_metrics_summary(
@@ -3337,7 +4604,7 @@ def summary_flow_metrics(
         mode=mode,
         intent=intent,
         status=status,
-        user_id=user_id,
+        user_id=str(current_user.user_id),
         device_id=device_id,
         session_id=session_id,
         agent_escalated=agent_escalated,
@@ -3347,7 +4614,7 @@ def summary_flow_metrics(
 
 
 @app.get("/api/flow/release_gate", response_model=ReleaseGateResponse)
-def flow_release_gate() -> ReleaseGateResponse:
+def flow_release_gate(current_user: AuthenticatedUser = Depends(get_current_user)) -> ReleaseGateResponse:
     """输出最终验收清单与发布门槛判定，供版本发布前检查。"""
     metrics_summary = _query_flow_metrics_summary(
         start_time=None,
@@ -3366,7 +4633,10 @@ def flow_release_gate() -> ReleaseGateResponse:
 
 
 @app.post("/api/map/render", response_model=MapRenderResponse)
-def render_map(payload: MapRenderRequest) -> MapRenderResponse:
+def render_map(
+    payload: MapRenderRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> MapRenderResponse:
     trip_data = payload.trip_data or {}
     map_renderer = _get_map_renderer()
     batch_index = payload.batch_index or 0
@@ -3393,7 +4663,10 @@ def render_map(payload: MapRenderRequest) -> MapRenderResponse:
 
 
 @app.post("/api/map/geojson", response_model=MapGeoJsonResponse)
-def render_map_geojson(payload: MapGeoJsonRequest) -> MapGeoJsonResponse:
+def render_map_geojson(
+    payload: MapGeoJsonRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> MapGeoJsonResponse:
     trip_data = payload.trip_data or {}
     map_renderer = _get_map_renderer()
     geo_payload = map_renderer.build_geojson(trip_data)
@@ -3401,24 +4674,53 @@ def render_map_geojson(payload: MapGeoJsonRequest) -> MapGeoJsonResponse:
 
 
 @app.post("/api/trip/update", response_model=TripUpdateResponse)
-def update_trip(payload: TripUpdateRequest) -> TripUpdateResponse:
-    session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
-    storage = _get_storage()
-    llm_manager = _get_llm_manager()
-    next_trip = dict(payload.trip_data or {})
-    raw_constraints = payload.constraints or next_trip.get("constraints_used") or {}
-    normalized_constraints = _normalize_trip_constraints(raw_constraints)
-    constraint_statuses = _build_constraint_statuses(next_trip, normalized_constraints)
-    conflict_report = llm_manager.build_conflict_report(next_trip, normalized_constraints).model_dump()
-    next_trip["constraints_used"] = normalized_constraints
-    next_trip["constraints_satisfied"] = constraint_statuses
-    next_trip["conflict_report"] = conflict_report
-    storage.store_trip_data(session_id, next_trip)
-    return TripUpdateResponse(session_id=session_id, trip_data=next_trip)
+def update_trip(
+    request: Request,
+    payload: TripUpdateRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> TripUpdateResponse:
+    _assert_within_quota(current_user)
+    session_id = _ensure_session_id(str(current_user.user_id), payload.device_id, payload.session_id)
+    if payload.session_id:
+        _assert_session_owned(session_id, current_user)
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/trip/update",
+        session_id=session_id,
+    )
+    try:
+        storage = _get_storage()
+        llm_manager = _get_llm_manager()
+        next_trip = dict(payload.trip_data or {})
+        raw_constraints = payload.constraints or next_trip.get("constraints_used") or {}
+        normalized_constraints = _normalize_trip_constraints(raw_constraints)
+        constraint_statuses = _build_constraint_statuses(next_trip, normalized_constraints)
+        conflict_report = llm_manager.build_conflict_report(next_trip, normalized_constraints).model_dump()
+        next_trip["constraints_used"] = normalized_constraints
+        next_trip["constraints_satisfied"] = constraint_statuses
+        next_trip["conflict_report"] = conflict_report
+        storage.store_trip_data(session_id, next_trip)
+        _record_audit_log(
+            action="trip_update",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            session_id=session_id,
+            detail={"days": next_trip.get("days"), "has_conflicts": bool(conflict_report.get("has_conflicts"))},
+        )
+        return TripUpdateResponse(session_id=session_id, trip_data=next_trip)
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.post("/api/trip/replan_day", response_model=TripReplanDayResponse)
-def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
+def replan_trip_day(
+    request: Request,
+    payload: TripReplanDayRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> TripReplanDayResponse:
+    _assert_within_quota(current_user)
     # 这条链路不是“把第 N 天整天覆盖写回”这么简单，
     # 而是先生成候选结果，再按 scope merge，必要时只对前后相邻天做最小联动修补，
     # 最后对 locked_days 做硬回退，并重算约束满足状态与 conflict_report。
@@ -3429,657 +4731,756 @@ def replan_trip_day(payload: TripReplanDayRequest) -> TripReplanDayResponse:
     # 4) 只把候选结果 merge 回允许变动的时间段，而不是整份行程整表覆盖
     # 5) 若检测到相邻天依赖，只对相邻天的最小必要时间段做二次 merge
     # 6) 对 locked_days 做最终硬回退，然后重算约束满足状态与冲突报告
-    session_id = _ensure_session_id(payload.user_id, payload.device_id, payload.session_id)
-    # 会话里的 trip_data 才是本次局部重排的“原始基线”。
-    # 后面的所有 merge、锁定回退、冲突重算都围绕这份 current_trip 展开。
-    storage = _get_storage()
-    current_trip = storage.get_trip_data(session_id)
-    if not current_trip:
-        raise HTTPException(status_code=404, detail="当前会话未找到行程数据")
-    # scope 优先于旧版 day：如果前端传了更细粒度的 scope，就以 scope.day 作为目标天；
-    # 否则退化成旧版“整天重排”的 day。
-    scope_day = int(payload.scope.day) if payload.scope else int(payload.day)
-    # 把前端的 time_range 清洗成统一的小写枚举，便于后面判断 morning/afternoon/evening。
-    scope_time_range = str(payload.scope.time_range or "").strip().lower() if payload.scope else ""
-    if scope_time_range not in {"", "morning", "afternoon", "evening"}:
-        raise HTTPException(status_code=400, detail="time_range 仅支持 morning/afternoon/evening")
-    # None 表示整天重排；具体字符串则表示只改某个半天范围。
-    time_range = scope_time_range or None
-    # locked_days 会过滤非法值、去重，并排除当前目标天本身，
-    # 避免出现“既要重排第 N 天，又锁定第 N 天”的矛盾请求。
-    locked_days = _normalize_locked_days(payload.locked_days, scope_day)
-    llm_manager = _get_llm_manager()
-    # 约束优先用本次请求显式透传的 constraints；如果没有，再回退到当前行程里已生效的 constraints_used。
-    # 这样局部重排会延续用户原先的预算/强度/节奏要求，而不是裸跑一次新的重排行程。
-    normalized_constraints = _normalize_trip_constraints(payload.constraints or current_trip.get("constraints_used") or {})
-    # user_input 是喂给 generate_trip 的结构化输入基座：
-    # 目的地/天数/预算/偏好来自当前行程，结构化约束来自 normalized_constraints。
-    user_input = {
-        "destination": current_trip.get("destination", "成都"),
-        "days": current_trip.get("days", 3),
-        "budget": current_trip.get("budget", ""),
-        "preference": current_trip.get("preference", ""),
-        "budget_level": normalized_constraints.get("budget_level", "balanced"),
-        "intensity": normalized_constraints.get("intensity", "standard"),
-        "pace": normalized_constraints.get("pace", "cultural"),
-        "special_constraints": normalized_constraints.get("special_constraints") or {},
-    }
-    # 这里把“目标范围 / 锁定天 / 用户补充指令”全部压进 edit_cmd，
-    # 让 LLM 在重排时有明确边界，避免把局部修改误扩散到全行程。
-    # edit_cmd 更像是“本次重排任务说明”，告诉模型：
-    # 目标是第几天、哪个时间段、哪些天绝对不能动、用户额外补充了什么要求。
-    scope_label_map = {
-        "morning": "上午",
-        "afternoon": "下午",
-        "evening": "晚间",
-    }
-    # scope_label 只用于拼接更自然的中文任务描述，提升模型理解局部范围的稳定性。
-    scope_label = scope_label_map.get(time_range, "整天")
-    # 用户在弹窗里输入的自然语言补充要求，例如“下午尽量轻松一点”或“保留晚餐安排”。
-    replan_instruction = str(payload.replan_instruction or "").strip()
-    edit_cmd = {
-        "type": "modify",
-        "msg": f"仅重新规划第{scope_day}天{scope_label}行程，其余天保持最小改动",
-        "scope": {"day": scope_day, "time_range": time_range},
-        "locked_days": locked_days,
-        "replan_instruction": replan_instruction,
-    }
-    # 除了 edit_cmd 外，再单独补一份结构化上下文，降低模型误改非目标范围的概率。
-    # 这份上下文会把当前完整行程、目标天原始安排、锁定天内容一起告诉模型，
-    # 等于同时给模型“任务说明 + 原始参考材料”两层约束。
-    replan_context = _build_replan_context(
-        current_trip=current_trip,
-        target_day=scope_day,
-        time_range=time_range,
-        locked_days=locked_days,
-        replan_instruction=replan_instruction,
-    )
-    logger.info(
-        "局部重排开始 session_id=%s day=%s time_range=%s locked_days=%s",
-        session_id,
-        scope_day,
-        time_range or "full_day",
-        locked_days,
-    )
-    # 这里拿到的是“模型认为应该如何重排”的候选结果，它可能：
-    # 1) 只改了目标天
-    # 2) 顺手改了相邻天
-    # 3) 甚至误改了锁定天
-    # 所以后面绝不能直接整份覆盖 current_trip，而必须经过受控 merge。
-    replanned_trip = llm_manager.generate_trip(user_input, replan_context, edit_cmd)
-    if not replanned_trip:
-        raise HTTPException(status_code=500, detail="重新规划失败")
-    # original_daily_plan 是真正的基线；current_daily_plan 是后续持续被 merge 的工作副本；
-    # replanned_daily_plan 则是模型输出的候选版本。
-    original_daily_plan = _normalize_daily_plan(current_trip)
-    current_daily_plan = dict(original_daily_plan)
-    replanned_daily_plan = _normalize_daily_plan(replanned_trip)
-    # 目标天的 key 统一转成字符串，和 daily_plan 的内部表示保持一致。
-    day_key = str(scope_day)
-    # original_day_items 是目标天原始内容；
-    # replanned_day_items 是模型给目标天产出的候选内容。
-    original_day_items = current_daily_plan.get(day_key, [])
-    replanned_day_items = replanned_daily_plan.get(day_key, [])
-    if replanned_day_items:
-        # 这里统一复用 scope merge：
-        # 整天时等价于直接替换，半天时只替换目标时间段。
-        # merge 的核心思路是：
-        # - 如果是整天重排：当前目标天直接使用模型返回的新日程
-        # - 如果是半天重排：只把 morning/afternoon/evening 命中的项替换掉
-        #   不在该时间段内的旧项全部保留
-        # 这样能保证“上午重排不会把晚上晚餐或酒店入住也冲掉”。
-        current_daily_plan[day_key] = _merge_day_items_by_scope(
-            original_items=original_day_items,
-            replanned_items=replanned_day_items,
-            time_range=time_range,
-        )
-
-    # 目标天 merge 完成后，再检测这次改动是否影响相邻天。
-    # 例如：
-    # - 第 N 天晚上改到另一个城市，可能会影响第 N+1 天早晨的出发安排
-    # - 第 N 天上午改动，可能暴露出第 N-1 天晚上收尾过晚的问题
-    escalation_meta = _detect_replan_escalation(current_trip, scope_day, time_range, locked_days)
-    if escalation_meta.get("escalated"):
-        # impacted_days 是启发式检测出来“需要最小联动修补”的相邻天集合，
-        # 不是允许把整天都重算的授权列表。
-        impacted_days = escalation_meta.get("impacted_days") or []
-        # 具体例子：
-        # - 原始 Day 2:
-        #   09:00-11:00 西湖
-        #   14:00-16:00 灵隐寺
-        #   19:00-20:30 河坊街晚餐
-        # - 原始 Day 3:
-        #   08:00-09:00 酒店早餐
-        #   09:30-12:00 西溪湿地
-        #   14:00-17:00 宋城
-        # - 用户只要求重排 Day 2 的 evening
-        # - 模型候选把 Day 2 晚上改成：
-        #   20:00-23:00 杭州 -> 上海
-        #
-        # 这时系统会判断 Day 3 上午原计划已经接不上，因此 impacted_days 会包含 Day 3。
-        # 但这里不会把 Day 3 整天重做，而是只替换 Day 3 的 morning：
-        # 1) 保留原始 Day 3 中不属于 morning 的项：
-        #    14:00-17:00 宋城
-        # 2) 从模型候选结果里只取属于 morning 的项，比如：
-        #    09:30-10:30 上海酒店补觉
-        #    11:00-12:00 南京路 brunch
-        # 3) merge 后得到新的 Day 3：
-        #    09:30-10:30 上海酒店补觉
-        #    11:00-12:00 南京路 brunch
-        #    14:00-17:00 宋城
-        #
-        # 也就是说：相邻天只做“受影响时间段”的局部替换，
-        # 不是把整天全部替换成模型版本。
-        # 对相邻受影响天只做最小联动：上一天只允许动 evening，下一天只允许动 morning。
-        # 这样既能处理跨天交通衔接，又能把改动范围控制在最小必要集合里。
-        for impacted_day in impacted_days:
-            # 相邻天在 daily_plan 里同样用字符串 key 存储。
-            impacted_key = str(impacted_day)
-            # impacted_items 取自模型候选结果中的相邻天安排。
-            # 如果模型没提供该相邻天内容，就说明没有可 merge 的候选项，直接跳过。
-            impacted_items = replanned_daily_plan.get(impacted_key) or []
-            if not impacted_items:
-                continue
-            # 只允许做“最小必要时间段”的联动：
-            # - 影响下一天：只调 morning，因为最常见的是跨城后影响次日清晨衔接
-            # - 影响上一天：只调 evening，因为最常见的是前一晚收尾过晚或跨城前置安排
-            impacted_scope = "morning" if impacted_day > scope_day else "evening"
-            # 这里是整条链路里最重要、也最容易误解的 merge：
-            # 它不是“把相邻天整天替换成模型版本”，而是：
-            # 1) 先保留 current_daily_plan 中该相邻天未落入 impacted_scope 的原始项
-            # 2) 再从 impacted_items 中取出落入 impacted_scope 的候选项
-            # 3) 把两部分拼起来后重新按时间排序
-            # 结果就是：
-            # - 第 N+1 天若受影响，只会替换 morning，下午/晚上沿用原行程
-            # - 第 N-1 天若受影响，只会替换 evening，上午/下午沿用原行程
-            # 这样做的目的，是把“局部重排的副作用”严格限制在相邻天最小必要范围内。
-            current_daily_plan[impacted_key] = _merge_day_items_by_scope(
-                original_items=current_daily_plan.get(impacted_key, []),
-                replanned_items=impacted_items,
-                time_range=impacted_scope,
-            )
-
-    # 锁定天始终以原始数据为准，哪怕模型误改了，也在 merge 末尾硬回退。
-    for locked_day in locked_days:
-        # locked_key 也是字符串，因为 daily_plan 的键在当前实现里使用字符串 day。
-        locked_key = str(locked_day)
-        # 如果模型候选结果里真的改到了锁定天，就记一条 warning，方便排查模型边界控制是否漂移。
-        if locked_key in replanned_daily_plan and replanned_daily_plan.get(locked_key) != original_daily_plan.get(locked_key):
-            logger.warning("局部重排命中锁定天回退 session_id=%s day=%s", session_id, locked_day)
-        if locked_key in original_daily_plan:
-            # 这里是最终“硬回退”动作：
-            # 不管前面目标天 merge、相邻天 merge 发生了什么，只要这一天被锁定，就强制恢复原始内容。
-            current_daily_plan[locked_key] = original_daily_plan.get(locked_key, [])
-
-    # merged_trip 基于 current_trip 拷贝，再只替换 daily_plan，
-    # 这样目的地、天数、预算、偏好等顶层字段会保持原始会话里的值。
-    merged_trip = dict(current_trip)
-    # 到这里 current_daily_plan 已经是：
-    # 目标天局部 merge + 相邻天最小联动 merge + 锁定天硬回退 之后的最终日程。
-    merged_trip["daily_plan"] = current_daily_plan
-    # 局部重排后的结果也要继续挂上当前约束，供后续展示、编辑、再次重排复用。
-    merged_trip["constraints_used"] = normalized_constraints
-    # 约束满足状态基于 merge 后的最终结果重算，避免沿用旧 trip_data 的状态。
-    merged_trip["constraints_satisfied"] = _build_constraint_statuses(merged_trip, normalized_constraints)
-    # 冲突报告同样必须基于 merge 后结果重算，因为局部重排和相邻天联动都可能改变冲突分布。
-    conflict_report = llm_manager.build_conflict_report(merged_trip, normalized_constraints).model_dump()
-    merged_trip["conflict_report"] = conflict_report
-    # 持久化的是最终 merge 完成后的 merged_trip，而不是模型原始候选结果。
-    storage.store_trip_data(session_id, merged_trip)
-    logger.info(
-        "局部重排完成 session_id=%s day=%s time_range=%s escalated=%s conflict=%s",
-        session_id,
-        scope_day,
-        time_range or "full_day",
-        bool(escalation_meta.get("escalated")),
-        bool(conflict_report.get("has_conflicts")),
-    )
-    # replanned_scope 回传的是后端最终采用的重排范围，
-    # 前端可据此确认这次是整天/上午/下午/晚间哪一种重排。
-    return TripReplanDayResponse(
+    session_id = _ensure_session_id(str(current_user.user_id), payload.device_id, payload.session_id)
+    if payload.session_id:
+        _assert_session_owned(session_id, current_user)
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/trip/replan_day",
         session_id=session_id,
-        trip_data=merged_trip,
-        replanned_scope={
-            "day": scope_day,
-            "time_range": time_range,
-            "locked_days": locked_days,
-        },
-        # agent_escalation 返回的不是完整 agent 执行明细，而是：
-        # 是否触发了相邻天最小联动、为什么触发、对用户怎么解释。
-        agent_escalation=AgentEscalationInfo(
-            escalated=bool(escalation_meta.get("escalated")),
-            reasons=list(escalation_meta.get("reasons") or []),
-            message=str(escalation_meta.get("message") or ""),
-        ),
-        # conflict_report 是 merge 后重新计算的最终冲突状态，
-        # 不是原行程的旧冲突报告，也不是模型候选结果里的临时冲突估计。
-        conflict_report=conflict_report,
     )
+    try:
+        # 会话里的 trip_data 才是本次局部重排的“原始基线”。
+        # 后面的所有 merge、锁定回退、冲突重算都围绕这份 current_trip 展开。
+        storage = _get_storage()
+        current_trip = storage.get_trip_data(session_id)
+        if not current_trip:
+            raise HTTPException(status_code=404, detail="当前会话未找到行程数据")
+        # scope 优先于旧版 day：如果前端传了更细粒度的 scope，就以 scope.day 作为目标天；
+        # 否则退化成旧版“整天重排”的 day。
+        scope_day = int(payload.scope.day) if payload.scope else int(payload.day)
+        # 把前端的 time_range 清洗成统一的小写枚举，便于后面判断 morning/afternoon/evening。
+        scope_time_range = str(payload.scope.time_range or "").strip().lower() if payload.scope else ""
+        if scope_time_range not in {"", "morning", "afternoon", "evening"}:
+            raise HTTPException(status_code=400, detail="time_range 仅支持 morning/afternoon/evening")
+        # None 表示整天重排；具体字符串则表示只改某个半天范围。
+        time_range = scope_time_range or None
+        # locked_days 会过滤非法值、去重，并排除当前目标天本身，
+        # 避免出现“既要重排第 N 天，又锁定第 N 天”的矛盾请求。
+        locked_days = _normalize_locked_days(payload.locked_days, scope_day)
+        llm_manager = _get_llm_manager()
+        # 约束优先用本次请求显式透传的 constraints；如果没有，再回退到当前行程里已生效的 constraints_used。
+        # 这样局部重排会延续用户原先的预算/强度/节奏要求，而不是裸跑一次新的重排行程。
+        normalized_constraints = _normalize_trip_constraints(payload.constraints or current_trip.get("constraints_used") or {})
+        # user_input 是喂给 generate_trip 的结构化输入基座：
+        # 目的地/天数/预算/偏好来自当前行程，结构化约束来自 normalized_constraints。
+        user_input = {
+            "destination": current_trip.get("destination", "成都"),
+            "days": current_trip.get("days", 3),
+            "budget": current_trip.get("budget", ""),
+            "preference": current_trip.get("preference", ""),
+            "budget_level": normalized_constraints.get("budget_level", "balanced"),
+            "intensity": normalized_constraints.get("intensity", "standard"),
+            "pace": normalized_constraints.get("pace", "cultural"),
+            "special_constraints": normalized_constraints.get("special_constraints") or {},
+        }
+        # 这里把“目标范围 / 锁定天 / 用户补充指令”全部压进 edit_cmd，
+        # 让 LLM 在重排时有明确边界，避免把局部修改误扩散到全行程。
+        scope_label_map = {
+            "morning": "上午",
+            "afternoon": "下午",
+            "evening": "晚间",
+        }
+        # scope_label 只用于拼接更自然的中文任务描述，提升模型理解局部范围的稳定性。
+        scope_label = scope_label_map.get(time_range, "整天")
+        # 用户在弹窗里输入的自然语言补充要求，例如“下午尽量轻松一点”或“保留晚餐安排”。
+        replan_instruction = str(payload.replan_instruction or "").strip()
+        edit_cmd = {
+            "type": "modify",
+            "msg": f"仅重新规划第{scope_day}天{scope_label}行程，其余天保持最小改动",
+            "scope": {"day": scope_day, "time_range": time_range},
+            "locked_days": locked_days,
+            "replan_instruction": replan_instruction,
+        }
+        # 除了 edit_cmd 外，再单独补一份结构化上下文，降低模型误改非目标范围的概率。
+        replan_context = _build_replan_context(
+            current_trip=current_trip,
+            target_day=scope_day,
+            time_range=time_range,
+            locked_days=locked_days,
+            replan_instruction=replan_instruction,
+        )
+        logger.info(
+            "局部重排开始 session_id=%s day=%s time_range=%s locked_days=%s",
+            session_id,
+            scope_day,
+            time_range or "full_day",
+            locked_days,
+        )
+        # 这里拿到的是“模型认为应该如何重排”的候选结果”，后面必须经过受控 merge，
+        # 不能直接整份覆盖 current_trip。
+        replanned_trip = llm_manager.generate_trip(user_input, replan_context, edit_cmd)
+        if not replanned_trip:
+            raise HTTPException(status_code=500, detail="重新规划失败")
+        # original_daily_plan 是真正的基线；current_daily_plan 是后续持续被 merge 的工作副本；
+        # replanned_daily_plan 则是模型输出的候选版本。
+        original_daily_plan = _normalize_daily_plan(current_trip)
+        current_daily_plan = dict(original_daily_plan)
+        replanned_daily_plan = _normalize_daily_plan(replanned_trip)
+        # 目标天的 key 统一转成字符串，和 daily_plan 的内部表示保持一致。
+        day_key = str(scope_day)
+        # original_day_items 是目标天原始内容；replanned_day_items 是候选内容。
+        original_day_items = current_daily_plan.get(day_key, [])
+        replanned_day_items = replanned_daily_plan.get(day_key, [])
+        if replanned_day_items:
+            # 整天时等价于直接替换，半天时只替换目标时间段，
+            # 这样能保证“上午重排不会把晚上安排也冲掉”。
+            current_daily_plan[day_key] = _merge_day_items_by_scope(
+                original_items=original_day_items,
+                replanned_items=replanned_day_items,
+                time_range=time_range,
+            )
+        escalation_meta = _detect_replan_escalation(current_trip, scope_day, time_range, locked_days)
+        if escalation_meta.get("escalated"):
+            impacted_days = escalation_meta.get("impacted_days") or []
+            for impacted_day in impacted_days:
+                impacted_key = str(impacted_day)
+                impacted_items = replanned_daily_plan.get(impacted_key) or []
+                if not impacted_items:
+                    continue
+                impacted_scope = "morning" if impacted_day > scope_day else "evening"
+                current_daily_plan[impacted_key] = _merge_day_items_by_scope(
+                    original_items=current_daily_plan.get(impacted_key, []),
+                    replanned_items=impacted_items,
+                    time_range=impacted_scope,
+                )
+        for locked_day in locked_days:
+            locked_key = str(locked_day)
+            if locked_key in replanned_daily_plan and replanned_daily_plan.get(locked_key) != original_daily_plan.get(locked_key):
+                logger.warning("局部重排命中锁定天回退 session_id=%s day=%s", session_id, locked_day)
+            if locked_key in original_daily_plan:
+                current_daily_plan[locked_key] = original_daily_plan.get(locked_key, [])
+        merged_trip = dict(current_trip)
+        merged_trip["daily_plan"] = current_daily_plan
+        merged_trip["constraints_used"] = normalized_constraints
+        merged_trip["constraints_satisfied"] = _build_constraint_statuses(merged_trip, normalized_constraints)
+        conflict_report = llm_manager.build_conflict_report(merged_trip, normalized_constraints).model_dump()
+        merged_trip["conflict_report"] = conflict_report
+        storage.store_trip_data(session_id, merged_trip)
+        logger.info(
+            "局部重排完成 session_id=%s day=%s time_range=%s escalated=%s conflict=%s",
+            session_id,
+            scope_day,
+            time_range or "full_day",
+            bool(escalation_meta.get("escalated")),
+            bool(conflict_report.get("has_conflicts")),
+        )
+        _record_audit_log(
+            action="trip_replan_day",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            session_id=session_id,
+            detail={
+                "day": scope_day,
+                "time_range": time_range or "full_day",
+                "locked_days": locked_days,
+                "escalated": bool(escalation_meta.get("escalated")),
+            },
+        )
+        return TripReplanDayResponse(
+            session_id=session_id,
+            trip_data=merged_trip,
+            replanned_scope={
+                "day": scope_day,
+                "time_range": time_range,
+                "locked_days": locked_days,
+            },
+            agent_escalation=AgentEscalationInfo(
+                escalated=bool(escalation_meta.get("escalated")),
+                reasons=list(escalation_meta.get("reasons") or []),
+                message=str(escalation_meta.get("message") or ""),
+            ),
+            conflict_report=conflict_report,
+        )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.get("/api/knowledge/bases", response_model=KnowledgeBaseListResponse)
-def list_knowledge_bases() -> KnowledgeBaseListResponse:
-    records = _load_knowledge_base_registry()
-    items = [_build_knowledge_base_item(row) for row in records]
-    return KnowledgeBaseListResponse(items=items)
+def list_knowledge_bases(
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeBaseListResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/knowledge/bases",
+    )
+    try:
+        records = _load_knowledge_base_registry()
+        items = [_build_knowledge_base_item(row) for row in records]
+        _record_audit_log(
+            action="knowledge_bases_list",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"base_count": len(items)},
+        )
+        return KnowledgeBaseListResponse(items=items)
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.post("/api/knowledge/bases", response_model=KnowledgeBaseCreateResponse)
-def create_knowledge_base(payload: KnowledgeBaseCreateRequest) -> KnowledgeBaseCreateResponse:
-    normalized_id = _normalize_knowledge_base_id(payload.name)
-    collection_name = _to_collection_name(normalized_id)
-    store = _get_knowledge_store()
-    created_collection_name = store.create_collection(collection_name)
-    _upsert_knowledge_base_registry(
-        knowledge_base_id=normalized_id,
-        name=str(payload.name).strip(),
-        collection_name=created_collection_name,
+def create_knowledge_base(
+    request: Request,
+    payload: KnowledgeBaseCreateRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeBaseCreateResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/knowledge/bases",
     )
-    return KnowledgeBaseCreateResponse(
-        knowledge_base_id=normalized_id,
-        name=str(payload.name).strip(),
-        collection_name=created_collection_name,
-    )
+    try:
+        normalized_id = _normalize_knowledge_base_id(payload.name)
+        collection_name = _to_collection_name(normalized_id)
+        store = _get_knowledge_store()
+        created_collection_name = store.create_collection(collection_name)
+        _upsert_knowledge_base_registry(
+            knowledge_base_id=normalized_id,
+            name=str(payload.name).strip(),
+            collection_name=created_collection_name,
+        )
+        _record_audit_log(
+            action="knowledge_base_create",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"knowledge_base_id": normalized_id, "name": str(payload.name).strip()},
+        )
+        return KnowledgeBaseCreateResponse(
+            knowledge_base_id=normalized_id,
+            name=str(payload.name).strip(),
+            collection_name=created_collection_name,
+        )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.delete("/api/knowledge/bases/{knowledge_base_id}", response_model=KnowledgeBaseDeleteResponse)
-def delete_knowledge_base(knowledge_base_id: str) -> KnowledgeBaseDeleteResponse:
-    normalized_id = _normalize_knowledge_base_id(knowledge_base_id)
-    collection_name = _to_collection_name(normalized_id)
-    store = _get_knowledge_store()
-    existing = set(store.list_collections())
-    if collection_name not in existing:
-        raise HTTPException(status_code=404, detail="知识库不存在")
-    delete_success = store.delete_collection(collection_name)
-    if not delete_success:
-        raise HTTPException(status_code=500, detail="知识库删除失败")
-    _delete_knowledge_base_registry(normalized_id)
-    return KnowledgeBaseDeleteResponse(knowledge_base_id=normalized_id, success=True)
+def delete_knowledge_base(
+    request: Request,
+    knowledge_base_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeBaseDeleteResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path=f"/api/knowledge/bases/{knowledge_base_id}",
+    )
+    try:
+        normalized_id = _normalize_knowledge_base_id(knowledge_base_id)
+        collection_name = _to_collection_name(normalized_id)
+        store = _get_knowledge_store()
+        existing = set(store.list_collections())
+        if collection_name not in existing:
+            raise HTTPException(status_code=404, detail="知识库不存在")
+        delete_success = store.delete_collection(collection_name)
+        if not delete_success:
+            raise HTTPException(status_code=500, detail="知识库删除失败")
+        _delete_knowledge_base_registry(normalized_id)
+        _record_audit_log(
+            action="knowledge_base_delete",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"knowledge_base_id": normalized_id},
+        )
+        return KnowledgeBaseDeleteResponse(knowledge_base_id=normalized_id, success=True)
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.post("/api/knowledge/bases/{knowledge_base_id}/upload", response_model=KnowledgeUploadResponse)
-async def upload_knowledge_document(knowledge_base_id: str, file: UploadFile = File(...)) -> KnowledgeUploadResponse:
-    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
-    normalized_id = kb_info["knowledge_base_id"]
-    collection_name = kb_info["collection_name"]
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="文件名不能为空")
-    file_bytes = await file.read()
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="文件内容不能为空")
-    extracted_text = _extract_text_from_upload(file.filename, file_bytes)
-    if not extracted_text:
-        raise HTTPException(status_code=400, detail="文档中未提取到可用文本")
-    logger.info(
-        "knowledge_upload_parse_success kb=%s filename=%s content_chars=%s preview=%s",
-        normalized_id,
-        str(file.filename),
-        len(extracted_text),
-        _build_text_preview(extracted_text, 260),
+async def upload_knowledge_document(
+    request: Request,
+    knowledge_base_id: str,
+    file: UploadFile = File(...),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeUploadResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path=f"/api/knowledge/bases/{knowledge_base_id}/upload",
     )
-    store = _get_knowledge_store()
-    store.switch_collection(collection_name, create_if_missing=False)
-    source_type = _detect_source_type_by_filename(file.filename)
-    source_metadata = _build_source_metadata(
-        knowledge_base_id=normalized_id,
-        source_url="",
-        source_type=source_type,
-        source_platform="unknown",
-        ingest_mode="auto",
-        ingest_status="parsed",
-    )
-    parsed_preview_text = _build_text_preview(extracted_text, 3000)
-    parsed_chars = len(extracted_text)
-    added_chunks = store.add_documents(
-        [
-            {
-                "content": extracted_text,
-                "metadata": {
-                    "source": str(file.filename),
-                    **source_metadata,
-                    "parsed_content_preview": parsed_preview_text,
-                    "parsed_content_chars": parsed_chars,
-                    "file_type": str(file.content_type or ""),
-                },
-            }
-        ]
-    )
-    if added_chunks <= 0:
-        raise HTTPException(status_code=500, detail="文档入库失败")
-    logger.info(
-        "knowledge_upload_store_success kb=%s filename=%s source_id=%s chunks=%s",
-        normalized_id,
-        str(file.filename),
-        str(source_metadata.get("source_id") or ""),
-        added_chunks,
-    )
-    return KnowledgeUploadResponse(
-        knowledge_base_id=normalized_id,
-        filename=str(file.filename),
-        chunks=added_chunks,
-        metadata=source_metadata,
-        parsed_content_preview=parsed_preview_text,
-        parsed_content_chars=parsed_chars,
-    )
+    try:
+        kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+        normalized_id = kb_info["knowledge_base_id"]
+        collection_name = kb_info["collection_name"]
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="文件名不能为空")
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="文件内容不能为空")
+        extracted_text = _extract_text_from_upload(file.filename, file_bytes)
+        if not extracted_text:
+            raise HTTPException(status_code=400, detail="文档中未提取到可用文本")
+        logger.info(
+            "knowledge_upload_parse_success kb=%s filename=%s content_chars=%s preview=%s",
+            normalized_id,
+            str(file.filename),
+            len(extracted_text),
+            _build_text_preview(extracted_text, 260),
+        )
+        store = _get_knowledge_store()
+        store.switch_collection(collection_name, create_if_missing=False)
+        source_type = _detect_source_type_by_filename(file.filename)
+        source_metadata = _build_source_metadata(
+            knowledge_base_id=normalized_id,
+            source_url="",
+            source_type=source_type,
+            source_platform="unknown",
+            ingest_mode="auto",
+            ingest_status="parsed",
+        )
+        parsed_preview_text = _build_text_preview(extracted_text, 3000)
+        parsed_chars = len(extracted_text)
+        added_chunks = store.add_documents(
+            [
+                {
+                    "content": extracted_text,
+                    "metadata": {
+                        "source": str(file.filename),
+                        **source_metadata,
+                        "parsed_content_preview": parsed_preview_text,
+                        "parsed_content_chars": parsed_chars,
+                        "file_type": str(file.content_type or ""),
+                    },
+                }
+            ]
+        )
+        if added_chunks <= 0:
+            raise HTTPException(status_code=500, detail="文档入库失败")
+        logger.info(
+            "knowledge_upload_store_success kb=%s filename=%s source_id=%s chunks=%s",
+            normalized_id,
+            str(file.filename),
+            str(source_metadata.get("source_id") or ""),
+            added_chunks,
+        )
+        _record_audit_log(
+            action="knowledge_upload",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"knowledge_base_id": normalized_id, "filename": str(file.filename), "chunks": added_chunks},
+        )
+        return KnowledgeUploadResponse(
+            knowledge_base_id=normalized_id,
+            filename=str(file.filename),
+            chunks=added_chunks,
+            metadata=source_metadata,
+            parsed_content_preview=parsed_preview_text,
+            parsed_content_chars=parsed_chars,
+        )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.post("/api/knowledge/preprocess/url", response_model=KnowledgePreprocessUrlResponse)
-def preprocess_knowledge_url(payload: KnowledgePreprocessUrlRequest) -> KnowledgePreprocessUrlResponse:
-    url = str(payload.url or "").strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="url 不能为空")
-    parsed_url = urlparse(url)
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-        raise HTTPException(status_code=400, detail="url 必须是可公开访问的 http/https 链接")
-    # preprocess 只做“预判”，不会真正入库。
-    # 它承担的是前端即时反馈：平台识别、短链解跳、风险等级、自动解析成功概率等。
-    preprocess_payload = preprocess_url(url, timeout=5)
-    resolved_url = str(preprocess_payload.get("resolved_url") or "")
-    source_platform = str(preprocess_payload.get("source_platform") or "unknown")
-    source_risk_level = str(preprocess_payload.get("source_risk_level") or "low")
-    resolve_error_code = str(preprocess_payload.get("resolve_error_code") or "").strip() or None
-    auto_parse_preview = _run_url_auto_parse_preview(
-        resolved_url=resolved_url or str(preprocess_payload.get("normalized_url") or ""),
-        source_platform=source_platform,
-        source_risk_level=source_risk_level,
-        resolve_error_code=resolve_error_code,
+def preprocess_knowledge_url(
+    request: Request,
+    payload: KnowledgePreprocessUrlRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgePreprocessUrlResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path="/api/knowledge/preprocess/url",
     )
-    return KnowledgePreprocessUrlResponse(
-        success=True,
-        normalized_url=str(preprocess_payload.get("normalized_url") or ""),
-        resolved_url=resolved_url,
-        source_platform=source_platform,
-        source_risk_level=source_risk_level,
-        resolve_error_code=resolve_error_code,
-        extractor_layer=auto_parse_preview.get("extractor_layer"),
-        quality_score=auto_parse_preview.get("quality_score"),
-        ingest_error_code=auto_parse_preview.get("ingest_error_code"),
-        failure_reason=auto_parse_preview.get("failure_reason"),
-        content_lang=auto_parse_preview.get("content_lang"),
-        requires_user_assist=bool(auto_parse_preview.get("requires_user_assist")),
-        parsed_content_preview=str(auto_parse_preview.get("parsed_content_preview") or ""),
-        parsed_content_chars=int(auto_parse_preview.get("parsed_content_chars") or 0),
-    )
+    try:
+        url = str(payload.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="url 不能为空")
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            raise HTTPException(status_code=400, detail="url 必须是可公开访问的 http/https 链接")
+        # preprocess 只做“预判”，不会真正入库。
+        # 它承担的是前端即时反馈：平台识别、短链解跳、风险等级、自动解析成功概率等。
+        preprocess_payload = preprocess_url(url, timeout=5)
+        resolved_url = str(preprocess_payload.get("resolved_url") or "")
+        source_platform = str(preprocess_payload.get("source_platform") or "unknown")
+        source_risk_level = str(preprocess_payload.get("source_risk_level") or "low")
+        resolve_error_code = str(preprocess_payload.get("resolve_error_code") or "").strip() or None
+        auto_parse_preview = _run_url_auto_parse_preview(
+            resolved_url=resolved_url or str(preprocess_payload.get("normalized_url") or ""),
+            source_platform=source_platform,
+            source_risk_level=source_risk_level,
+            resolve_error_code=resolve_error_code,
+        )
+        _record_audit_log(
+            action="knowledge_preprocess_url",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"url": url, "resolved_url": resolved_url, "risk_level": source_risk_level},
+        )
+        return KnowledgePreprocessUrlResponse(
+            success=True,
+            normalized_url=str(preprocess_payload.get("normalized_url") or ""),
+            resolved_url=resolved_url,
+            source_platform=source_platform,
+            source_risk_level=source_risk_level,
+            resolve_error_code=resolve_error_code,
+            extractor_layer=auto_parse_preview.get("extractor_layer"),
+            quality_score=auto_parse_preview.get("quality_score"),
+            ingest_error_code=auto_parse_preview.get("ingest_error_code"),
+            failure_reason=auto_parse_preview.get("failure_reason"),
+            content_lang=auto_parse_preview.get("content_lang"),
+            requires_user_assist=bool(auto_parse_preview.get("requires_user_assist")),
+            parsed_content_preview=str(auto_parse_preview.get("parsed_content_preview") or ""),
+            parsed_content_chars=int(auto_parse_preview.get("parsed_content_chars") or 0),
+        )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.post("/api/knowledge/bases/{knowledge_base_id}/ingest/url", response_model=KnowledgeIngestUrlResponse)
-def ingest_knowledge_url(knowledge_base_id: str, payload: KnowledgeIngestUrlRequest) -> KnowledgeIngestUrlResponse:
-    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
-    normalized_id = kb_info["knowledge_base_id"]
-    collection_name = kb_info["collection_name"]
-    url = str(payload.url or "").strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="url 不能为空")
-    parsed_url = urlparse(url)
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-        raise HTTPException(status_code=400, detail="url 必须是可公开访问的 http/https 链接")
-    mode = str(payload.mode or "auto").strip().lower()
-    if mode not in {"auto", "manual"}:
-        raise HTTPException(status_code=400, detail="mode 仅支持 auto/manual")
-    manual_text = str(payload.manual_text or "").strip()
-    ocr_text = str(payload.ocr_text or "").strip()
-    if mode == "manual" and not manual_text and not ocr_text:
-        raise HTTPException(status_code=400, detail="manual 模式下需提供 manual_text 或 ocr_text")
-    # 先做 URL 规范化与解跳，后续去重、平台判断、落库 metadata 都基于这组标准字段，
-    # 避免同一条内容因为短链/追踪参数不同被重复导入。
-    preprocess_payload = preprocess_url(url, timeout=5)
-    normalized_url = str(preprocess_payload.get("normalized_url") or url)
-    resolved_url = str(preprocess_payload.get("resolved_url") or normalized_url)
-    platform = str(preprocess_payload.get("source_platform") or _infer_source_platform(resolved_url))
-    source_risk_level = str(preprocess_payload.get("source_risk_level") or "low")
-    resolve_error_code = str(preprocess_payload.get("resolve_error_code") or "").strip() or None
-    store = _get_knowledge_store()
-    store.switch_collection(collection_name, create_if_missing=False)
-    ingest_status = "failed"
-    ingest_error_code = resolve_error_code or "INGEST_EMPTY_CONTENT"
-    source_type = "url"
-    content_text = ""
-    extractor_layer: Optional[str] = None
-    quality_score: Optional[int] = None
-    source_metadata: Dict[str, Any] = {}
-    auto_parse_preview: Dict[str, Any] = {}
-    if _exists_source_url(collection_name, resolved_url):
-        # 即使是重复来源，也写一条失败来源记录。
-        # 这样前端可以给用户明确反馈“这条链接已导入过”，同时保留失败原因与来源追踪。
+def ingest_knowledge_url(
+    request: Request,
+    knowledge_base_id: str,
+    payload: KnowledgeIngestUrlRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeIngestUrlResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path=f"/api/knowledge/bases/{knowledge_base_id}/ingest/url",
+    )
+    try:
+        kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+        normalized_id = kb_info["knowledge_base_id"]
+        collection_name = kb_info["collection_name"]
+        url = str(payload.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="url 不能为空")
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            raise HTTPException(status_code=400, detail="url 必须是可公开访问的 http/https 链接")
+        mode = str(payload.mode or "auto").strip().lower()
+        if mode not in {"auto", "manual"}:
+            raise HTTPException(status_code=400, detail="mode 仅支持 auto/manual")
+        manual_text = str(payload.manual_text or "").strip()
+        ocr_text = str(payload.ocr_text or "").strip()
+        if mode == "manual" and not manual_text and not ocr_text:
+            raise HTTPException(status_code=400, detail="manual 模式下需提供 manual_text 或 ocr_text")
+        # 先做 URL 规范化与解跳，后续去重、平台判断、落库 metadata 都基于这组标准字段，
+        # 避免同一条内容因为短链/追踪参数不同被重复导入。
+        preprocess_payload = preprocess_url(url, timeout=5)
+        normalized_url = str(preprocess_payload.get("normalized_url") or url)
+        resolved_url = str(preprocess_payload.get("resolved_url") or normalized_url)
+        platform = str(preprocess_payload.get("source_platform") or _infer_source_platform(resolved_url))
+        source_risk_level = str(preprocess_payload.get("source_risk_level") or "low")
+        resolve_error_code = str(preprocess_payload.get("resolve_error_code") or "").strip() or None
+        store = _get_knowledge_store()
+        store.switch_collection(collection_name, create_if_missing=False)
+        ingest_status = "failed"
+        ingest_error_code = resolve_error_code or "INGEST_EMPTY_CONTENT"
+        source_type = "url"
+        content_text = ""
+        extractor_layer: Optional[str] = None
+        quality_score: Optional[int] = None
+        source_metadata: Dict[str, Any] = {}
+        auto_parse_preview: Dict[str, Any] = {}
+        if _exists_source_url(collection_name, resolved_url):
+            # 即使是重复来源，也写一条失败来源记录。
+            # 这样前端可以给用户明确反馈“这条链接已导入过”，同时保留失败原因与来源追踪。
+            source_metadata = _build_source_metadata(
+                knowledge_base_id=normalized_id,
+                source_url=url,
+                source_type=source_type,
+                source_platform=platform,
+                ingest_mode=mode,
+                ingest_status="failed",
+                ingest_error_code="AUTO_PARSE_DUPLICATED",
+                normalized_url=normalized_url,
+                resolved_url=resolved_url,
+                source_risk_level=source_risk_level,
+                extractor_layer=extractor_layer,
+                quality_score=quality_score,
+            )
+            _upsert_failed_source_entry(source_metadata, parsed_preview_text="", parsed_chars=0)
+            response = KnowledgeIngestUrlResponse(
+                success=False,
+                ingest_status="failed",
+                chunks_count=0,
+                metadata=source_metadata,
+                parsed_content_preview="",
+                parsed_content_chars=0,
+            )
+            _record_audit_log(
+                action="knowledge_ingest_url",
+                status="failed_duplicate",
+                user_id=current_user.user_id,
+                user_email=current_user.email,
+                detail={"knowledge_base_id": normalized_id, "url": url, "mode": mode},
+            )
+            return response
+        if mode == "manual":
+            # manual 模式本质上是“跳过自动解析，直接走用户提供的正文/OCR 文本入库”，
+            # 所以状态记为 fallback，用来和真正自动解析成功的 parsed 区分。
+            content_text = manual_text or ocr_text
+            source_type = "manual" if manual_text else "ocr"
+            ingest_status = "fallback"
+            ingest_error_code = None
+            extractor_layer = "manual" if manual_text else "ocr"
+            manual_quality = validate_content_quality(content_text, {"source_platform": platform})
+            quality_score = int(manual_quality.get("quality_score") or 0)
+        else:
+            # auto 模式先走统一的预解析+质量门禁，再决定 parsed / failed / fallback。
+            # 这里的 fallback 表示“自动解析失败，但用户同时补了手动文本，所以仍然允许导入”。
+            auto_parse_preview = _run_url_auto_parse_preview(
+                resolved_url=resolved_url,
+                source_platform=platform,
+                source_risk_level=source_risk_level,
+                resolve_error_code=resolve_error_code,
+            )
+            content_text = str(auto_parse_preview.get("content_text") or "")
+            extractor_layer = str(auto_parse_preview.get("extractor_layer") or "").strip() or None
+            quality_score = auto_parse_preview.get("quality_score")
+            if bool(auto_parse_preview.get("is_valid")):
+                ingest_status = "parsed"
+                ingest_error_code = None
+                logger.info(
+                    "knowledge_ingest_url_auto_parse kb=%s platform=%s url=%s content_chars=%s preview=%s layer=%s quality_score=%s",
+                    normalized_id,
+                    platform,
+                    resolved_url,
+                    len(content_text),
+                    _build_text_preview(content_text, 260),
+                    extractor_layer,
+                    quality_score,
+                )
+            else:
+                ingest_status = "failed"
+                ingest_error_code = str(auto_parse_preview.get("ingest_error_code") or ingest_error_code or "AUTO_PARSE_LOW_QUALITY")
+            if not content_text and (manual_text or ocr_text):
+                content_text = manual_text or ocr_text
+                source_type = "manual" if manual_text else "ocr"
+                ingest_status = "fallback"
+                ingest_error_code = ingest_error_code or "AUTO_PARSE_EMPTY_FALLBACK"
+                extractor_layer = "manual" if manual_text else "ocr"
+                manual_quality = validate_content_quality(content_text, {"source_platform": platform})
+                quality_score = int(manual_quality.get("quality_score") or 0)
+            elif ingest_status == "failed" and (manual_text or ocr_text):
+                content_text = manual_text or ocr_text
+                source_type = "manual" if manual_text else "ocr"
+                ingest_status = "fallback"
+                extractor_layer = "manual" if manual_text else "ocr"
+                manual_quality = validate_content_quality(content_text, {"source_platform": platform})
+                quality_score = int(manual_quality.get("quality_score") or 0)
+            elif not content_text:
+                ingest_status = "failed"
+                ingest_error_code = ingest_error_code or "AUTO_PARSE_EMPTY"
         source_metadata = _build_source_metadata(
             knowledge_base_id=normalized_id,
             source_url=url,
             source_type=source_type,
             source_platform=platform,
             ingest_mode=mode,
-            ingest_status="failed",
-            ingest_error_code="AUTO_PARSE_DUPLICATED",
+            ingest_status=ingest_status,
+            ingest_error_code=ingest_error_code,
             normalized_url=normalized_url,
             resolved_url=resolved_url,
             source_risk_level=source_risk_level,
             extractor_layer=extractor_layer,
             quality_score=quality_score,
         )
-        _upsert_failed_source_entry(source_metadata, parsed_preview_text="", parsed_chars=0)
-        return KnowledgeIngestUrlResponse(
-            success=False,
-            ingest_status="failed",
-            chunks_count=0,
-            metadata=source_metadata,
-            parsed_content_preview="",
-            parsed_content_chars=0,
-        )
-    if mode == "manual":
-        # manual 模式本质上是“跳过自动解析，直接走用户提供的正文/OCR 文本入库”，
-        # 所以状态记为 fallback，用来和真正自动解析成功的 parsed 区分。
-        content_text = manual_text or ocr_text
-        source_type = "manual" if manual_text else "ocr"
-        ingest_status = "fallback"
-        ingest_error_code = None
-        extractor_layer = "manual" if manual_text else "ocr"
-        manual_quality = validate_content_quality(content_text, {"source_platform": platform})
-        quality_score = int(manual_quality.get("quality_score") or 0)
-    else:
-        # auto 模式先走统一的预解析+质量门禁，再决定 parsed / failed / fallback。
-        # 这里的 fallback 表示“自动解析失败，但用户同时补了手动文本，所以仍然允许导入”。
-        auto_parse_preview = _run_url_auto_parse_preview(
-            resolved_url=resolved_url,
-            source_platform=platform,
-            source_risk_level=source_risk_level,
-            resolve_error_code=resolve_error_code,
-        )
-        content_text = str(auto_parse_preview.get("content_text") or "")
-        extractor_layer = str(auto_parse_preview.get("extractor_layer") or "").strip() or None
-        quality_score = auto_parse_preview.get("quality_score")
-        if bool(auto_parse_preview.get("is_valid")):
-            ingest_status = "parsed"
-            ingest_error_code = None
-            logger.info(
-                "knowledge_ingest_url_auto_parse kb=%s platform=%s url=%s content_chars=%s preview=%s layer=%s quality_score=%s",
+        if ingest_status == "failed":
+            source_metadata["failure_reason"] = str(
+                auto_parse_preview.get("failure_reason") if mode == "auto" else (ingest_error_code or "INGEST_FAILED")
+            )
+        if ingest_status == "failed":
+            logger.warning(
+                "knowledge_ingest_url_failed kb=%s platform=%s url=%s error_code=%s",
                 normalized_id,
                 platform,
-                resolved_url,
-                len(content_text),
-                _build_text_preview(content_text, 260),
-                extractor_layer,
-                quality_score,
+                url,
+                ingest_error_code,
             )
-        else:
-            ingest_status = "failed"
-            ingest_error_code = str(auto_parse_preview.get("ingest_error_code") or ingest_error_code or "AUTO_PARSE_LOW_QUALITY")
-        if not content_text and (manual_text or ocr_text):
-            content_text = manual_text or ocr_text
-            source_type = "manual" if manual_text else "ocr"
-            ingest_status = "fallback"
-            ingest_error_code = ingest_error_code or "AUTO_PARSE_EMPTY_FALLBACK"
-            extractor_layer = "manual" if manual_text else "ocr"
-            manual_quality = validate_content_quality(content_text, {"source_platform": platform})
-            quality_score = int(manual_quality.get("quality_score") or 0)
-        elif ingest_status == "failed" and (manual_text or ocr_text):
-            content_text = manual_text or ocr_text
-            source_type = "manual" if manual_text else "ocr"
-            ingest_status = "fallback"
-            extractor_layer = "manual" if manual_text else "ocr"
-            manual_quality = validate_content_quality(content_text, {"source_platform": platform})
-            quality_score = int(manual_quality.get("quality_score") or 0)
-        elif not content_text:
-            ingest_status = "failed"
-            ingest_error_code = ingest_error_code or "AUTO_PARSE_EMPTY"
-    source_metadata = _build_source_metadata(
-        knowledge_base_id=normalized_id,
-        source_url=url,
-        source_type=source_type,
-        source_platform=platform,
-        ingest_mode=mode,
-        ingest_status=ingest_status,
-        ingest_error_code=ingest_error_code,
-        normalized_url=normalized_url,
-        resolved_url=resolved_url,
-        source_risk_level=source_risk_level,
-        extractor_layer=extractor_layer,
-        quality_score=quality_score,
-    )
-    if ingest_status == "failed":
-        source_metadata["failure_reason"] = str(
-            auto_parse_preview.get("failure_reason") if mode == "auto" else (ingest_error_code or "INGEST_FAILED")
-        )
-    if ingest_status == "failed":
-        logger.warning(
-            "knowledge_ingest_url_failed kb=%s platform=%s url=%s error_code=%s",
+            failed_preview = _build_text_preview(content_text, 3000) if content_text else ""
+            # 失败时不写向量分块，但必须把失败来源写进 registry，
+            # 否则用户下一次进入页面会看不到这条失败记录，也就没法原位重试。
+            _upsert_failed_source_entry(source_metadata, parsed_preview_text=failed_preview, parsed_chars=len(content_text))
+            response = KnowledgeIngestUrlResponse(
+                success=False,
+                ingest_status="failed",
+                chunks_count=0,
+                metadata=source_metadata,
+                parsed_content_preview=failed_preview,
+                parsed_content_chars=len(content_text),
+            )
+            _record_audit_log(
+                action="knowledge_ingest_url",
+                status="failed",
+                user_id=current_user.user_id,
+                user_email=current_user.email,
+                detail={"knowledge_base_id": normalized_id, "url": url, "mode": mode, "ingest_status": ingest_status},
+            )
+            return response
+        parsed_preview_text = _build_text_preview(content_text, 3000)
+        parsed_chars = len(content_text)
+        logger.info(
+            "knowledge_ingest_url_content_ready kb=%s source_type=%s ingest_status=%s content_chars=%s preview=%s",
             normalized_id,
-            platform,
-            url,
-            ingest_error_code,
+            source_type,
+            ingest_status,
+            len(content_text),
+            _build_text_preview(content_text, 260),
         )
-        failed_preview = _build_text_preview(content_text, 3000) if content_text else ""
-        # 失败时不写向量分块，但必须把失败来源写进 registry，
-        # 否则用户下一次进入页面会看不到这条失败记录，也就没法原位重试。
-        _upsert_failed_source_entry(source_metadata, parsed_preview_text=failed_preview, parsed_chars=len(content_text))
-        return KnowledgeIngestUrlResponse(
-            success=False,
-            ingest_status="failed",
-            chunks_count=0,
-            metadata=source_metadata,
-            parsed_content_preview=failed_preview,
-            parsed_content_chars=len(content_text),
+        # 当前仍按“单条长文本交给向量库内部切分”的方式入库。
+        # source_id / ingest_status / parsed_preview 等 metadata 会复制到所有分块上，供后续聚合与调试使用。
+        added_chunks = store.add_documents(
+            [
+                {
+                    "content": content_text,
+                    "metadata": {
+                        "source": url,
+                        **source_metadata,
+                        "parsed_content_preview": parsed_preview_text,
+                        "parsed_content_chars": parsed_chars,
+                    },
+                }
+            ]
         )
-    parsed_preview_text = _build_text_preview(content_text, 3000)
-    parsed_chars = len(content_text)
-    logger.info(
-        "knowledge_ingest_url_content_ready kb=%s source_type=%s ingest_status=%s content_chars=%s preview=%s",
-        normalized_id,
-        source_type,
-        ingest_status,
-        len(content_text),
-        _build_text_preview(content_text, 260),
-    )
-    # 当前仍按“单条长文本交给向量库内部切分”的方式入库。
-    # source_id / ingest_status / parsed_preview 等 metadata 会复制到所有分块上，供后续聚合与调试使用。
-    added_chunks = store.add_documents(
-        [
-            {
-                "content": content_text,
-                "metadata": {
-                    "source": url,
-                    **source_metadata,
-                    "parsed_content_preview": parsed_preview_text,
-                    "parsed_content_chars": parsed_chars,
-                },
-            }
-        ]
-    )
-    if added_chunks <= 0:
-        failed_metadata = dict(source_metadata)
-        failed_metadata["ingest_status"] = "failed"
-        failed_metadata["ingest_error_code"] = "VECTOR_STORE_INSERT_FAILED"
-        _upsert_failed_source_entry(failed_metadata, parsed_preview_text=parsed_preview_text, parsed_chars=parsed_chars)
-        logger.error(
-            "knowledge_ingest_url_store_failed kb=%s source_id=%s url=%s",
+        if added_chunks <= 0:
+            failed_metadata = dict(source_metadata)
+            failed_metadata["ingest_status"] = "failed"
+            failed_metadata["ingest_error_code"] = "VECTOR_STORE_INSERT_FAILED"
+            _upsert_failed_source_entry(failed_metadata, parsed_preview_text=parsed_preview_text, parsed_chars=parsed_chars)
+            logger.error(
+                "knowledge_ingest_url_store_failed kb=%s source_id=%s url=%s",
+                normalized_id,
+                str(source_metadata.get("source_id") or ""),
+                url,
+            )
+            response = KnowledgeIngestUrlResponse(
+                success=False,
+                ingest_status="failed",
+                chunks_count=0,
+                metadata=failed_metadata,
+                parsed_content_preview=parsed_preview_text,
+                parsed_content_chars=parsed_chars,
+            )
+            _record_audit_log(
+                action="knowledge_ingest_url",
+                status="failed_store",
+                user_id=current_user.user_id,
+                user_email=current_user.email,
+                detail={"knowledge_base_id": normalized_id, "url": url, "mode": mode},
+            )
+            return response
+        # 成功入库后要把同 source_id 的失败记录清掉，避免来源列表同时出现“失败记录 + 成功记录”。
+        _delete_failed_source_entry(normalized_id, str(source_metadata.get("source_id") or ""))
+        logger.info(
+            "knowledge_ingest_url_store_success kb=%s source_id=%s ingest_status=%s chunks=%s",
             normalized_id,
             str(source_metadata.get("source_id") or ""),
-            url,
+            ingest_status,
+            added_chunks,
+        )
+        _record_audit_log(
+            action="knowledge_ingest_url",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"knowledge_base_id": normalized_id, "url": url, "mode": mode, "chunks": added_chunks},
         )
         return KnowledgeIngestUrlResponse(
-            success=False,
-            ingest_status="failed",
-            chunks_count=0,
-            metadata=failed_metadata,
+            success=True,
+            ingest_status=ingest_status,
+            chunks_count=added_chunks,
+            metadata=source_metadata,
             parsed_content_preview=parsed_preview_text,
             parsed_content_chars=parsed_chars,
         )
-    # 成功入库后要把同 source_id 的失败记录清掉，避免来源列表同时出现“失败记录 + 成功记录”。
-    _delete_failed_source_entry(normalized_id, str(source_metadata.get("source_id") or ""))
-    logger.info(
-        "knowledge_ingest_url_store_success kb=%s source_id=%s ingest_status=%s chunks=%s",
-        normalized_id,
-        str(source_metadata.get("source_id") or ""),
-        ingest_status,
-        added_chunks,
-    )
-    return KnowledgeIngestUrlResponse(
-        success=True,
-        ingest_status=ingest_status,
-        chunks_count=added_chunks,
-        metadata=source_metadata,
-        parsed_content_preview=parsed_preview_text,
-        parsed_content_chars=parsed_chars,
-    )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.get("/api/knowledge/bases/{knowledge_base_id}/sources", response_model=KnowledgeSourceListResponse)
-def list_knowledge_sources(knowledge_base_id: str) -> KnowledgeSourceListResponse:
-    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
-    normalized_id = kb_info["knowledge_base_id"]
-    collection_name = kb_info["collection_name"]
-    store = _get_knowledge_store()
-    all_collections = set(store.list_collections())
-    collection_exists = collection_name in all_collections
-    raw_doc_count = 0
-    if collection_exists:
-        try:
-            store.switch_collection(collection_name, create_if_missing=False)
-            raw_payload = store.vector_db.get(include=["ids"])
-            raw_ids = raw_payload.get("ids") if isinstance(raw_payload, dict) else []
-            raw_doc_count = len(raw_ids) if isinstance(raw_ids, list) else 0
-        except Exception as exc:
-            logger.error(
-                "knowledge_sources_raw_count_failed kb=%s collection=%s error=%s",
-                normalized_id,
-                collection_name,
-                str(exc),
-            )
-    # sources 接口要返回“用户视角的来源列表”，而不是底层向量分块明细：
-    # 已成功入库的来源来自 collection，失败待修复的来源来自 registry，这里统一聚合后再返回。
-    source_entries = _load_collection_source_entries(collection_name, normalized_id)
-    social_entries = [
-        item
-        for item in source_entries
-        if str(item.get("source_url") or "").strip()
-        or str(item.get("source_type") or "").strip().lower() in {"url", "manual", "ocr"}
-    ]
-    items = [KnowledgeSourceItem(**{key: value for key, value in item.items() if key != "chunk_ids"}) for item in source_entries]
-    status_counter = {"parsed": 0, "fallback": 0, "failed": 0}
-    for item in source_entries:
-        status_value = str(item.get("ingest_status") or "parsed")
-        if status_value in status_counter:
-            status_counter[status_value] += 1
-    logger.info(
-        "knowledge_sources_list kb=%s collection=%s exists=%s raw_docs=%s total=%s social=%s first_source_id=%s first_source_url=%s",
-        normalized_id,
-        collection_name,
-        collection_exists,
-        raw_doc_count,
-        len(source_entries),
-        len(social_entries),
-        str(source_entries[0].get("source_id") or "") if source_entries else "",
-        str(source_entries[0].get("source_url") or "") if source_entries else "",
+def list_knowledge_sources(
+    request: Request,
+    knowledge_base_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeSourceListResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path=f"/api/knowledge/bases/{knowledge_base_id}/sources",
     )
-    stats = KnowledgeSourceStats(
-        total=len(source_entries),
-        parsed=status_counter["parsed"],
-        fallback=status_counter["fallback"],
-        failed=status_counter["failed"],
-    )
-    return KnowledgeSourceListResponse(knowledge_base_id=normalized_id, items=items, stats=stats)
+    try:
+        kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+        normalized_id = kb_info["knowledge_base_id"]
+        collection_name = kb_info["collection_name"]
+        store = _get_knowledge_store()
+        all_collections = set(store.list_collections())
+        collection_exists = collection_name in all_collections
+        raw_doc_count = 0
+        if collection_exists:
+            try:
+                store.switch_collection(collection_name, create_if_missing=False)
+                raw_payload = store.vector_db.get(include=["ids"])
+                raw_ids = raw_payload.get("ids") if isinstance(raw_payload, dict) else []
+                raw_doc_count = len(raw_ids) if isinstance(raw_ids, list) else 0
+            except Exception as exc:
+                logger.error(
+                    "knowledge_sources_raw_count_failed kb=%s collection=%s error=%s",
+                    normalized_id,
+                    collection_name,
+                    str(exc),
+                )
+        # sources 接口要返回“用户视角的来源列表”，而不是底层向量分块明细：
+        # 已成功入库的来源来自 collection，失败待修复的来源来自 registry，这里统一聚合后再返回。
+        source_entries = _load_collection_source_entries(collection_name, normalized_id)
+        social_entries = [
+            item
+            for item in source_entries
+            if str(item.get("source_url") or "").strip()
+            or str(item.get("source_type") or "").strip().lower() in {"url", "manual", "ocr"}
+        ]
+        items = [KnowledgeSourceItem(**{key: value for key, value in item.items() if key != "chunk_ids"}) for item in source_entries]
+        status_counter = {"parsed": 0, "fallback": 0, "failed": 0}
+        for item in source_entries:
+            status_value = str(item.get("ingest_status") or "parsed")
+            if status_value in status_counter:
+                status_counter[status_value] += 1
+        logger.info(
+            "knowledge_sources_list kb=%s collection=%s exists=%s raw_docs=%s total=%s social=%s first_source_id=%s first_source_url=%s",
+            normalized_id,
+            collection_name,
+            collection_exists,
+            raw_doc_count,
+            len(source_entries),
+            len(social_entries),
+            str(source_entries[0].get("source_id") or "") if source_entries else "",
+            str(source_entries[0].get("source_url") or "") if source_entries else "",
+        )
+        _record_audit_log(
+            action="knowledge_sources_list",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"knowledge_base_id": normalized_id, "source_count": len(items)},
+        )
+        stats = KnowledgeSourceStats(
+            total=len(source_entries),
+            parsed=status_counter["parsed"],
+            fallback=status_counter["fallback"],
+            failed=status_counter["failed"],
+        )
+        return KnowledgeSourceListResponse(knowledge_base_id=normalized_id, items=items, stats=stats)
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.get("/api/knowledge/debug/snapshot", response_model=KnowledgeDebugSnapshotResponse)
-def knowledge_debug_snapshot() -> KnowledgeDebugSnapshotResponse:
+def knowledge_debug_snapshot(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeDebugSnapshotResponse:
     """输出全部知识库与分块调试快照，便于核验导入解析结果。"""
     records = _load_knowledge_base_registry()
     debug_items: List[KnowledgeDebugBaseItem] = []
@@ -4113,203 +5514,329 @@ def knowledge_debug_snapshot() -> KnowledgeDebugSnapshotResponse:
 
 
 @app.delete("/api/knowledge/bases/{knowledge_base_id}/sources/{source_id}", response_model=KnowledgeSourceDeleteResponse)
-def delete_knowledge_source(knowledge_base_id: str, source_id: str) -> KnowledgeSourceDeleteResponse:
-    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
-    normalized_id = kb_info["knowledge_base_id"]
-    collection_name = kb_info["collection_name"]
-    source_entries = _load_collection_source_entries(collection_name, normalized_id)
-    matched_entry = next((item for item in source_entries if str(item.get("source_id") or "") == str(source_id or "")), None)
-    if not matched_entry:
-        raise HTTPException(status_code=404, detail="来源不存在")
-    # 删除来源时既要删掉真正入库的 chunk，也要清理失败来源快照；
-    # 这样无论该来源当前处于 parsed/fallback/failed 哪个状态，都能完成“按来源撤回”。
-    chunk_ids = [str(item) for item in (matched_entry.get("chunk_ids") or []) if str(item).strip()]
-    if chunk_ids:
-        store = _get_knowledge_store()
-        store.switch_collection(collection_name, create_if_missing=False)
-        store.vector_db.delete(ids=chunk_ids)
-    _delete_failed_source_entry(normalized_id, str(source_id))
-    return KnowledgeSourceDeleteResponse(
-        knowledge_base_id=normalized_id,
-        source_id=str(source_id),
-        success=True,
-        deleted_chunks=len(chunk_ids),
+def delete_knowledge_source(
+    request: Request,
+    knowledge_base_id: str,
+    source_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeSourceDeleteResponse:
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path=f"/api/knowledge/bases/{knowledge_base_id}/sources/{source_id}",
     )
+    try:
+        kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+        normalized_id = kb_info["knowledge_base_id"]
+        collection_name = kb_info["collection_name"]
+        source_entries = _load_collection_source_entries(collection_name, normalized_id)
+        matched_entry = next((item for item in source_entries if str(item.get("source_id") or "") == str(source_id or "")), None)
+        if not matched_entry:
+            raise HTTPException(status_code=404, detail="来源不存在")
+        # 删除来源时既要删掉真正入库的 chunk，也要清理失败来源快照；
+        # 这样无论该来源当前处于 parsed/fallback/failed 哪个状态，都能完成“按来源撤回”。
+        chunk_ids = [str(item) for item in (matched_entry.get("chunk_ids") or []) if str(item).strip()]
+        if chunk_ids:
+            store = _get_knowledge_store()
+            store.switch_collection(collection_name, create_if_missing=False)
+            store.vector_db.delete(ids=chunk_ids)
+        _delete_failed_source_entry(normalized_id, str(source_id))
+        _record_audit_log(
+            action="knowledge_source_delete",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"knowledge_base_id": normalized_id, "source_id": str(source_id), "deleted_chunks": len(chunk_ids)},
+        )
+        return KnowledgeSourceDeleteResponse(
+            knowledge_base_id=normalized_id,
+            source_id=str(source_id),
+            success=True,
+            deleted_chunks=len(chunk_ids),
+        )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.patch("/api/knowledge/bases/{knowledge_base_id}/sources/{source_id}", response_model=KnowledgeSourceUpdateResponse)
-def update_knowledge_source(knowledge_base_id: str, source_id: str, payload: KnowledgeSourceUpdateRequest) -> KnowledgeSourceUpdateResponse:
+def update_knowledge_source(
+    request: Request,
+    knowledge_base_id: str,
+    source_id: str,
+    payload: KnowledgeSourceUpdateRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeSourceUpdateResponse:
     """更新指定来源内容并重建该来源分块，确保修改后内容可被私有检索命中。"""
-    kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
-    normalized_id = kb_info["knowledge_base_id"]
-    collection_name = kb_info["collection_name"]
-    normalized_source_id = str(source_id or "").strip()
-    if not normalized_source_id:
-        raise HTTPException(status_code=400, detail="source_id 不能为空")
-    updated_content = str(payload.content or "").strip()
-    updated_ocr_text = str(payload.ocr_text or "").strip()
-    # 重试入口允许“正文 + OCR/字幕补充”拼接后一起入库，
-    # 这样用户可以在不覆盖原手工整理文本的情况下补充识别结果。
-    if updated_ocr_text:
-        updated_content = "\n".join([item for item in [updated_content, updated_ocr_text] if item]).strip()
-    if not updated_content:
-        raise HTTPException(status_code=400, detail="content 不能为空")
-    # 这里既服务“普通正文修改”，也服务“失败来源补全文本重试”。
-    # 两种场景都要求保留原 source_id，避免来源列表与命中引用断裂。
-    source_entries = _load_collection_source_entries(collection_name, normalized_id)
-    matched_entry = next((item for item in source_entries if str(item.get("source_id") or "") == normalized_source_id), None)
-    if not matched_entry:
-        raise HTTPException(status_code=404, detail="来源不存在")
-    logger.info(
-        "knowledge_source_update_start kb=%s source_id=%s old_chunks=%s old_source_url=%s",
-        normalized_id,
-        normalized_source_id,
-        len(matched_entry.get("chunk_ids") or []),
-        str(matched_entry.get("source_url") or ""),
+    guard_token = _apply_authenticated_audit_context(
+        request=request,
+        current_user=current_user,
+        request_path=f"/api/knowledge/bases/{knowledge_base_id}/sources/{source_id}",
     )
-    store = _get_knowledge_store()
-    store.switch_collection(collection_name, create_if_missing=False)
-    chunk_ids = [str(item) for item in (matched_entry.get("chunk_ids") or []) if str(item).strip()]
-    if chunk_ids:
-        store.vector_db.delete(ids=chunk_ids)
-    # 复用原来源标识并替换正文，保证前端列表与检索引用稳定。
-    retry_count = int(matched_entry.get("retry_count") or 0) + 1
-    last_retry_at = datetime.now().isoformat()
-    source_type = str(matched_entry.get("source_type") or "manual")
-    if updated_ocr_text and not str(payload.content or "").strip():
-        source_type = "ocr"
-    quality_payload = validate_content_quality(updated_content, {"source_platform": str(matched_entry.get("source_platform") or "unknown")})
-    source_metadata = _build_source_metadata(
-        knowledge_base_id=normalized_id,
-        source_url=str(payload.source_url or matched_entry.get("source_url") or "").strip(),
-        source_type=source_type,
-        source_platform=str(matched_entry.get("source_platform") or "unknown"),
-        ingest_mode="manual",
-        ingest_status="fallback",
-        source_id=normalized_source_id,
-        author=matched_entry.get("author"),
-        expires_at=matched_entry.get("expires_at"),
-        normalized_url=matched_entry.get("normalized_url"),
-        resolved_url=matched_entry.get("resolved_url"),
-        source_risk_level=matched_entry.get("source_risk_level"),
-        extractor_layer="ocr" if source_type == "ocr" else "manual",
-        quality_score=int(quality_payload.get("quality_score") or 0),
-    )
-    # retry_count / last_retry_at 只在“原位修复失败来源”时增长，
-    # 便于后续从调试快照中看出这条来源经历过多少次人工补救。
-    source_metadata["retry_count"] = retry_count
-    source_metadata["last_retry_at"] = last_retry_at
-    source_metadata["failure_reason"] = None
-    parsed_preview_text = _build_text_preview(updated_content, 3000)
-    parsed_chars = len(updated_content)
-    added_chunks = store.add_documents(
-        [
-            {
-                "content": updated_content,
-                "metadata": {
-                    "source": str(payload.source_url or matched_entry.get("source_url") or ""),
-                    **source_metadata,
-                    "parsed_content_preview": parsed_preview_text,
-                    "parsed_content_chars": parsed_chars,
-                },
-            }
-        ]
-    )
-    if added_chunks <= 0:
-        raise HTTPException(status_code=500, detail="来源更新失败")
-    _delete_failed_source_entry(normalized_id, normalized_source_id)
-    logger.info(
-        "knowledge_source_update_done kb=%s source_id=%s new_chunks=%s content_chars=%s",
-        normalized_id,
-        normalized_source_id,
-        added_chunks,
-        parsed_chars,
-    )
-    return KnowledgeSourceUpdateResponse(
-        knowledge_base_id=normalized_id,
-        source_id=normalized_source_id,
-        success=True,
-        chunks_count=added_chunks,
-        metadata=source_metadata,
-        parsed_content_preview=parsed_preview_text,
-        parsed_content_chars=parsed_chars,
-    )
+    try:
+        kb_info = _resolve_knowledge_base_collection(knowledge_base_id)
+        normalized_id = kb_info["knowledge_base_id"]
+        collection_name = kb_info["collection_name"]
+        normalized_source_id = str(source_id or "").strip()
+        if not normalized_source_id:
+            raise HTTPException(status_code=400, detail="source_id 不能为空")
+        updated_content = str(payload.content or "").strip()
+        updated_ocr_text = str(payload.ocr_text or "").strip()
+        # 重试入口允许“正文 + OCR/字幕补充”拼接后一起入库，
+        # 这样用户可以在不覆盖原手工整理文本的情况下补充识别结果。
+        if updated_ocr_text:
+            updated_content = "\n".join([item for item in [updated_content, updated_ocr_text] if item]).strip()
+        if not updated_content:
+            raise HTTPException(status_code=400, detail="content 不能为空")
+        # 这里既服务“普通正文修改”，也服务“失败来源补全文本重试”。
+        # 两种场景都要求保留原 source_id，避免来源列表与命中引用断裂。
+        source_entries = _load_collection_source_entries(collection_name, normalized_id)
+        matched_entry = next((item for item in source_entries if str(item.get("source_id") or "") == normalized_source_id), None)
+        if not matched_entry:
+            raise HTTPException(status_code=404, detail="来源不存在")
+        logger.info(
+            "knowledge_source_update_start kb=%s source_id=%s old_chunks=%s old_source_url=%s",
+            normalized_id,
+            normalized_source_id,
+            len(matched_entry.get("chunk_ids") or []),
+            str(matched_entry.get("source_url") or ""),
+        )
+        store = _get_knowledge_store()
+        store.switch_collection(collection_name, create_if_missing=False)
+        chunk_ids = [str(item) for item in (matched_entry.get("chunk_ids") or []) if str(item).strip()]
+        if chunk_ids:
+            store.vector_db.delete(ids=chunk_ids)
+        # 复用原来源标识并替换正文，保证前端列表与检索引用稳定。
+        retry_count = int(matched_entry.get("retry_count") or 0) + 1
+        last_retry_at = datetime.now().isoformat()
+        source_type = str(matched_entry.get("source_type") or "manual")
+        if updated_ocr_text and not str(payload.content or "").strip():
+            source_type = "ocr"
+        quality_payload = validate_content_quality(updated_content, {"source_platform": str(matched_entry.get("source_platform") or "unknown")})
+        source_metadata = _build_source_metadata(
+            knowledge_base_id=normalized_id,
+            source_url=str(payload.source_url or matched_entry.get("source_url") or "").strip(),
+            source_type=source_type,
+            source_platform=str(matched_entry.get("source_platform") or "unknown"),
+            ingest_mode="manual",
+            ingest_status="fallback",
+            source_id=normalized_source_id,
+            author=matched_entry.get("author"),
+            expires_at=matched_entry.get("expires_at"),
+            normalized_url=matched_entry.get("normalized_url"),
+            resolved_url=matched_entry.get("resolved_url"),
+            source_risk_level=matched_entry.get("source_risk_level"),
+            extractor_layer="ocr" if source_type == "ocr" else "manual",
+            quality_score=int(quality_payload.get("quality_score") or 0),
+        )
+        # retry_count / last_retry_at 只在“原位修复失败来源”时增长，
+        # 便于后续从调试快照中看出这条来源经历过多少次人工补救。
+        source_metadata["retry_count"] = retry_count
+        source_metadata["last_retry_at"] = last_retry_at
+        source_metadata["failure_reason"] = None
+        parsed_preview_text = _build_text_preview(updated_content, 3000)
+        parsed_chars = len(updated_content)
+        added_chunks = store.add_documents(
+            [
+                {
+                    "content": updated_content,
+                    "metadata": {
+                        "source": str(payload.source_url or matched_entry.get("source_url") or ""),
+                        **source_metadata,
+                        "parsed_content_preview": parsed_preview_text,
+                        "parsed_content_chars": parsed_chars,
+                    },
+                }
+            ]
+        )
+        if added_chunks <= 0:
+            raise HTTPException(status_code=500, detail="来源更新失败")
+        _delete_failed_source_entry(normalized_id, normalized_source_id)
+        logger.info(
+            "knowledge_source_update_done kb=%s source_id=%s new_chunks=%s content_chars=%s",
+            normalized_id,
+            normalized_source_id,
+            added_chunks,
+            parsed_chars,
+        )
+        _record_audit_log(
+            action="knowledge_source_update",
+            status="success",
+            user_id=current_user.user_id,
+            user_email=current_user.email,
+            detail={"knowledge_base_id": normalized_id, "source_id": normalized_source_id, "chunks": added_chunks},
+        )
+        return KnowledgeSourceUpdateResponse(
+            knowledge_base_id=normalized_id,
+            source_id=normalized_source_id,
+            success=True,
+            chunks_count=added_chunks,
+            metadata=source_metadata,
+            parsed_content_preview=parsed_preview_text,
+            parsed_content_chars=parsed_chars,
+        )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.post("/api/knowledge/search", response_model=KnowledgeSearchResponse)
-def knowledge_search(payload: KnowledgeSearchRequest) -> KnowledgeSearchResponse:
+def knowledge_search(
+    payload: KnowledgeSearchRequest,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeSearchResponse:
     """知识库检索接口"""
-    query = str(payload.query or "").strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="query 不能为空")
-    scope = _normalize_knowledge_scope(payload.knowledge_scope)
-    knowledge_base_id = str(payload.knowledge_base_id or "").strip()
-    if scope == "private_only" and not knowledge_base_id:
-        raise HTTPException(status_code=400, detail="private_only 模式下必须选择 knowledge_base_id")
-    allow_public_fusion = scope != "private_only"
-    source_evidence: List[Dict[str, Any]] = []
-    rag_pipeline = _get_rag_pipeline()
-    private_docs = _search_private_knowledge_docs(knowledge_base_id, query, k=14) if knowledge_base_id else []
-    if private_docs:
-        source_evidence = _build_source_evidence_from_docs(private_docs)
-    private_evidence = (
-        _build_private_knowledge_evidence(knowledge_base_id, query)
-        if knowledge_base_id
-        else _build_empty_evidence()
+    _assert_within_quota(current_user)
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path="/api/knowledge/search",
+        bucket="knowledge_search",
     )
-    if scope == "private_only":
-        evidence = private_evidence
-        answer = rag_pipeline.generate_answer_from_evidence(query, evidence) if payload.generate_answer else None
+    try:
+        query = str(payload.query or "").strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="query 不能为空")
+        scope = _normalize_knowledge_scope(payload.knowledge_scope)
+        knowledge_base_id = str(payload.knowledge_base_id or "").strip()
+        if scope == "private_only" and not knowledge_base_id:
+            raise HTTPException(status_code=400, detail="private_only 模式下必须选择 knowledge_base_id")
+        allow_public_fusion = scope != "private_only"
+        source_evidence: List[Dict[str, Any]] = []
+        rag_pipeline = _get_rag_pipeline()
+        private_docs = _search_private_knowledge_docs(knowledge_base_id, query, k=14) if knowledge_base_id else []
+        if private_docs:
+            source_evidence = _build_source_evidence_from_docs(private_docs)
+        private_evidence = (
+            _build_private_knowledge_evidence(knowledge_base_id, query)
+            if knowledge_base_id
+            else _build_empty_evidence()
+        )
+        if scope == "private_only":
+            evidence = private_evidence
+            answer = rag_pipeline.generate_answer_from_evidence(query, evidence) if payload.generate_answer else None
+            if answer:
+                evidence_text = json.dumps(evidence, ensure_ascii=False)
+                _record_token_usage(
+                    user_id=current_user.user_id,
+                    session_id="",
+                    request_path="/api/knowledge/search",
+                    message_id="",
+                    model_name=_get_config().ANALYSIS_MODEL_NAME,
+                    prompt_tokens=_estimate_tokens_text(query) + _estimate_tokens_text(evidence_text),
+                    completion_tokens=_estimate_tokens_text(answer),
+                    total_tokens=_estimate_tokens_text(query) + _estimate_tokens_text(evidence_text) + _estimate_tokens_text(answer),
+                    stage="knowledge_search_answer",
+                )
+            _record_audit_log(action="knowledge_search", status="success", user_id=current_user.user_id, user_email=current_user.email, detail={"scope": scope, "generate_answer": bool(payload.generate_answer)})
+            return KnowledgeSearchResponse(
+                query=query,
+                evidence=evidence,
+                answer=answer,
+                source_evidence=source_evidence,
+                knowledge_debug={
+                    "knowledge_scope": scope,
+                    "allow_public_fusion": allow_public_fusion,
+                    "kb_context_count": len((evidence.get("body") or {}).get("items") or []),
+                    "source_evidence_count": len(source_evidence),
+                },
+            )
+        if not knowledge_base_id:
+            result = rag_pipeline.run(query, generate_answer=payload.generate_answer)
+            evidence = result.get("evidence") or _build_empty_evidence()
+            answer = result.get("answer")
+            if answer:
+                evidence_text = json.dumps(evidence, ensure_ascii=False)
+                _record_token_usage(
+                    user_id=current_user.user_id,
+                    session_id="",
+                    request_path="/api/knowledge/search",
+                    message_id="",
+                    model_name=_get_config().ANALYSIS_MODEL_NAME,
+                    prompt_tokens=_estimate_tokens_text(query) + _estimate_tokens_text(evidence_text),
+                    completion_tokens=_estimate_tokens_text(answer),
+                    total_tokens=_estimate_tokens_text(query) + _estimate_tokens_text(evidence_text) + _estimate_tokens_text(answer),
+                    stage="knowledge_search_answer",
+                )
+            _record_audit_log(action="knowledge_search", status="success", user_id=current_user.user_id, user_email=current_user.email, detail={"scope": scope, "generate_answer": bool(payload.generate_answer)})
+            return KnowledgeSearchResponse(
+                query=query,
+                evidence=evidence,
+                answer=answer,
+                source_evidence=[],
+                knowledge_debug={
+                    "knowledge_scope": scope,
+                    "allow_public_fusion": allow_public_fusion,
+                    "kb_context_count": 0,
+                    "source_evidence_count": 0,
+                },
+            )
+        public_result = rag_pipeline.run(query, generate_answer=False)
+        public_evidence = public_result.get("evidence") or _build_empty_evidence()
+        merged_evidence = _merge_knowledge_evidence(private_evidence, public_evidence)
+        answer = rag_pipeline.generate_answer_from_evidence(query, merged_evidence) if payload.generate_answer else None
+        if answer:
+            merged_text = json.dumps(merged_evidence, ensure_ascii=False)
+            _record_token_usage(
+                user_id=current_user.user_id,
+                session_id="",
+                request_path="/api/knowledge/search",
+                message_id="",
+                model_name=_get_config().ANALYSIS_MODEL_NAME,
+                prompt_tokens=_estimate_tokens_text(query) + _estimate_tokens_text(merged_text),
+                completion_tokens=_estimate_tokens_text(answer),
+                total_tokens=_estimate_tokens_text(query) + _estimate_tokens_text(merged_text) + _estimate_tokens_text(answer),
+                stage="knowledge_search_answer",
+            )
+        _record_audit_log(action="knowledge_search", status="success", user_id=current_user.user_id, user_email=current_user.email, detail={"scope": scope, "generate_answer": bool(payload.generate_answer)})
         return KnowledgeSearchResponse(
             query=query,
-            evidence=evidence,
+            evidence=merged_evidence,
             answer=answer,
             source_evidence=source_evidence,
             knowledge_debug={
                 "knowledge_scope": scope,
                 "allow_public_fusion": allow_public_fusion,
-                "kb_context_count": len((evidence.get("body") or {}).get("items") or []),
+                "kb_context_count": len((private_evidence.get("body") or {}).get("items") or []),
                 "source_evidence_count": len(source_evidence),
             },
         )
-    if not knowledge_base_id:
-        result = rag_pipeline.run(query, generate_answer=payload.generate_answer)
-        evidence = result.get("evidence") or _build_empty_evidence()
-        answer = result.get("answer")
-        return KnowledgeSearchResponse(
-            query=query,
-            evidence=evidence,
-            answer=answer,
-            source_evidence=[],
-            knowledge_debug={
-                "knowledge_scope": scope,
-                "allow_public_fusion": allow_public_fusion,
-                "kb_context_count": 0,
-                "source_evidence_count": 0,
-            },
-        )
-    public_result = rag_pipeline.run(query, generate_answer=False)
-    public_evidence = public_result.get("evidence") or _build_empty_evidence()
-    merged_evidence = _merge_knowledge_evidence(private_evidence, public_evidence)
-    answer = rag_pipeline.generate_answer_from_evidence(query, merged_evidence) if payload.generate_answer else None
-    return KnowledgeSearchResponse(
-        query=query,
-        evidence=merged_evidence,
-        answer=answer,
-        source_evidence=source_evidence,
-        knowledge_debug={
-            "knowledge_scope": scope,
-            "allow_public_fusion": allow_public_fusion,
-            "kb_context_count": len((private_evidence.get("body") or {}).get("items") or []),
-            "source_evidence_count": len(source_evidence),
-        },
-    )
+    finally:
+        _reset_observability_context(guard_token)
 
 
 @app.post("/api/knowledge/answer_from_evidence", response_model=KnowledgeAnswerResponse)
-def knowledge_answer_from_evidence(payload: KnowledgeAnswerRequest) -> KnowledgeAnswerResponse:
-    rag_pipeline = _get_rag_pipeline()
-    if not payload.query or not isinstance(payload.evidence, dict):
-        raise HTTPException(status_code=400, detail="证据或问题不能为空")
-    answer = rag_pipeline.generate_answer_from_evidence(payload.query, payload.evidence)
-    return KnowledgeAnswerResponse(query=payload.query, evidence=payload.evidence, answer=answer)
+def knowledge_answer_from_evidence(
+    payload: KnowledgeAnswerRequest,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> KnowledgeAnswerResponse:
+    _assert_within_quota(current_user)
+    guard_token = _apply_authenticated_request_guard(
+        request=request,
+        current_user=current_user,
+        request_path="/api/knowledge/answer_from_evidence",
+        bucket="knowledge_answer_from_evidence",
+    )
+    try:
+        rag_pipeline = _get_rag_pipeline()
+        if not payload.query or not isinstance(payload.evidence, dict):
+            raise HTTPException(status_code=400, detail="证据或问题不能为空")
+        answer = rag_pipeline.generate_answer_from_evidence(payload.query, payload.evidence)
+        evidence_text = json.dumps(payload.evidence, ensure_ascii=False)
+        prompt_tokens = _estimate_tokens_text(payload.query) + _estimate_tokens_text(evidence_text)
+        completion_tokens = _estimate_tokens_text(answer)
+        _record_token_usage(
+            user_id=current_user.user_id,
+            session_id="",
+            request_path="/api/knowledge/answer_from_evidence",
+            message_id="",
+            model_name=_get_config().ANALYSIS_MODEL_NAME,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            stage="knowledge_answer_from_evidence",
+        )
+        _record_audit_log(action="knowledge_answer_from_evidence", status="success", user_id=current_user.user_id, user_email=current_user.email)
+        return KnowledgeAnswerResponse(query=payload.query, evidence=payload.evidence, answer=answer)
+    finally:
+        _reset_observability_context(guard_token)

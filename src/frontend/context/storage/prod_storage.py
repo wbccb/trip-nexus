@@ -6,9 +6,13 @@ import mysql.connector
 from mysql.connector import pooling
 from typing import Optional, Dict, List
 from pydantic import ValidationError
+import logging
 from src.frontend.context.entity import SessionContext, CoreEntity
 from src.config import Config
 from .base_storage import BaseConversationStorage
+from src.observability import log_event
+
+logger = logging.getLogger(__name__)
 
 class ProdConversationStorage(BaseConversationStorage):
     """生产用存储：Redis + MySQL"""
@@ -82,7 +86,7 @@ class ProdConversationStorage(BaseConversationStorage):
             cursor.execute(query, (session_id, entities_json, now, entities_json, now))
             conn.commit()
         except Exception as e:
-            print(f"MySQL存储核心实体失败: {e}")
+            log_event(logger, logging.ERROR, "MySQL 存储核心实体失败", {"原因": str(e)})
         finally:
             if 'conn' in locals() and conn.is_connected():
                 cursor.close()
@@ -112,7 +116,7 @@ class ProdConversationStorage(BaseConversationStorage):
                 # 缓存回Redis
                 self.redis.setex(redis_key, datetime.timedelta(hours=2), entities_json)
         except Exception as e:
-            print(f"MySQL获取核心实体失败: {e}")
+            log_event(logger, logging.ERROR, "MySQL 获取核心实体失败", {"原因": str(e)})
         finally:
             if 'conn' in locals() and conn.is_connected():
                 cursor.close()
@@ -131,7 +135,7 @@ class ProdConversationStorage(BaseConversationStorage):
                         data_obj["travel_dates"] = [d for d in data_obj["travel_dates"] if d]
                     return CoreEntity.model_validate(data_obj)
                 except Exception as e:
-                    print(f"核心实体数据修复失败: {e}")
+                    log_event(logger, logging.ERROR, "核心实体数据修复失败", {"原因": str(e)})
                     return None
 
         return None
@@ -150,7 +154,7 @@ class ProdConversationStorage(BaseConversationStorage):
             cursor.execute(query, (session_id, summary, now, summary, now))
             conn.commit()
         except Exception as e:
-            print(f"MySQL存储摘要失败: {e}")
+            log_event(logger, logging.ERROR, "MySQL 存储摘要失败", {"原因": str(e)})
         finally:
             if 'conn' in locals() and conn.is_connected():
                 cursor.close()
@@ -167,7 +171,7 @@ class ProdConversationStorage(BaseConversationStorage):
             if result:
                 return result['summary']
         except Exception as e:
-            print(f"MySQL获取摘要失败: {e}")
+            log_event(logger, logging.ERROR, "MySQL 获取摘要失败", {"原因": str(e)})
         finally:
             if 'conn' in locals() and conn.is_connected():
                 cursor.close()
@@ -184,7 +188,7 @@ class ProdConversationStorage(BaseConversationStorage):
             try:
                 self.redis.delete(key)
             except Exception as e:
-                print(f"Redis删除会话缓存失败: {e}")
+                log_event(logger, logging.ERROR, "Redis 删除会话缓存失败", {"原因": str(e), "键": key})
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor()
@@ -195,7 +199,7 @@ class ProdConversationStorage(BaseConversationStorage):
             cursor.execute("DELETE FROM session_list WHERE session_id = %s", (session_id,))
             conn.commit()
         except Exception as e:
-            print(f"MySQL删除会话数据失败: {e}")
+            log_event(logger, logging.ERROR, "MySQL 删除会话数据失败", {"原因": str(e), "session_id": session_id})
         finally:
             if 'conn' in locals() and conn.is_connected():
                 cursor.close()

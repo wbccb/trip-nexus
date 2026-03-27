@@ -17,9 +17,10 @@ from src.frontend.context.entity import Message, MessageType
 from src.frontend.context.storage import get_conversation_storage
 from src.llm.llm_manager import LlmManager
 from src.map.map_renderer import TripMap
-from src.utils.console import console_log
 from src.frontend.agent_ui import AgentUI
-from src.observability import ErrorCodes, normalize_exception, get_global_recorder
+from src.observability import ErrorCodes, normalize_exception, get_global_recorder, log_event, summarize_value
+
+logger = logging.getLogger(__name__)
 
 class UIManager:
     def __init__(self, llm_manager: LlmManager, config: Config, map_renderer: TripMap | None = None):
@@ -63,13 +64,7 @@ class UIManager:
 
     def _log_llm_output(self, stage: str, content: str) -> None:
         safe_content = content or ""
-        head_size = 180
-        tail_size = 180
-        if len(safe_content) <= head_size + tail_size + 5:
-            preview = safe_content
-        else:
-            preview = f"{safe_content[:head_size]}....{safe_content[-tail_size:]}"
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] llm_output stage={stage} len={len(safe_content)} preview={preview}")
+        log_event(logger, logging.INFO, "UI LLM 输出摘要", {"阶段": stage, "长度": len(safe_content), "预览": summarize_value(safe_content, 60, 60)})
 
     def _init_session_state(self) -> None:
         """
@@ -215,7 +210,6 @@ class UIManager:
         - 预算提示：展示当前 Evidence Budget 使用量，并在超限时预警。
         """
         if not isinstance(evidence, dict) or not evidence:
-            print("【RAG】界面无证据可展示")
             st.info("暂无 RAG 证据可展示。")
             return
 
@@ -224,7 +218,7 @@ class UIManager:
 
         summary_entries = self._get_rag_evidence_entries(evidence, "summary")
         body_entries = self._get_rag_evidence_entries(evidence, "body")
-        print(f"【RAG】界面准备展示证据，摘要/正文条目数：{len(summary_entries)}/{len(body_entries)}")
+        log_event(logger, logging.INFO, "UI 准备展示 RAG 证据", {"摘要条数": len(summary_entries), "正文条数": len(body_entries)})
 
         summary_budget = int((evidence.get("summary") or {}).get("budget_chars") or 0)
         body_budget = int((evidence.get("body") or {}).get("budget_chars") or 0)
@@ -770,9 +764,8 @@ class UIManager:
         if prompt:
             try:
                 # 记录聊天提交开始时间与日志
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 start_ts = datetime.now()
-                print(f"[{ts}][UIManager] chat_submit start, session_id={session_id}, prompt_len={len(prompt)}")
+                log_event(logger, logging.INFO, "聊天提交流程开始", {"session_id": session_id, "提示词长度": len(prompt)})
                 # 记录 UI 链路的开始指标
                 self._metrics.record("ui_chat_start", {"session_id": session_id, "prompt_len": len(prompt)})
                 # 组织用户消息结构
@@ -795,14 +788,14 @@ class UIManager:
                 # 先渲染加载中视图
                 chat_placeholder.markdown(build_chat_html(loading_messages), unsafe_allow_html=True)
                 # 调用 LLM 进行意图识别与参数抽取
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 实体抽取+意图识别 start")
+                log_event(logger, logging.INFO, "UI 开始实体抽取与意图识别", {"session_id": session_id})
                 intent_data = self.llm_manager.analyze_user_message(
                     query=prompt,
                     context=st.session_state.chat_history,
                     current_trip=st.session_state.trip_data,
                 )
                 # 打印意图识别结果
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 实体抽取+意图识别 end, intent={intent_data.get('intent')}")
+                log_event(logger, logging.INFO, "UI 实体抽取与意图识别完成", {"意图": intent_data.get("intent")})
                 # 写入用户消息与意图数据到会话管理
                 self.conversation_manager.process_new_message(
                     user_id,
@@ -811,8 +804,6 @@ class UIManager:
                     session_id,
                     intent_data=intent_data,
                 )
-
-                print(f"处理用户消息结束,当前用户的意图是{intent_data.get('intent')}, 准备开始进行LLM的生成:")
 
                 # 获取意图类型，默认走普通对话
                 intent_type = intent_data.get("intent", "general_conversation")
@@ -829,7 +820,7 @@ class UIManager:
                     )
                     # 若缺少必要信息，提示用户补充
                     if prepared_request.get("needs_more_info"):
-                        print("信息缺失，无法生成行程，暂时中断..............")
+                        log_event(logger, logging.INFO, "生成行程信息不足，已中断", {"缺失信息": prepared_request.get("missing_info")})
                         missing_info = prepared_request.get("missing_info", [])
                         response_data = {
                             "response": f"我需要更多信息才能为您生成行程。请提供以下信息：{', '.join(missing_info)}",
@@ -841,10 +832,7 @@ class UIManager:
                         stream_start_ts = datetime.now()
                         stream_request_id = f"trip-{stream_start_ts.strftime('%H%M%S%f')}"
                         stream_stage = "trip_generation_stream"
-                        print(
-                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] generate_trip使用大模型开始生成行程【流式输出】"
-                            f"stage={stream_stage} request_id={stream_request_id} prompt_len={len(prompt)}"
-                        )
+                        log_event(logger, logging.INFO, "UI 开始流式生成行程", {"阶段": stream_stage, "请求ID": stream_request_id, "提示词长度": len(prompt)})
                         response_stream = self.llm_manager.stream_trip_generation(
                             prepared_request.get("user_input") or {},
                             prepared_request.get("context_texts") or [],
@@ -856,9 +844,7 @@ class UIManager:
                 elif intent_type in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
                     # 仅在已有行程时支持修改类意图
                     if st.session_state.trip_data:
-                        print(
-                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 目前是：{intent_type}，准备触发大模型"
-                        )
+                        log_event(logger, logging.INFO, "UI 开始流式修改行程", {"意图": intent_type})
                         prepared_request = self.llm_manager.prepare_trip_request_from_modification(
                             intent_data,
                             st.session_state.trip_data,
@@ -883,7 +869,6 @@ class UIManager:
                             "trip_data": None,
                         }
                 else:
-                    print("当前不是【生成行程】，也不是【修改行程】，只是普通对话模式")
                     tool_call = self.llm_manager.call_tool_by_llm(prompt, st.session_state.chat_history)
                     if tool_call.get("needs_tool") and tool_call.get("result"):
                         result_payload = tool_call.get("result")
@@ -892,22 +877,16 @@ class UIManager:
                                 "response": f"工具结果：{json.dumps(result_payload.get('data'), ensure_ascii=False)}",
                                 "trip_data": None,
                             }
-                            print("当前不是【生成行程】，也不是【修改行程】，也不是普通对话模式，直接返回工具结果")
+                            log_event(logger, logging.INFO, "普通对话命中工具结果，直接返回")
                         else:
                             tool_call = {"needs_tool": False}
                     if not tool_call.get("needs_tool"):
                         decision_payload = tool_call.get("decision") or {}
-                        print(
-                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 工具路由未命中，准备走对话模型 "
-                            f"needs_tool={decision_payload.get('needs_tool')} tool_name={decision_payload.get('tool_name')} params={decision_payload.get('params')}"
-                        )
+                        log_event(logger, logging.INFO, "工具路由未命中，转入对话模型", {"needs_tool": decision_payload.get("needs_tool"), "tool_name": decision_payload.get("tool_name"), "params": decision_payload.get("params")})
                         stream_start_ts = datetime.now()
                         stream_request_id = f"chat-{stream_start_ts.strftime('%H%M%S%f')}"
                         stream_stage = "chat_response_stream"
-                        print(
-                            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 无法获取类型，直接走LLM调用，准备触发大模型 "
-                            f"stage={stream_stage} request_id={stream_request_id} prompt_len={len(prompt)}"
-                        )
+                        log_event(logger, logging.INFO, "UI 开始流式普通对话", {"阶段": stream_stage, "请求ID": stream_request_id, "提示词长度": len(prompt)})
                         response_stream = self.llm_manager.stream_chat_response(
                             prompt,
                             st.session_state.chat_history,
@@ -926,7 +905,7 @@ class UIManager:
                 trip_data = None
                 # 处理流式输出
                 if response_stream is not None:
-                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager]流式数据渲染-----------------------------开始")
+                    log_event(logger, logging.INFO, "开始渲染流式输出", {"阶段": stream_stage, "请求ID": stream_request_id})
                     chat_response = self.chat_stream_renderer.render_stream_response(
                         chat_response,
                         st.session_state.chat_history,
@@ -934,10 +913,7 @@ class UIManager:
                         response_stream=response_stream,
                     )
                     stream_elapsed_ms = int((datetime.now() - stream_start_ts).total_seconds() * 1000)
-                    print(
-                        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] 流式输出-------结束"
-                        f"stage={stream_stage} request_id={stream_request_id} elapsed_ms={stream_elapsed_ms} response_len={len(chat_response)}"
-                    )
+                    log_event(logger, logging.INFO, "流式输出渲染完成", {"阶段": stream_stage, "请求ID": stream_request_id, "耗时毫秒": stream_elapsed_ms, "响应长度": len(chat_response)})
                     self._log_llm_output(stream_stage, chat_response)
                     chat_response, think_text = self._split_think_content(chat_response)
                     # 若是行程流式生成，则解析行程数据
@@ -951,14 +927,13 @@ class UIManager:
                     self._log_llm_output("non_stream_response", chat_response)
                     chat_response, think_text = self._split_think_content(chat_response)
                     # 非流式输出直接渲染
-                    print("非流式输出直接渲染-----------------------------开始")
                     self.chat_stream_renderer.render_stream_response(
                         chat_response,
                         st.session_state.chat_history,
                         chat_placeholder,
                         response_stream=None,
                     )
-                    print("非流式输出直接渲染-----------------------------结束")
+                    log_event(logger, logging.INFO, "非流式输出渲染完成", {"响应长度": len(chat_response or "")})
                     # 若返回包含行程数据，则写入状态
                     if isinstance(response_data, dict) and "trip_data" in response_data:
                         trip_data = response_data["trip_data"]
@@ -975,8 +950,6 @@ class UIManager:
                 }
                 if think_text:
                     metadata_payload["think"] = think_text
-                    # print(f"目前抽离出来的<think>内容是: \n + {think_text} \n\n")
-                    # print(f"目前抽离出来的回答文本是: \n + {chat_response}")
                 assistant_msg = {
                     "role": MessageType.ASSISTANT,
                     "content": chat_response,
@@ -987,14 +960,11 @@ class UIManager:
                 st.session_state.chat_history.append(assistant_msg)
                 # 转换为消息对象用于持久化
                 assistant_message_obj = Message.model_validate(assistant_msg)
-                print("追加AI返回信息到历史记录 + 转换为消息对象用于持久化")
-
                 # AI消息进行处理：主要是压缩多轮对话消息 + 存储会话信息到数据库中
                 self.conversation_manager.process_new_message(user_id, device_id, assistant_message_obj, session_id)
                 # 计算总耗时并记录日志
                 total_cost = (datetime.now() - start_ts).total_seconds()
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}][UIManager] AI消息处理结束！！, total_cost={total_cost:.2f}s")
-                print("\n")
+                log_event(logger, logging.INFO, "聊天提交流程完成", {"总耗时秒": total_cost, "session_id": session_id})
                 # 记录 UI 链路成功指标
                 self._metrics.record("ui_chat_success", {"session_id": session_id, "elapsed_ms": int(total_cost * 1000)})
                 # 显示AI消息到界面中
@@ -1019,9 +989,6 @@ class UIManager:
         if st.session_state.get("map_visible") is None:
             st.session_state.map_visible = True
 
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{ts}][UIManager] render_map_panel called. visible={st.session_state.map_visible}, has_trip={bool(st.session_state.get('trip_data'))}, has_map_obj={bool(st.session_state.get('map_obj'))}")
-
         # 3. 处理隐藏逻辑
         if not st.session_state.map_visible:
             if st.button("显示地图", key="show_map_button"):
@@ -1042,22 +1009,18 @@ class UIManager:
         
         # 5. 渲染地图对象（如果不存在则生成）
         if not st.session_state.get("map_obj") and self.map_renderer:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{ts}][UIManager] map_obj missing, generating new map...")
+            log_event(logger, logging.INFO, "UI 地图对象缺失，开始生成")
             try:
                 with st.spinner("地图生成中，请稍候..."):
                     st.session_state.map_obj = self.map_renderer.render_map(trip_data)
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{ts}][UIManager] map generated successfully")
+                log_event(logger, logging.INFO, "UI 地图生成完成")
             except Exception as e:
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{ts}][UIManager] map generation failed: {e}")
+                log_event(logger, logging.ERROR, "UI 地图生成失败", {"原因": str(e)})
                 st.error(f"地图生成失败: {str(e)}")
                 return
 
         # 6. 显示地图组件
         if st.session_state.get("map_obj"):
-            print("[MapDebug] rendering map via html component")
             html(
                 st.session_state.map_obj._repr_html_(),
                 height=600,
@@ -1212,7 +1175,7 @@ class UIManager:
             return "\n".join(markdown_content)
 
         except Exception as e:
-            print(f"❌ 行程格式化失败: {str(e)}")
+            log_event(logger, logging.ERROR, "行程格式化失败", {"原因": str(e)})
             return f"❌ 行程数据格式错误，无法显示。错误: {str(e)}"
 
     def _reset_conversation(self, user_id: str, device_id: str) -> None:
@@ -1296,8 +1259,6 @@ class UIManager:
         # 浮动显示右侧地图（悬浮层）
         map_visible = st.session_state.get("map_visible", False)
         has_trip_data = bool(st.session_state.get("trip_data"))
-        print(f"[DEBUG] Map render check: visible={map_visible}, has_data={has_trip_data}")
-        
         if map_visible and has_trip_data:
             # 渲染地图内容
             trip_data = st.session_state.get("trip_data")
@@ -1338,7 +1299,7 @@ class UIManager:
                 st.session_state.map_visible = False
                 st.rerun()
             if not st.session_state.get("map_obj") and self.map_renderer:
-                print("[DEBUG] Generating map object...")
+                log_event(logger, logging.INFO, "悬浮地图开始分批生成")
                 with st.spinner("地图生成中..."):
                     try:
                         last_event = None
@@ -1353,27 +1314,22 @@ class UIManager:
                                 time_module.sleep(0.25)
                         if last_event and last_event.get("map_obj"):
                             st.session_state.map_obj = last_event.get("map_obj")
-                            print("[DEBUG] Map object generated successfully")
+                            log_event(logger, logging.INFO, "悬浮地图对象生成完成")
                         elif not st.session_state.get("map_obj"):
                             st.session_state.map_obj = self.map_renderer.render_map(trip_data)
                     except Exception as e:
-                        print(f"[DEBUG] Map generation failed: {e}")
+                        log_event(logger, logging.ERROR, "悬浮地图生成失败", {"原因": str(e)})
                         st.error(f"地图生成失败: {str(e)}")
             
             if st.session_state.get("map_obj") and not map_rendered_inline:
                 try:
                     # 2. 获取地图的完整 HTML 字符串
                     map_html_content = st.session_state.map_obj.get_root().render()
-                    print(f"[DEBUG] Map HTML generated, length: {len(map_html_content)}")
-                    
                     sidebar_html = self._build_map_sidebar_html(map_html_content)
-                    print("[DEBUG] Injecting map sidebar HTML")
                     map_placeholder.markdown(sidebar_html, unsafe_allow_html=True)
                 except Exception as e:
-                    print(f"[DEBUG] Error rendering map sidebar: {e}")
+                    log_event(logger, logging.ERROR, "悬浮地图渲染失败", {"原因": str(e)})
                     st.error(f"地图渲染错误: {e}")
-            else:
-                print("[DEBUG] No map object available to render")
 
         agent_last_state = st.session_state.get("agent_last_state")
         if isinstance(agent_last_state, dict):
@@ -1396,9 +1352,8 @@ class UIManager:
     def render_session_list(self, user_id: str, device_id: str) -> None:
         """绘制左侧的会话列表（侧边栏内）"""
         if st.button("新建会话", use_container_width=True):
-            console_log("新建会话:"+user_id , device_id)
             new_session_id = self.conversation_storage.generate_session_id(user_id, device_id)
-            console_log("新建会话 new_session_id", new_session_id)
+            log_event(logger, logging.INFO, "创建新会话", {"user_id": user_id, "session_id": new_session_id})
             self.conversation_storage.store_session(user_id, session_id=new_session_id)
             st.session_state.current_conversation_id = new_session_id
             st.session_state.chat_history = []

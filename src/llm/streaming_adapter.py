@@ -1,16 +1,9 @@
-from datetime import datetime
 from typing import Any, Dict, Iterable, List
 import re
+import logging
+from src.observability import log_event, summarize_value
 
-
-def _ts() -> str:
-    """
-    返回当前时间的字符串表示，用于日志前缀。
-
-    返回：
-    - 形如 "YYYY-MM-DD HH:MM:SS" 的时间字符串。
-    """
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+logger = logging.getLogger(__name__)
 
 
 def _strip_think_content(text: Any) -> str:
@@ -22,17 +15,11 @@ def _strip_think_content(text: Any) -> str:
 
 
 def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
-    if text is None:
-        return ""
-    text_value = str(text)
-    if len(text_value) <= head + tail + 5:
-        return text_value
-    return f"{text_value[:head]}....{text_value[-tail:]}"
+    return summarize_value(text, head=head, tail=tail)
 
 
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
-    preview = _format_log_text(cleaned_text)
-    print(f"[{_ts()}][LlmStreamingAdapter] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
+    log_event(logger, logging.INFO, f"流式适配输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
 
 
 class LlmStreamingAdapter:

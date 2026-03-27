@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react"
 import { Alert, Button, Card, Checkbox, Collapse, Divider, Input, InputNumber, List, Modal, Popconfirm, Radio, Select, Space, Spin, Tabs, Tag, Typography, Upload } from "antd"
 import { generateKnowledgeAnswer } from "../api/index.js"
+import { logDebug } from "../utils/debugLogger.js"
 
 const EMPTY_EVIDENCE = {}
 
@@ -265,7 +266,7 @@ export default function KnowledgeTab({
   }, [lastIngestResult])
 
   useEffect(() => {
-    console.info("[knowledge-tab] social-list-state", {
+    logDebug("知识库", "社交来源列表状态更新", {
       selectedKnowledgeBaseId: String(selectedKnowledgeBaseId || ""),
       knowledgeSourcesCount: normalizedKnowledgeSources.length,
       socialSourcesCount: socialSources.length,

@@ -1,8 +1,12 @@
 from typing import Dict, Any, Optional
 import requests
+import logging
+from src.observability import log_event
+
+logger = logging.getLogger(__name__)
 
 def get_daily_weather(city: str, date: Optional[str] = None, days: int = 7) -> Dict[str, Any]:
-    print("\n【请求】get_daily_weather", city, date, days)
+    log_event(logger, logging.INFO, "天气查询开始", {"城市": city, "日期": date, "天数": days})
     geo_resp = requests.get(
         "https://geocoding-api.open-meteo.com/v1/search",
         params={"name": city, "count": 1, "language": "zh", "format": "json"},
@@ -58,5 +62,5 @@ def get_daily_weather(city: str, date: Optional[str] = None, days: int = 7) -> D
         "daily": daily_list,
         "source": "open-meteo",
     }
-    print("【返回】get_daily_weather\n", result)
+    log_event(logger, logging.INFO, "天气查询完成", {"城市": city, "返回天数": len(daily_list)})
     return result

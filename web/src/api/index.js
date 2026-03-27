@@ -28,4 +28,12 @@ export {
   updateKnowledgeSource,
   uploadKnowledgeDocument,
 } from "./knowledgeApi.js";
+export {
+  getAdminDashboard,
+  getAdminAuditLogs,
+  getAdminUserTokenUsage,
+  listAdminUsers,
+  updateAdminUserQuota,
+  updateAdminUserStatus,
+} from "./adminApi.js";
 export { API_BASE, apiPost } from "./httpClient.js";

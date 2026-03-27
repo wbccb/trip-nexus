@@ -11,6 +11,7 @@ import tiktoken
 from langchain_core.prompts import PromptTemplate
 import logging
 import re
+from src.observability import log_event, log_llm_end, log_llm_start, summarize_value
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +25,11 @@ def _strip_think_content(text: Any) -> str:
 
 
 def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
-    if text is None:
-        return ""
-    text_value = str(text)
-    if len(text_value) <= head + tail + 5:
-        return text_value
-    return f"{text_value[:head]}....{text_value[-tail:]}"
+    return summarize_value(text, head=head, tail=tail)
 
 
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
-    preview = _format_log_text(cleaned_text)
-    print(f"【RAG】{tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
+    log_event(logger, logging.INFO, f"RAG LLM 输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
 
 class AIRetrievalPipeline:
     def __init__(self, llm):
@@ -134,7 +129,7 @@ class AIRetrievalPipeline:
         body_section["used_chars"] = sum(len(str(it.get("text") or "")) for it in body_items)
         new_evidence["summary"] = summary_section
         new_evidence["body"] = body_section
-        print(f"【RAG】Token压缩后Context tokens={current_tokens}, budget={budget}")
+        log_event(logger, logging.INFO, "RAG 证据压缩完成", {"当前Token": current_tokens, "预算Token": budget})
         return new_evidence
 
     def _summarize_text(self, text: str, max_chars: int) -> str:
@@ -148,7 +143,7 @@ class AIRetrievalPipeline:
         if len(text) <= max_chars:
             return text
             
-        print(f"【RAG】触发超长摘要: 原文长度={len(text)}, 目标长度={max_chars}")
+        log_event(logger, logging.INFO, "RAG 触发长文本摘要", {"原文长度": len(text), "目标长度": max_chars})
         template = """请将下面内容压缩为不超过{max_chars}字，保留核心事实与关键数字。
 
 内容：
@@ -160,10 +155,18 @@ class AIRetrievalPipeline:
             input_variables=["content", "max_chars"]
         )
         chain = prompt | self.llm
+        started_at = log_llm_start(
+            logger,
+            stage="RAG 长文本摘要",
+            model=getattr(self.llm, "model", getattr(self.llm, "model_name", "未知模型")),
+            prompt=template.format(content=summarize_value(text, 60, 60), max_chars=max_chars),
+            extra={"目标长度": max_chars},
+        )
         response = chain.invoke({"content": text, "max_chars": max_chars})
         summary_raw = response.content if hasattr(response, "content") else response
         summary = _strip_think_content(summary_raw)
         _log_llm_output("summarize_response", summary)
+        log_llm_end(logger, stage="RAG 长文本摘要", started_at=started_at, output=summary)
         summary = str(summary).strip()
         if summary:
             return summary[:max_chars]
@@ -183,7 +186,7 @@ class AIRetrievalPipeline:
         max_item_chars = self.config.EVIDENCE_SUMMARY_ITEM_MAX_CHARS
         top_k = self.config.EVIDENCE_SUMMARY_TOP_K
         
-        print(f"【RAG】构建Summary Evidence，拿到的配置信息为: Budget={budget}, MaxItem={max_item_chars}, TopK={top_k}")
+        log_event(logger, logging.INFO, "开始构建摘要证据", {"预算字符": budget, "单条上限": max_item_chars, "TopK": top_k})
         
         summary_items = []
         summary_candidates = []
@@ -230,7 +233,7 @@ class AIRetrievalPipeline:
             })
             used += len(combined)
             
-        print(f"【RAG】用标题 + 摘要去组装combined，然后进行截断 => 构建出Summary: 数量(真正)={len(summary_items)}, Candidates(原始，部分可能要跳过)={len(summary_candidates)}, UsedChars={used}/{budget}, Skipped(Dup={skipped_dup}, Budget={skipped_budget})")
+        log_event(logger, logging.INFO, "摘要证据构建完成", {"摘要条数": len(summary_items), "候选条数": len(summary_candidates), "已用字符": f"{used}/{budget}", "去重跳过": skipped_dup, "预算跳过": skipped_budget})
         return {
             "items": summary_items,
             "candidates": summary_candidates,
@@ -254,7 +257,7 @@ class AIRetrievalPipeline:
         max_chunk_chars = self.config.EVIDENCE_CHUNK_MAX_CHARS
         min_chunk_chars = self.config.EVIDENCE_CHUNK_MIN_CHARS
         
-        print(f"【RAG】获取Body Evidence配置: token数量限制={budget}, 个数限制={top_n}, Chunk(Min={min_chunk_chars}, Max={max_chunk_chars})")
+        log_event(logger, logging.INFO, "开始构建正文证据", {"预算字符": budget, "TopN": top_n, "最小分块": min_chunk_chars, "最大分块": max_chunk_chars})
         
         used = 0
         skipped_short = 0
@@ -284,7 +287,7 @@ class AIRetrievalPipeline:
                 "timestamp": timestamp,
             })
             
-        print(f"【RAG】正文构建（还没进行llm压缩) => Body候选集构建完成: Candidates={len(candidates)}, Skipped(Short={skipped_short}, Dup={skipped_dup})")
+        log_event(logger, logging.INFO, "正文候选构建完成", {"候选条数": len(candidates), "过短跳过": skipped_short, "重复跳过": skipped_dup})
         
         for cand in candidates:
             if len(selected) >= top_n:
@@ -315,7 +318,7 @@ class AIRetrievalPipeline:
             })
             used += len(content)
             
-        print(f"【RAG】Body最终筛选完成（token+top_n限制）: Selected={len(selected)}, UsedChars={used}/{budget}, Truncated/BudgetBreak={truncated_cnt}")
+        log_event(logger, logging.INFO, "正文证据筛选完成", {"入选条数": len(selected), "已用字符": f"{used}/{budget}", "截断次数": truncated_cnt})
         
         return {
             "items": selected,
@@ -339,7 +342,7 @@ class AIRetrievalPipeline:
         执行完整的AI检索流程
         """
         start_time = time.time()
-        print(f"【RAG】开始检索：{query}")
+        log_event(logger, logging.INFO, "RAG 检索开始", {"查询": query})
         
         # 清除旧的向量存储上下文
         self.vector_store.clear()
@@ -347,14 +350,13 @@ class AIRetrievalPipeline:
         # 1. 意图识别 (如果外部未传入，则进行识别)
         if not intent_info:
             intent_info = self.intent_recognizer.classify_intent(query)
-            logger.info(f"Intent info: {intent_info}")
-            print(f"【RAG】意图识别完成，是否需要检索：{intent_info.get('needs_search', True)}")
+            log_event(logger, logging.INFO, "RAG 意图识别完成", {"主意图": intent_info.get("primary_intent"), "需要检索": intent_info.get("needs_search", True)})
         else:
-            print(f"【RAG】使用外部传入意图：{intent_info.get('primary_intent')} (Needs Search: {intent_info.get('needs_search')})")
+            log_event(logger, logging.INFO, "RAG 使用外部传入意图", {"主意图": intent_info.get("primary_intent"), "需要检索": intent_info.get("needs_search")})
 
         # 2. 判断是否需要检索
         if not intent_info.get('needs_search', True):
-            print("【RAG】无需检索，直接生成回答")
+            log_event(logger, logging.INFO, "RAG 跳过检索，直接生成回答")
             answer = None
             if generate_answer:
                 answer = self._generate_direct_answer(query, intent_info)
@@ -375,7 +377,7 @@ class AIRetrievalPipeline:
             logger.info(f"SearchXNR得到: 首条={search_results[0]}, 末条={search_results[-1]}")
         else:
             logger.info("SearchXNR得到: 无结果")
-        print(f"【RAG】搜索完成，结果数：{len(search_results)}")
+        log_event(logger, logging.INFO, "RAG 搜索完成", {"结果数": len(search_results)})
 
         logger.info("-------------准备质量过滤-------------------")
 
@@ -384,7 +386,7 @@ class AIRetrievalPipeline:
         # 4. 质量过滤 (基于摘要重排序)
         filtered_results = self.quality_filter.filter_and_rank(search_results, query)
         logger.info(f"质量过滤 {len(filtered_results)} 结果")
-        print(f"【RAG】质量过滤完成，保留数：{len(filtered_results)}")
+        log_event(logger, logging.INFO, "RAG 质量过滤完成", {"保留数": len(filtered_results)})
 
         logger.info("-------------准备内容抓取-------------------")
 
@@ -393,7 +395,7 @@ class AIRetrievalPipeline:
         urls_to_fetch = [r['url'] for r in filtered_results[:self.config.DETAIL_FETCH_TOP_K]]
         crawled_contents = self.crawler.fetch_urls(urls_to_fetch)
         logger.info(f"内容抓取 {len(crawled_contents)} pages")
-        print(f"【RAG】内容抓取完成，页面数：{len(crawled_contents)}")
+        log_event(logger, logging.INFO, "RAG 内容抓取完成", {"页面数": len(crawled_contents)})
 
         if crawled_contents:
             head = str(crawled_contents[0])[:200]
@@ -439,7 +441,7 @@ class AIRetrievalPipeline:
             
             # 将联网检索到的正文存入向量库后，检索相关片段作为 Body Evidence 候选（抓取正文的高相关段落）
             relevant_docs = self.vector_store.similarity_search(query, k=self.config.EVIDENCE_BODY_CANDIDATE_K)
-            print(f"【RAG】Summary 向量检索完成，候选片段数：{len(relevant_docs)} \n")
+            log_event(logger, logging.INFO, "RAG 向量检索完成", {"候选片段数": len(relevant_docs)})
             
             # 依据 Top N 与 token长度预算 => 两个都得满足 => 构建 Body Evidence
             body_section = self._build_body_section(relevant_docs)
@@ -452,19 +454,25 @@ class AIRetrievalPipeline:
             logger.warning("Crawling failed or empty, falling back to snippets")
             context_text = self._build_context_text(summary_section, body_section)
 
-        print(
-            "【RAG】证据构建完成\n"
-            f"- Summary: {len(summary_section.get('items', []))} items, {summary_section.get('used_chars', 0)}/{summary_section.get('budget_chars', 0)} chars\n"
-            f"- Body: {len(body_section.get('items', []))} items, {body_section.get('used_chars', 0)}/{body_section.get('budget_chars', 0)} chars\n"
-            f"- Total Context: {len(context_text)} chars"
+        log_event(
+            logger,
+            logging.INFO,
+            "RAG 证据构建完成",
+            {
+                "摘要条数": len(summary_section.get("items", [])),
+                "摘要预算": f"{summary_section.get('used_chars', 0)}/{summary_section.get('budget_chars', 0)}",
+                "正文条数": len(body_section.get("items", [])),
+                "正文预算": f"{body_section.get('used_chars', 0)}/{body_section.get('budget_chars', 0)}",
+                "上下文长度": len(context_text),
+            },
         )
         answer = None
         if generate_answer:
             logger.info("\n\n\n-------------准备LLM生成回答-------------------")
             answer = self._generate_rag_answer(query, context_text)
-            print(f"【RAG】回答生成完成: {answer} \n")
+            log_event(logger, logging.INFO, "RAG 回答生成完成", {"回答预览": answer})
         else:
-            print("【RAG】已构建证据，等待人工复核后再生成回答")
+            log_event(logger, logging.INFO, "RAG 已构建证据，等待人工复核")
 
         processing_time = time.time() - start_time
 
@@ -497,14 +505,14 @@ class AIRetrievalPipeline:
         body_section = evidence.get("body", {})
         context_text = self._build_context_text(summary_section, body_section)
         context_tokens = self._count_tokens(context_text)
-        print(f"【RAG】人工复核证据Context tokens={context_tokens}, budget={context_budget}")
+        log_event(logger, logging.INFO, "人工复核证据预算", {"当前Token": context_tokens, "预算Token": context_budget})
         if context_tokens > context_budget:
             evidence = self._shrink_evidence_to_token_budget(evidence, query, max_tokens)
             summary_section = evidence.get("summary", {})
             body_section = evidence.get("body", {})
             context_text = self._build_context_text(summary_section, body_section)
             context_tokens = self._count_tokens(context_text)
-            print(f"【RAG】压缩后Context tokens={context_tokens}, budget={context_budget}")
+            log_event(logger, logging.INFO, "人工复核证据压缩完成", {"当前Token": context_tokens, "预算Token": context_budget})
         return self._generate_rag_answer(query, context_text)
 
     def _generate_direct_answer(self, query: str, intent_info: Dict[str, Any]) -> str:
@@ -512,10 +520,18 @@ class AIRetrievalPipeline:
         无需搜索直接回答
         """
         # 简单透传给LLM，或者使用特定的Prompt
+        started_at = log_llm_start(
+            logger,
+            stage="RAG 直接回答",
+            model=getattr(self.llm, "model", getattr(self.llm, "model_name", "未知模型")),
+            prompt=query,
+            extra={"主意图": intent_info.get("primary_intent")},
+        )
         raw_response = self.llm.invoke(query)
         response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
         cleaned_text = _strip_think_content(response_text)
         _log_llm_output("direct_answer_response", cleaned_text)
+        log_llm_end(logger, stage="RAG 直接回答", started_at=started_at, output=cleaned_text)
         return cleaned_text
 
     def _generate_rag_answer(self, query: str, context: str) -> str:
@@ -538,12 +554,19 @@ class AIRetrievalPipeline:
         )
 
 
-        print(f"""\n\n\n=================================检索组装的prompt:\n{prompt.format(context=context, query=query)}\n===========================""")
+        log_event(logger, logging.DEBUG, "RAG 回答提示词已构建", {"提示词预览": prompt.format(context=context, query=query)})
 
 
         chain = prompt | self.llm
+        started_at = log_llm_start(
+            logger,
+            stage="RAG 回答生成",
+            model=getattr(self.llm, "model", getattr(self.llm, "model_name", "未知模型")),
+            prompt=prompt.format(context=summarize_value(context, 60, 60), query=query),
+        )
         raw_response = chain.invoke({"context": context, "query": query})
         response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
         cleaned_text = _strip_think_content(response_text)
         _log_llm_output("rag_answer_response", cleaned_text)
+        log_llm_end(logger, stage="RAG 回答生成", started_at=started_at, output=cleaned_text)
         return cleaned_text

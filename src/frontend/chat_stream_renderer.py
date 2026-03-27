@@ -9,6 +9,10 @@ import streamlit as st
 
 from src.frontend.context.entity import MessageType
 from src.llm.llm_manager import LlmManager
+import logging
+from src.observability import log_event
+
+logger = logging.getLogger(__name__)
 
 
 def build_chat_html(messages: List[Dict[str, Any]]) -> str:
@@ -173,9 +177,7 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
             active = metadata.get("active") or ""
             combined_parts: List[str] = []
             for segment in segments:
-                # print(f"""\n 处理前的片段: {str(segment)}""")
                 safe_segment = html_lib.escape(str(segment)).replace("\n", "<br/>") # 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
-                # print(f"处理后的片段: {str(safe_segment)} \n")
                 combined_parts.append(f'<span class="stream-segment frozen">{safe_segment}</span>')
             safe_active = html_lib.escape(str(active)).replace("\n", "<br/>") # 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
             combined_parts.append(f'<span class="stream-segment">{safe_active}</span>')
@@ -201,7 +203,7 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
                 else:
                     safe_content = html_lib.escape(safe_content).replace("\n", "<br/>") # 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
             if think_text and idx == last_assistant_index:
-                print(f"在ui_manager获取think内容，然后隐藏think内容准备重新刷新一次界面UI")
+                log_event(logger, logging.DEBUG, "检测到 think 内容，准备隐藏后刷新界面")
                 safe_think = html_lib.escape(str(think_text)).replace("\n", "<br/>") ## 不替换的话,\n\n会导致Streamlit把 \n\n 误当成分段导致界面错乱
                 safe_content = f'<details class="think-box"><summary>思考过程</summary><pre>{safe_think}</pre></details>{safe_content}'
             body.append(f'<div class="bubble">{safe_content}</div>')
@@ -214,7 +216,6 @@ def build_chat_html(messages: List[Dict[str, Any]]) -> str:
         '</script>'
     )
 
-    # print(f"body: {body}")
     return css + "".join(body)
 
 

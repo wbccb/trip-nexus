@@ -5,9 +5,10 @@ import { ScatterplotLayer, LineLayer, TextLayer } from "@deck.gl/layers"
 import { WebMercatorViewport } from "@deck.gl/core"
 import MapView from "react-map-gl/maplibre"
 import { renderFlowGeojson } from "../api/index.js"
+import { logDebug } from "../utils/debugLogger.js"
 
 const logMap = (msg, data = {}) => {
-  console.log(`[TripMap] ${msg}`, data)
+  logDebug("地图", msg, data)
 }
 
 const resolveRouteColor = (colorName) => {

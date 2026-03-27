@@ -16,7 +16,17 @@ from src.agent.event_bus import event_bus
 from src.llm.llm_manager import LlmManager
 from src.llm.tool_protocol import ToolCallResult
 from src.map.map_renderer import TripMap
-from src.observability import ErrorCodes, build_error_payload, normalize_exception, BudgetManager, ConstraintChecker
+from src.observability import (
+    ErrorCodes,
+    build_error_payload,
+    normalize_exception,
+    BudgetManager,
+    ConstraintChecker,
+    log_event,
+    log_llm_end,
+    log_llm_start,
+    summarize_value,
+)
 from src.config import Config  # 读取全局配置预算
 
 logger = logging.getLogger(__name__)
@@ -31,17 +41,11 @@ def _strip_think_content(text: Any) -> str:
 
 
 def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
-    if text is None:
-        return ""
-    text_value = str(text)
-    if len(text_value) <= head + tail + 5:
-        return text_value
-    return f"{text_value[:head]}....{text_value[-tail:]}"
+    return summarize_value(text, head=head, tail=tail)
 
 
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
-    preview = _format_log_text(cleaned_text)
-    print(f"[PlannerAgent] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
+    log_event(logger, logging.INFO, f"Agent LLM 输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
 
 
 class AgentGraphState(TypedDict):
@@ -196,14 +200,12 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
         force_sop: bool = False,
         error_context: Optional[Dict[str, Any]] = None,
     ) -> Plan:
-        # 生成 SOP 计划
         sop_plan = self._build_sop_plan(user_input, agent_config)
-        # print(f"\n[{time.strftime('%H:%M:%S')}] [PlannerAgent] 生成 SOP 计划")
         # 判断是否需要 SOP
         if force_sop:
             sop_plan.validate_plan(tool_whitelist=set(tool_whitelist))
             tools = [t.tool for t in sop_plan.tasks if t.type == "tool_call"]
-            print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 使用 SOP 计划，工具序列: {', '.join(tools)}\n")
+            log_event(logger, logging.INFO, "使用 SOP 计划", {"工具序列": tools})
             return sop_plan
         # 读取工具清单
         tool_registry = self._llm_manager.list_tools()
@@ -211,23 +213,26 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
         sop_templates = [{"name": "default_trip", "tasks": [task.model_dump() for task in sop_plan.tasks]}]
         # 构建 prompt
         prompt = self._build_plan_prompt(user_intent, user_input, tool_registry, sop_templates, error_context=error_context)
-        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 即将调用大模型......进行任务规划")
-        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 用户意图: {user_intent}")
-        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 用户输入: {json.dumps(user_input, ensure_ascii=False)}")
-        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] prompt\n: {prompt}")
+        started_at = log_llm_start(
+            logger,
+            stage="Agent 任务规划",
+            model=str(getattr(self._llm_manager.get_analysis_llm(), "model", getattr(self._llm_manager.get_analysis_llm(), "model_name", "未知模型"))),
+            prompt=prompt,
+            extra={"用户意图": user_intent, "工具数": len(tool_registry)},
+        )
         raw_response = self._llm_manager.get_analysis_llm().invoke(prompt)
         
         response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
         cleaned_response_text = _strip_think_content(response_text)
         _log_llm_output("plan_response", cleaned_response_text)
         
-        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 大模型-任务规划完成")
+        log_llm_end(logger, stage="Agent 任务规划", started_at=started_at, output=cleaned_response_text)
 
         plan = self._parse_plan_response(str(cleaned_response_text))
         plan.validate_plan(tool_whitelist=set(tool_whitelist))
 
         tools = [t.tool for t in plan.tasks if t.type == "tool_call"]
-        print(f"[{time.strftime('%H:%M:%S')}] [PlannerAgent] 规划完成，工具序列: {', '.join(tools)}\n")
+        log_event(logger, logging.INFO, "任务规划完成", {"工具序列": tools, "任务数": len(plan.tasks)})
         return plan
 
 
@@ -498,9 +503,7 @@ class AgentExecutor:
             for key, bucket in (state.shared_context.data or {}).items():
                 context_payload.append(f"{key}:{json.dumps(bucket, ensure_ascii=False)}")
             
-            # [LOG] 调用大模型生成行程前
-            print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 正在执行行程生成任务: {task.id}")
-            print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 上下文条目数: {len(context_payload)}")
+            log_event(logger, logging.INFO, "Agent 开始执行行程生成任务", {"任务ID": task.id, "上下文条数": len(context_payload)})
             logger.info(
                 "Agent行程生成开始 thread_id=%s task_id=%s context_count=%s user_input_keys=%s",
                 state.thread_id,
@@ -513,15 +516,13 @@ class AgentExecutor:
             # generate_trip 内部会构建 prompt 并调用 LLM 生成详细行程 JSON
             draft = self._llm_manager.generate_trip_pure(state.user_input, context_payload) or {}
             
-            # [LOG] 调用大模型生成行程后
             trip_days = draft.get("days") if isinstance(draft, dict) else "Unknown"
             daily_plan_keys = []
             if isinstance(draft, dict):
                 daily_plan = draft.get("daily_plan") or {}
                 if isinstance(daily_plan, dict):
                     daily_plan_keys = sorted(list(daily_plan.keys()))
-            print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 行程生成完成")
-            print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 生成行程天数: {trip_days}")
+            log_event(logger, logging.INFO, "Agent 行程生成完成", {"任务ID": task.id, "行程天数": trip_days, "已规划天": daily_plan_keys})
             logger.info(
                 "Agent行程生成结束 thread_id=%s task_id=%s success=%s trip_days=%s daily_plan_keys=%s",
                 state.thread_id,
@@ -575,7 +576,6 @@ class AgentExecutor:
             return task, result_payload
         # 行程摘要任务
         if task.type == "trip_summarize":
-            print("\n")
             # 读取行程数据
             trip_data = state.shared_context.resolve(task.input_mapping.get("trip", ""), default={})
             # 构造简要摘要
@@ -584,8 +584,7 @@ class AgentExecutor:
             output_key = task.output_key or "summary"
             state.shared_context.write(task.id, output_key, {"summary": summary})
             self._emit_context_patch(state, task, output_key, {"summary": summary})
-            print(f"生成摘要完成:{summary}")
-            print("\n")
+            log_event(logger, logging.INFO, "Agent 行程摘要生成完成", {"摘要": summary})
             # 返回结果
             result_payload = {"success": True, "data": {"summary": summary}}
             event_bus.emit(
@@ -624,7 +623,7 @@ class AgentExecutor:
             asyncio.to_thread(self._execute_task, task, state, agent_config)
             for task in batch
         ]
-        print(f"[{time.strftime('%H:%M:%S')}] [AgentExecutor] 并发执行任务: {tasks}")
+        log_event(logger, logging.INFO, "Agent 开始并发执行任务", {"任务数": len(tasks)})
         # 并发执行并返回结果
         return await asyncio.gather(*tasks)
 

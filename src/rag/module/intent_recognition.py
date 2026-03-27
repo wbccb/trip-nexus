@@ -3,8 +3,12 @@ from typing import Dict
 from functools import lru_cache
 from langchain_core.prompts import ChatPromptTemplate
 import re
+import logging
 
 from src.config import Config
+from src.observability import log_event, summarize_value
+
+logger = logging.getLogger(__name__)
 
 try:
     import streamlit as st
@@ -33,17 +37,11 @@ def _strip_think_content(text: str) -> str:
 
 
 def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
-    if text is None:
-        return ""
-    text_value = str(text)
-    if len(text_value) <= head + tail + 5:
-        return text_value
-    return f"{text_value[:head]}....{text_value[-tail:]}"
+    return summarize_value(text, head=head, tail=tail)
 
 
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
-    preview = _format_log_text(cleaned_text)
-    print(f"[IntentRecognizer] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
+    log_event(logger, logging.INFO, f"意图识别输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
 
 class IntentRecognizer:
     def __init__(self, llm):

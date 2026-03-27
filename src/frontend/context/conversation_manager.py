@@ -7,9 +7,10 @@ from pydantic import ValidationError
 import re
 from src.llm.llm_manager import LlmManager
 from datetime import datetime as _dt
+import logging
+from src.observability import log_event, log_llm_end, log_llm_start, summarize_value
 
-def _ts() -> str:
-    return _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+logger = logging.getLogger(__name__)
 
 
 def _strip_think_content(text: Any) -> str:
@@ -21,17 +22,11 @@ def _strip_think_content(text: Any) -> str:
 
 
 def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
-    if text is None:
-        return ""
-    text_value = str(text)
-    if len(text_value) <= head + tail + 5:
-        return text_value
-    return f"{text_value[:head]}....{text_value[-tail:]}"
+    return summarize_value(text, head=head, tail=tail)
 
 
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
-    preview = _format_log_text(cleaned_text)
-    print(f"[{_ts()}][ConversationManager] {tag} cleaned_len={len(cleaned_text)} cleaned_preview={preview}")
+    log_event(logger, logging.INFO, f"上下文 LLM 输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
 
 """
 会话管理：
@@ -113,20 +108,21 @@ class ConversationManager:
         4. 只有当新消息明确提到新偏好时，才更新 preferences。
         """
 
-        start_ts = _dt.now()
-        print(
-            f"[{_ts()}][ConversationManager] 抽取实体=> LLM 调用开始, "
-            f"message_len={len(new_message)}, existing_entities_present={bool(existing_entities)}"
+        start_ts = log_llm_start(
+            logger,
+            stage="核心实体抽取",
+            model=str(getattr(self.llm_manager.get_analysis_llm(), "model", getattr(self.llm_manager.get_analysis_llm(), "model_name", "未知模型"))),
+            prompt=prompt,
+            extra={"消息长度": len(new_message), "已有实体": bool(existing_entities)},
         )
         raw_response = self.llm_manager.get_analysis_llm().invoke(prompt)
         if hasattr(raw_response, "content"):
             response_text = raw_response.content
         else:
             response_text = raw_response
-        cost = (_dt.now() - start_ts).total_seconds()
         cleaned_response_text = _strip_think_content(response_text)
         _log_llm_output("extract_entities_response", cleaned_response_text)
-        print(f"[{_ts()}][ConversationManager] 抽取实体=> LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response_text))}")
+        log_llm_end(logger, stage="核心实体抽取", started_at=start_ts, output=cleaned_response_text, extra={"原始响应长度": len(str(response_text))})
 
         clean_response = self.llm_manager.extract_json_from_string(cleaned_response_text)
         if not clean_response.startswith("{"):
@@ -134,12 +130,12 @@ class ConversationManager:
             if json_match:
                 clean_response = json_match.group(0)
             else:
-                print(f"[{_ts()}][ConversationManager] 抽取实体 未找到可解析 JSON，跳过更新")
+                log_event(logger, logging.WARNING, "核心实体抽取结果无法解析 JSON，跳过更新")
                 return existing_entities
 
         extracted_data = json.loads(clean_response)
 
-        print(f"[{_ts()}][ConversationManager] 抽取实体=> 解析完成，keys={list(extracted_data.keys())}")
+        log_event(logger, logging.INFO, "核心实体抽取解析完成", {"字段": list(extracted_data.keys())})
 
         updated_entities = existing_entities.model_copy(deep=True)
 
@@ -164,7 +160,7 @@ class ConversationManager:
                         dt = datetime.fromisoformat(d_str)
                         valid_dates_obj.append(dt)
                     except ValueError:
-                        print(f"[{_ts()}][ConversationManager] 日期格式无法解析: {d_str}")
+                        log_event(logger, logging.WARNING, "日期格式无法解析", {"原始值": d_str})
             
             if valid_dates_obj:
                 updated_entities.travel_dates = valid_dates_obj
@@ -201,17 +197,21 @@ class ConversationManager:
         4. 用中文输出
         """
 
-        start_ts = _dt.now()
-        print(f"[{_ts()}][ConversationManager] 概要生成 LLM 调用开始, message_count={len(messages)}")
+        start_ts = log_llm_start(
+            logger,
+            stage="对话摘要生成",
+            model=str(getattr(self.llm_manager.get_analysis_llm(), "model", getattr(self.llm_manager.get_analysis_llm(), "model_name", "未知模型"))),
+            prompt=prompt,
+            extra={"消息数": len(messages)},
+        )
         raw_response = self.llm_manager.get_analysis_llm().invoke(prompt)
         if hasattr(raw_response, "content"):
             response = raw_response.content
         else:
             response = raw_response
-        cost = (_dt.now() - start_ts).total_seconds()
         cleaned_response = _strip_think_content(response)
         _log_llm_output("summary_response", cleaned_response)
-        print(f"[{_ts()}][ConversationManager] 概要生成 LLM 调用结束，耗时 {cost:.2f}s，响应长度={len(str(response))}")
+        log_llm_end(logger, stage="对话摘要生成", started_at=start_ts, output=cleaned_response, extra={"原始响应长度": len(str(response))})
         
         return cleaned_response
 
@@ -228,7 +228,7 @@ class ConversationManager:
         # 生成新摘要
         new_summary = self.generate_summary(early_messages, context.long_term_summary)
 
-        print(f"[{_ts()}][ConversationManager] 压缩早期消息后的新摘要长度: {len(new_summary)}")
+        log_event(logger, logging.INFO, "早期消息压缩完成", {"新摘要长度": len(new_summary)})
 
         # 更新长期摘要
         self.conversationStorage.store_long_term_summary(context.session_id, new_summary)
@@ -289,9 +289,9 @@ class ConversationManager:
         """处理新消息，更新上下文"""
 
         if message.role == "user":
-                print(f"[{_ts()}][ConversationManager] 用户消息【实体抽取+意图识别结束】,准备将用户消息添加到会话历史中, user_id={user_id}, device_id={device_id}, session_id={session_id}")
+            log_event(logger, logging.INFO, "准备写入用户消息到会话历史", {"user_id": user_id, "device_id": device_id, "session_id": session_id})
         else:
-                print(f"[{_ts()}][ConversationManager] AI大模型生成结束，准备将AI消息存入存储中")
+            log_event(logger, logging.INFO, "准备写入 AI 消息到会话历史")
 
         # 1. 获取或创建会话上下文
         # session_id = self.conversationStorage.generate_session_id(user_id, device_id)
@@ -299,7 +299,7 @@ class ConversationManager:
 
         if short_term_data:
             # 1.1 命中短期缓存（Redis），直接恢复会话上下文
-            print(f"[{_ts()}][ConversationManager] 命中短期缓存(Redis), 直接恢复会话上下文")
+            log_event(logger, logging.INFO, "命中短期缓存，直接恢复会话上下文")
             context = SessionContext(
                 session_id=session_id,
                 user_id=user_id,
@@ -314,14 +314,14 @@ class ConversationManager:
             history_messages_json = self.conversationStorage.get_session_chat_list(session_id)
             
             if history_messages_json:
-                print(f"[{_ts()}][ConversationManager] 从数据库恢复会话历史，共 {len(history_messages_json)} 条消息")
+                log_event(logger, logging.INFO, "从数据库恢复会话历史", {"消息数": len(history_messages_json)})
                 # 反序列化历史消息
                 all_messages = []
                 for msg_json in history_messages_json:
                     try:
                         all_messages.append(Message.model_validate_json(msg_json))
                     except Exception as e:
-                        print(f"[{_ts()}][ConversationManager] 解析历史消息失败: {e}")
+                        log_event(logger, logging.WARNING, "解析历史消息失败", {"原因": str(e)})
                 
                 # 重建上下文：仅加载最近10条到短期窗口
                 context = SessionContext(
@@ -360,14 +360,14 @@ class ConversationManager:
             # 4. 增量提取核心实体（如果不是冗余信息）
             if not message.is_redundant:
                 start_ts = _dt.now()
-                print(f"[{_ts()}][ConversationManager] 核心实体结束了，开始增量覆盖已经存在的实体, 本来的实体数据为: {existing_entities}")
+                log_event(logger, logging.INFO, "开始增量覆盖核心实体", {"原始实体": existing_entities})
                 if intent_data:
                     context.core_entities = self.merge_core_entities_from_intent_data(intent_data, existing_entities)
                 else:
-                    print(f"[{_ts()}][ConversationManager] 未提供 intent_data，跳过实体抽取以避免额外 LLM 调用")
+                    log_event(logger, logging.INFO, "未提供 intent_data，跳过核心实体抽取")
                 cost = (_dt.now() - start_ts).total_seconds()
                 # 更新存储
-                print(f"[{_ts()}][ConversationManager] 抽离完成，进行存储，耗时 {cost:.2f}s")
+                log_event(logger, logging.INFO, "核心实体抽取与存储完成", {"耗时秒": cost})
                 self.conversationStorage.store_core_entities(session_id, context.core_entities)
         else:
             message.is_redundant = False
@@ -377,11 +377,11 @@ class ConversationManager:
         context.message_count += 1
         context.last_active = datetime.now()
 
-        print(f"[{_ts()}][ConversationManager] 添加新消息到short_term_messages后的数量为: {context.message_count}")
+        log_event(logger, logging.INFO, "短期消息已更新", {"消息总数": context.message_count})
 
         # 6. 检查是否需要压缩早期对话
         if context.message_count > 10:
-            print("早期会话数量超过10，准备开始压缩最早的会话消息，不然下次上下文会爆炸")
+            log_event(logger, logging.INFO, "短期消息超过阈值，开始压缩早期消息", {"消息总数": context.message_count})
             context.long_term_summary = self.compress_early_messages(context)
 
         # 7. 更新短期存储
@@ -391,10 +391,9 @@ class ConversationManager:
         self.conversationStorage.store_session_chat(session_id, message.model_dump_json())
 
         if message.role == "user":
-            print(f"[{_ts()}][ConversationManager] 处理用户消息（更新上下文）结束=======, role={message.role}, total_count={context.message_count}")
-            print("\n")
+            log_event(logger, logging.INFO, "用户消息上下文更新完成", {"角色": message.role, "消息总数": context.message_count})
         else:
-            print(f"[{_ts()}][ConversationManager] 处理AI消息（更新上下文）结束=======, role={message.role}, total_count={context.message_count}")
+            log_event(logger, logging.INFO, "AI 消息上下文更新完成", {"角色": message.role, "消息总数": context.message_count})
 
         return context
 

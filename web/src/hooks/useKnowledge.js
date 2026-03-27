@@ -13,6 +13,7 @@ import {
   updateKnowledgeSource,
   uploadKnowledgeDocument,
 } from "../api/index.js";
+import { logDebug } from "../utils/debugLogger.js";
 
 const KNOWLEDGE_BASE_STORAGE_KEY = "tripnexus_selected_knowledge_base_id";
 
@@ -58,7 +59,7 @@ export function useKnowledge() {
       const normalizedId = String(
         knowledgeBaseId || selectedKnowledgeBaseId || "",
       ).trim();
-      console.info("[knowledge] refreshSources:start", {
+      logDebug("知识库", "开始刷新来源列表", {
         requestedKnowledgeBaseId: String(knowledgeBaseId || ""),
         selectedKnowledgeBaseId: String(selectedKnowledgeBaseId || ""),
         normalizedId,
@@ -66,7 +67,7 @@ export function useKnowledge() {
       if (!normalizedId) {
         setKnowledgeSources([]);
         setSourceStats({ total: 0, parsed: 0, fallback: 0, failed: 0 });
-        console.warn("[knowledge] refreshSources:skip-empty-kb");
+        logDebug("知识库", "未选择知识库，已跳过来源刷新", { __level: "warn" });
         return;
       }
       try {
@@ -92,7 +93,7 @@ export function useKnowledge() {
             failed: 0,
           },
         );
-        console.info("[knowledge] refreshSources:done", {
+        logDebug("知识库", "来源列表刷新完成", {
           knowledgeBaseId: normalizedId,
           total: items.length,
           socialCount,
@@ -102,7 +103,8 @@ export function useKnowledge() {
         message.error(`来源列表加载失败：${error.message}`);
         setKnowledgeSources([]);
         setSourceStats({ total: 0, parsed: 0, fallback: 0, failed: 0 });
-        console.error("[knowledge] refreshSources:error", {
+        logDebug("知识库", "来源列表刷新失败", {
+          __level: "error",
           knowledgeBaseId: normalizedId,
           error: String(error?.message || error),
         });
@@ -119,7 +121,7 @@ export function useKnowledge() {
       const data = await listKnowledgeBases();
       const items = Array.isArray(data?.items) ? data.items : [];
       setKnowledgeBases(items);
-      console.info("[knowledge] refreshBases:done", {
+      logDebug("知识库", "知识库列表刷新完成", {
         total: items.length,
         selectedKnowledgeBaseId: String(selectedKnowledgeBaseId || ""),
       });
@@ -266,7 +268,7 @@ export function useKnowledge() {
           selectedKnowledgeBaseId,
           payload,
         );
-        console.info("[knowledge] ingestUrl:done", {
+        logDebug("知识库", "链接导入完成", {
           knowledgeBaseId: String(selectedKnowledgeBaseId || ""),
           ingestStatus: String(result?.ingest_status || ""),
           chunksCount: Number(result?.chunks_count || 0),
@@ -337,7 +339,7 @@ export function useKnowledge() {
       // 删除后同时刷新 knowledgeBases 和 sources，
       // 这样文档分块数、来源数、失败统计都能在同一轮 UI 更新里同步。
       await deleteKnowledgeSource(selectedKnowledgeBaseId, normalizedSourceId);
-      console.info("[knowledge] deleteSource:done", {
+      logDebug("知识库", "来源删除完成", {
         knowledgeBaseId: String(selectedKnowledgeBaseId || ""),
         sourceId: normalizedSourceId,
       });
@@ -370,7 +372,7 @@ export function useKnowledge() {
           source_url: String(payload?.source_url || "").trim() || null,
         },
       );
-      console.info("[knowledge] updateSource:done", {
+      logDebug("知识库", "来源更新完成", {
         knowledgeBaseId: String(selectedKnowledgeBaseId || ""),
         sourceId: normalizedSourceId,
         chunksCount: Number(result?.chunks_count || 0),

@@ -2,15 +2,13 @@
 import { apiDelete, apiGet, apiPost } from "./httpClient.js";
 
 // 获取会话列表
-export async function listSessions(userId) {
-  const safeUserId = encodeURIComponent(userId || "");
-  return apiGet(`/api/sessions/list?user_id=${safeUserId}`);
+export async function listSessions() {
+  return apiGet("/api/sessions/list");
 }
 
 // 创建会话
-export async function startSession(userId, deviceId) {
+export async function startSession(deviceId) {
   return apiPost("/api/sessions/start", {
-    user_id: userId,
     device_id: deviceId,
   });
 }

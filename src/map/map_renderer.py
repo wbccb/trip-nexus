@@ -8,12 +8,8 @@ from geopy.exc import GeocoderTimedOut, GeocoderServiceError  # 地理编码异�
 from typing import Dict, List, Tuple, Any, Iterable  # 类型注解
 import time  # 失败重试延迟
 import logging  # 日志记录
-from datetime import datetime  # 时间戳
+from src.observability import log_event
 
-logging.basicConfig(  # 配置日志级别与格式
-    level=logging.INFO,  # 使用 INFO 级别输出
-    format="%(asctime)s - %(levelname)s - %(message)s",  # 日志格式
-)
 logger = logging.getLogger(__name__)  # 模块级日志器
 
 logging.getLogger("urllib3").setLevel(logging.ERROR)  # 降低 urllib3 噪声日志
@@ -79,11 +75,7 @@ class TripMap:
                                 or abs(lon - fallback[1]) > max_offset_deg  # 经度偏移过大
                             )
                         ):
-                            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # 记录时间戳
-                            print(
-                                f"[{ts}][MapRenderer] geocode result out of bounds for '{query}', "
-                                f"lat={lat}, lon={lon}, center={fallback}"
-                            )
+                            log_event(logger, logging.WARNING, "地理编码结果越界，已尝试下一候选查询", {"查询": query, "纬度": lat, "经度": lon, "中心点": fallback})
                             # 如果越界了，继续尝试下一个 query，或者直接视为失败
                             continue
                         else:
@@ -91,8 +83,7 @@ class TripMap:
                             return (lat, lon)  # 返回解析结果
 
                 except (GeocoderTimedOut, GeocoderServiceError, Exception) as e:  # 捕获地理编码异常
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # 记录时间戳
-                    print(f"[{ts}][MapRenderer] geocode error for '{query}' attempt {attempt + 1}: {e}")  # 输出错误
+                    log_event(logger, logging.WARNING, "地理编码失败，准备重试", {"查询": query, "重试次数": attempt + 1, "原因": str(e)})
                     time.sleep(1)  # 延迟后重试
 
         # 所有尝试都失败或越界，尝试降级到城市中心（如果之前没试过）
@@ -323,20 +314,15 @@ class TripMap:
         """
         一次性渲染完整地图（包含所有 POI 与路线）。
         """
-        logger.info("\n\n------------------!!开始渲染地图!!------------------\n\n")  # 记录渲染开始
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # 当前时间戳
-        print(f"[{ts}][MapRenderer] render_map input trip_data keys: {trip_data.keys()}")  # 打印输入结构
-
         dest = trip_data.get("destination", "成都")  # 获取目的地
-        print(f"[{ts}][MapRenderer] resolving destination: {dest}")  # 输出目的地
+        log_event(logger, logging.INFO, "开始渲染地图", {"目的地": dest, "行程字段": list(trip_data.keys())})
         center_coords = self._get_coordinates(dest)  # 解析目的地坐标作为中心点
-        print(f"[{ts}][MapRenderer] center_coords: {center_coords}")  # 输出中心坐标
 
         m = self._build_base_map(center_coords)  # 创建基础地图
 
         daily_plan_raw = trip_data.get("daily_plan")  # 读取行程计划
         if not daily_plan_raw:  # 没有行程则返回空地图
-            print(f"[{ts}][MapRenderer] Warning: daily_plan is empty or None")  # 输出告警
+            log_event(logger, logging.WARNING, "地图渲染时未发现 daily_plan")
             return m  # 直接返回
 
         if isinstance(daily_plan_raw, dict):  # 已按天分组
@@ -344,7 +330,7 @@ class TripMap:
         elif isinstance(daily_plan_raw, list):  # 单天数组则归为第 1 天
             daily_plans_grouped = {"1": daily_plan_raw}  # 转为字典结构
         else:  # 其他结构不支持
-            print(f"[{ts}][MapRenderer] 警告：daily_plan 数据类型异常，无法渲染。类型: {type(daily_plan_raw)}")  # 输出异常
+            log_event(logger, logging.WARNING, "daily_plan 数据类型异常，无法渲染", {"类型": str(type(daily_plan_raw))})
             return m  # 返回空地图
 
         all_coords: List[Tuple[float, float]] = []  # 收集所有坐标用于 fit_bounds
@@ -357,7 +343,7 @@ class TripMap:
             try:
                 day_idx = int(day_str) - 1  # 将天数转为索引
             except ValueError:
-                print(f"[{ts}][MapRenderer] 无法解析日期字符串 '{day_str}' 为数字，跳过。")  # 输出提示
+                log_event(logger, logging.WARNING, "无法解析天数字段，已跳过", {"原始值": day_str})
                 continue  # 跳过非法 day
 
             coords_list: List[Tuple[float, float]] = []  # 当天坐标列表
@@ -374,7 +360,7 @@ class TripMap:
                     coords = (float(lat), float(lon))  # 使用已有坐标
                 else:
                     if not address:  # 地址为空无法解析
-                        print(f"[{ts}][MapRenderer] 第{day_str}天第{idx + 1}项行程({attraction})缺少地址，跳过。")  # 输出提示
+                        log_event(logger, logging.DEBUG, "行程项缺少地址，已跳过", {"天数": day_str, "序号": idx + 1, "景点": attraction})
                         continue  # 跳过该点
 
                     coords = self._get_coordinates(  # 解析地址坐标
@@ -384,13 +370,8 @@ class TripMap:
                         fallback=center_coords,
                         max_offset_deg=1.0,
                     )
-                print(  # 打印原始坐标信息
-                    f"[{ts}][MapRenderer] Marker raw -> day={day_str}, idx={idx}, "
-                    f"attraction='{attraction}', address='{address}', coords={coords}"
-                )
-
                 if not coords or all(c == 0 for c in coords):  # 无效坐标直接跳过
-                    print(f"[{ts}][MapRenderer] 无法获取地址 '{address}' 的有效坐标，跳过。")  # 输出警告
+                    log_event(logger, logging.WARNING, "无法获取有效坐标，已跳过行程项", {"天数": day_str, "景点": attraction, "地址": address})
                     continue  # 跳过该点
 
                 adjusted_coords = self._spread_overlapping_coords(coords, overlap_counter)  # 处理重合坐标
@@ -410,11 +391,6 @@ class TripMap:
                     tooltip=item.get("attraction", ""),  # 悬浮提示
                 )
                 marker.add_to(day_layer)  # 添加到当天图层
-                print(  # 输出添加日志
-                    f"[{ts}][MapRenderer] Marker added -> day={day_str}, idx={idx}, "
-                    f"lat={adjusted_coords[0]}, lon={adjusted_coords[1]}"
-                )
-
             if len(coords_list) >= 2:  # 至少两点才绘制路线
                 route_line = PolyLine(  # 创建当天路线
                     locations=coords_list,
@@ -431,10 +407,10 @@ class TripMap:
             try:
                 m.fit_bounds(all_coords, padding=(20, 20))  # 自适应视角
             except Exception as e:
-                print(f"[{ts}][MapRenderer] fit_bounds failed: {e}")  # 输出错误
+                log_event(logger, logging.WARNING, "地图视角自适应失败", {"原因": str(e)})
 
         folium.LayerControl().add_to(m)  # 添加图层控制器
-        logger.info("\n\n------------------!!渲染地图结束!!------------------\n\n")  # 记录结束
+        log_event(logger, logging.INFO, "地图渲染完成", {"总坐标数": len(all_coords)})
         return m  # 返回最终地图
 
     def render_map_batches(self, trip_data: Dict[str, Any], batch_size: int = 4) -> Iterable[Dict[str, Any]]:
@@ -448,11 +424,8 @@ class TripMap:
         Yields:
             按序输出 poi_batch 事件，包含当前 HTML 与是否完成标记。
         """
-        logger.info("\n\n------------------!!开始分批渲染地图!!------------------\n\n")  # 记录渲染开始
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # 当前时间戳
-        print(f"[{ts}][MapRenderer] render_map_batches input trip_data keys: {trip_data.keys()}")  # 输出输入结构
-
         dest = trip_data.get("destination", "成都")  # 读取目的地
+        log_event(logger, logging.INFO, "开始分批渲染地图", {"目的地": dest, "批大小": batch_size})
         # 解析目的地中心点作为地图初始视角
         center_coords = self._get_coordinates(dest)  # 解析中心坐标
         m = self._build_base_map(center_coords)  # 构建基础地图

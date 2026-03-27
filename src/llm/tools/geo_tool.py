@@ -1,6 +1,10 @@
 from typing import Dict, Any, Optional
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+import logging
+from src.observability import log_event
+
+logger = logging.getLogger(__name__)
 
 
 def geocode_address(
@@ -17,11 +21,9 @@ def geocode_address(
     for query in search_queries:
         for _ in range(2):
             try:
-                # 打印请求前的参数
-                print(f"\n [Geocode Request] query={query}")
+                log_event(logger, logging.INFO, "地理编码请求开始", {"查询": query})
                 location = geolocator.geocode(query, exactly_one=True)
-                # 打印请求后的返回结果
-                print(f"[Geocode Response] query={query}, location={location} \n")
+                log_event(logger, logging.INFO, "地理编码请求完成", {"查询": query, "命中": bool(location)})
                 if location:
                     return {
                         "address": address,
@@ -31,7 +33,6 @@ def geocode_address(
                         "query": query,
                     }
             except (GeocoderTimedOut, GeocoderServiceError, Exception) as e:
-                # 打印异常信息
-                print(f"[Geocode Error] query={query}, error={e} \n")
+                log_event(logger, logging.WARNING, "地理编码请求失败", {"查询": query, "原因": str(e)})
                 continue
     raise RuntimeError(f"geocode failed for address: {address}")

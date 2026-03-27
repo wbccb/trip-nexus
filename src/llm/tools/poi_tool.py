@@ -1,5 +1,9 @@
 from typing import Dict, Any, Optional
 from src.rag.network.multi_source_search import MultiSourceSearcher
+import logging
+from src.observability import log_event
+
+logger = logging.getLogger(__name__)
 
 
 def search_poi(
@@ -9,12 +13,12 @@ def search_poi(
     top_k: int = 5,
     defer_answer: bool = False,
 ) -> Dict[str, Any]:
-    print("\n 调用 search_poi 工具，查询：", query)
     search_query = f"{city} {query}".strip() if city else query
+    log_event(logger, logging.INFO, "POI 搜索开始", {"查询": search_query, "TopK": top_k, "延迟回答": defer_answer})
     
     # 兼容 AIRetrievalPipeline (RAG)
     if hasattr(searcher, 'run'):
-        print(f"【POI】使用 RAG Pipeline 进行搜索 (query={search_query})")
+        log_event(logger, logging.INFO, "POI 搜索走 RAG Pipeline", {"查询": search_query})
         # 构造默认意图，避免 Pipeline 内部重复识别
         # POI 搜索肯定是 travel 且需要搜索
         intent_info = {
@@ -34,15 +38,17 @@ def search_poi(
         # 日志已经在 rag_main.py 中打印
     else:
         # MultiSourceSearcher
-        print(f"【POI】使用 MultiSourceSearcher 进行搜索 (query={search_query})")
+        log_event(logger, logging.INFO, "POI 搜索走 MultiSourceSearcher", {"查询": search_query})
         intent_info = {"primary_intent": "travel", "needs_search": True}
         results = searcher.search(search_query, intent_info)
         evidence = None
         rag_answer = None
         
-    return {
+    result = {
         "query": search_query,
         "results": results[:max(1, int(top_k))],
         "evidence": evidence,
         "rag_answer": rag_answer
     }
+    log_event(logger, logging.INFO, "POI 搜索完成", {"查询": search_query, "结果数": len(result.get("results") or [])})
+    return result

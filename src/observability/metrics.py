@@ -22,7 +22,7 @@ class MetricsRecorder:
             "name": name,
             "payload": payload or {},
         }
-        logger.info(f"[Metrics] {name} {event.get('payload')}")
+        logger.debug("指标记录已写入 name=%s", name)
         # 加锁后追加事件
         with self._lock:
             self._events.append(event)

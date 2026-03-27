@@ -7,10 +7,10 @@ import {
 } from "../api/index.js";
 import {
   DEFAULT_DEVICE_ID,
-  DEFAULT_USER_ID,
   SESSION_STORAGE_KEY,
 } from "../constants/appConfig.js";
 import { normalizeTripDays } from "../utils/tripUtils.js";
+import { logDebug } from "../utils/debugLogger.js";
 
 function createEmptyConflictReport() {
   return {
@@ -103,7 +103,6 @@ export function useTrip({
         return;
       }
       const payload = {
-        user_id: DEFAULT_USER_ID,
         device_id: DEFAULT_DEVICE_ID,
         session_id: sessionOverride || activeSessionId,
         trip_data: nextTrip,
@@ -152,7 +151,6 @@ export function useTrip({
         .filter((item) => Number.isInteger(item) && item > 0 && item !== day)
         .sort((a, b) => a - b);
       const payload = {
-        user_id: DEFAULT_USER_ID,
         device_id: DEFAULT_DEVICE_ID,
         session_id: activeSessionId,
         day,
@@ -188,8 +186,6 @@ export function useTrip({
         setSelectedAlternative(null);
         // 组装请求参数
         const payload = {
-          // 用户 ID
-          user_id: DEFAULT_USER_ID,
           // 设备 ID
           device_id: DEFAULT_DEVICE_ID,
           // 会话 ID
@@ -212,6 +208,13 @@ export function useTrip({
           knowledge_scope: knowledgeScope || "private_plus_public",
           ...normalizeFlowConstraints(values),
         };
+        logDebug("行程", "开始提交主流程", {
+          destination: payload.destination,
+          days: payload.days,
+          knowledgeBaseId: payload.knowledge_base_id,
+          knowledgeScope: payload.knowledge_scope,
+          mode: payload.mode,
+        });
         // 解构流式回调
         const {
           // 流开始回调
@@ -233,6 +236,14 @@ export function useTrip({
           const eventType = event?.event || "";
           const deltaText = event?.content_delta || "";
           const step = event?.step || "";
+          if (eventType !== "delta" || step !== "generate") {
+            logDebug("行程", "收到主流程事件", {
+              eventType,
+              step,
+              sequence: event?.sequence,
+              status: event?.status,
+            });
+          }
           if (eventType === "start" && onStreamStart) {
             onStreamStart(event);
           }
@@ -278,6 +289,10 @@ export function useTrip({
         if (streamTripData) {
           // 更新行程结果
           setTripResult(streamTripData);
+          logDebug("行程", "主流程完成并产出行程", {
+            destination: streamTripData?.destination,
+            days: streamTripData?.days,
+          });
         }
         // 刷新会话列表
         if (refreshSessions) {
@@ -287,6 +302,10 @@ export function useTrip({
       } catch (error) {
         // 提示错误信息
         message.error(`行程生成失败：${error.message}`);
+        logDebug("行程", "主流程提交失败", {
+          __level: "error",
+          error: String(error?.message || error),
+        });
       } finally {
         // 重置加载状态
         setLoadingTrip(false);

@@ -11,7 +11,10 @@ from src.agent.event_bus import event_bus, snapshot_store
 from src.agent.agent_loop import PlannerAgent, run_agent_loop_sync, TripState
 from src.agent.plan_models import Plan, Task
 from src.llm.llm_manager import LlmManager
-from src.observability import ErrorCodes, normalize_exception
+from src.observability import ErrorCodes, normalize_exception, log_event
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class AgentUI:
@@ -175,14 +178,14 @@ class AgentUI:
         return f"{ts} 事件：{kind}"
 
     def _resolve_intent(self, query: str) -> Tuple[Optional[Dict[str, Any]], List[str], Optional[str], Optional[str]]:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 开始意图识别: {self._truncate_text(query)}")
+        log_event(logger, logging.INFO, "AgentUI 开始意图识别", {"查询": self._truncate_text(query)})
         intent_data = self.llm_manager.analyze_user_message(
             query=query,
             context=[],
             current_trip=None,
         )
         intent_type = intent_data.get("intent")
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 意图识别完成: {intent_type} \n")
+        log_event(logger, logging.INFO, "AgentUI 意图识别完成", {"意图": intent_type})
         trip_request = self.llm_manager.prepare_trip_request_from_intent(
             intent_data,
             context=[],
@@ -190,7 +193,7 @@ class AgentUI:
         if trip_request.get("needs_more_info"):
             missing_info = trip_request.get("missing_info") or []
             missing_text = "、".join([str(item) for item in missing_info if item])
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 信息缺失: {missing_text}")
+            log_event(logger, logging.INFO, "AgentUI 输入信息缺失", {"缺失信息": missing_text})
             return None, [], missing_text, intent_type
         return trip_request.get("user_input"), trip_request.get("context_texts") or [], None, intent_type
 
@@ -305,7 +308,6 @@ class AgentUI:
         return user_input, context_texts, None, intent_type
 
     def render_debug_panel(self) -> None:
-        print(f"[AgentUI] render_debug_panel rerun_ts={datetime.now().strftime('%H:%M:%S')}")
         st.subheader("Agent 调试")
         thread_id = self.ensure_thread_id()
         st.text_input("Thread ID", value=thread_id, key="agent_thread_display", disabled=True)
@@ -379,11 +381,9 @@ class AgentUI:
             if error_text:
                 st.error(error_text)
                 return
-            print(f"\n\n[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 用户点击生成计划，开始处理...")
             user_intent = user_intent or "generate_trip"
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 确认用户意图: {user_intent}")
+            log_event(logger, logging.INFO, "AgentUI 开始生成并执行计划", {"意图": user_intent})
             tool_whitelist = [schema.get("name") for schema in self.llm_manager.list_tools()]
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 调用 PlannerAgent 生成计划...调用 LLM 生成 DAG 任务图")
             plan = self._planner_agent.plan(
                 user_intent=user_intent,
                 user_input=user_input,
@@ -392,14 +392,13 @@ class AgentUI:
                 force_sop=True,
             )
             tools = [t.tool for t in plan.tasks if t.type == "tool_call" and t.tool]
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] plan生成完成，工具序列: {', '.join(tools)} \n\n")
+            log_event(logger, logging.INFO, "AgentUI 计划生成完成", {"工具序列": tools})
             st.session_state.agent_plan_preview = plan.model_dump()
             st.session_state.agent_user_input_resolved = user_input
             st.session_state.agent_context_texts = context_texts
             st.session_state.agent_plan_intent = user_intent
             st.session_state.agent_plan_confirmed = False
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] 开始执行计划！")
             plan_payload = st.session_state.get("agent_plan_preview")
             if not plan_payload:
                 st.warning("请先生成计划")
@@ -422,7 +421,7 @@ class AgentUI:
                 )
                 st.session_state.agent_last_state = state.model_dump()
                 st.session_state.agent_plan_confirmed = True
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [AgentUI] Agent 执行结束，status={state.status}")
+                log_event(logger, logging.INFO, "AgentUI 执行完成", {"状态": state.status})
                 if getattr(state, "status", "") == "paused":
                     st.rerun()
             except Exception as error:
@@ -562,7 +561,7 @@ class AgentUI:
             try:
                 last_state_obj = TripState(**last_state_raw)
             except Exception as e:
-                print(f"[AgentUI] Failed to restore TripState: {e}")
+                log_event(logger, logging.WARNING, "恢复 TripState 失败", {"原因": str(e)})
         plan = last_state.get("plan") if isinstance(last_state, dict) else None
         if plan:
             status_map, activity_map, node_order = self._build_task_status_from_plan(
@@ -728,7 +727,6 @@ class AgentUI:
                     evidence_view = dict(evidence)
                     if query:
                         evidence_view["_query"] = query
-                    #print(f"[AgentUI] 渲染 Evidence 面板 task={task_id} keys={list(evidence_view.keys())}")
                     # 渲染交互面板 (状态保存在 session_state.rag_evidence_ui)
                     self._render_rag_evidence_panel(evidence_view, f"review_{task_id}")
 

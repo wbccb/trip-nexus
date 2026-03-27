@@ -3,19 +3,22 @@ import { message } from "antd";
 import { deleteSession, listSessions, startSession } from "../api/index.js";
 import {
   DEFAULT_DEVICE_ID,
-  DEFAULT_USER_ID,
   SESSION_STORAGE_KEY,
 } from "../constants/appConfig.js";
 
-export function useSessions() {
+export function useSessions({ isAuthenticated }) {
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [loadingSessions, setLoadingSessions] = useState(false);
 
   const loadSessions = useCallback(async () => {
+    if (!isAuthenticated) {
+      setSessions([]);
+      return;
+    }
     try {
       setLoadingSessions(true);
-      const data = await listSessions(DEFAULT_USER_ID);
+      const data = await listSessions();
       setSessions(Array.isArray(data) ? data : []);
     } catch (error) {
       message.error(`会话列表加载失败：${error.message}`);
@@ -25,8 +28,11 @@ export function useSessions() {
   }, []);
 
   const startNewSession = useCallback(async () => {
+    if (!isAuthenticated) {
+      return;
+    }
     try {
-      const data = await startSession(DEFAULT_USER_ID, DEFAULT_DEVICE_ID);
+      const data = await startSession(DEFAULT_DEVICE_ID);
       if (data?.session_id) {
         localStorage.setItem(SESSION_STORAGE_KEY, data.session_id);
         setActiveSessionId(data.session_id);
@@ -44,7 +50,7 @@ export function useSessions() {
       }
       try {
         await deleteSession(sessionId);
-        const data = await listSessions(DEFAULT_USER_ID);
+        const data = await listSessions();
         const nextSessions = Array.isArray(data) ? data : [];
         setSessions(nextSessions);
         if (sessionId === activeSessionId) {
@@ -83,9 +89,14 @@ export function useSessions() {
   }, []);
 
   useEffect(() => {
+    if (!isAuthenticated) {
+      setSessions([]);
+      setActiveSessionId(null);
+      return;
+    }
     loadSessions();
     ensureSession();
-  }, [loadSessions, ensureSession]);
+  }, [ensureSession, isAuthenticated, loadSessions]);
 
   return {
     activeSessionId,

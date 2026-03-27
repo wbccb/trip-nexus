@@ -5,11 +5,14 @@ import datetime
 import time
 from typing import Optional, Dict, List
 from pydantic import ValidationError
+import logging
 from src.frontend.context.entity import SessionContext, CoreEntity
 from src.config import Config
-from src.utils.console import console_log
 from .base_storage import BaseConversationStorage
 from .date_time_encoder import DateTimeEncoder
+from src.observability import log_event
+
+logger = logging.getLogger(__name__)
 
 
 class TestConversationStorage(BaseConversationStorage):
@@ -116,8 +119,6 @@ class TestConversationStorage(BaseConversationStorage):
         data = self._redis_get(key)
         if not data:
             return []
-        console_log("get_short_term_context:"+data)
-        console_log(data)
 
         parsed_data = json.loads(data)
         if isinstance(parsed_data, dict):
@@ -194,7 +195,7 @@ class TestConversationStorage(BaseConversationStorage):
                     
                     return entity
                 except Exception as e:
-                    print(f"核心实体数据损坏且修复失败: {e}")
+                    log_event(logger, logging.ERROR, "测试存储核心实体修复失败", {"原因": str(e)})
                     return None
 
         return None
@@ -282,7 +283,7 @@ class TestConversationStorage(BaseConversationStorage):
                 self._redis_setex(key, datetime.timedelta(hours=2), result[0])
                 return trip_data
             except Exception as e:
-                print(f"解析行程数据失败: {e}")
+                log_event(logger, logging.ERROR, "测试存储解析行程数据失败", {"原因": str(e), "session_id": session_id})
                 return None
         return None
 
