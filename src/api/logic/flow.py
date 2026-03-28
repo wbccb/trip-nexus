@@ -527,17 +527,14 @@ def _detect_agent_escalation(
     intent: str,
     user_input: Dict[str, Any],
     knowledge_query: Optional[str],
-    tool_result: Dict[str, Any],
 ) -> Dict[str, Any]:
     reasons: List[str] = []
     if flow_mode == "deep":
         reasons.append("mode_deep_requested")
     if intent == "generate_trip" and int(user_input.get("days") or 0) > 7:
         reasons.append("long_duration_trip")
-    if knowledge_query and len(str(knowledge_query)) > 20:
+    if knowledge_query and len(str(knowledge_query)) > 50:
         reasons.append("complex_knowledge_query")
-    if tool_result.get("needs_tool"):
-        reasons.append("tool_usage_required")
     return {
         "agent_escalated": len(reasons) > 0,
         "reasons": reasons,
@@ -571,6 +568,44 @@ def _merge_context_with_budget(context_texts: List[str]) -> List[str]:
         results.append(t)
         total_chars += len(t)
     return results
+
+
+def _normalize_agent_interrupt_payload(interrupt_payload: Any) -> Dict[str, Any]:
+    """将 Agent 中断载荷归一化为字典，便于主流程统一提取失败原因。"""
+    payload = interrupt_payload
+    if isinstance(payload, list) and payload:
+        payload = payload[0]
+    if hasattr(payload, "value"):
+        payload = getattr(payload, "value")
+    if hasattr(payload, "model_dump") and callable(getattr(payload, "model_dump")):
+        payload = payload.model_dump()
+    return payload if isinstance(payload, dict) else {}
+
+
+def _build_agent_pause_response(final_state: Any) -> str:
+    """在 Agent 被中断且没有产出 draft_trip 时，构造可直接展示给前端的原因说明。"""
+    if final_state is None:
+        return ""
+    stop_reason = str(getattr(final_state, "stop_reason", "") or "").strip().lower()
+    final_payload = getattr(final_state, "final_payload", {}) or {}
+    interrupt_payload = _normalize_agent_interrupt_payload(final_payload.get("interrupt"))
+    interrupt_reason = str(interrupt_payload.get("reason") or stop_reason or "").strip().lower()
+    if interrupt_reason == "tool_failed":
+        tool_name = str(interrupt_payload.get("tool") or "unknown").strip()
+        result_payload = interrupt_payload.get("result") if isinstance(interrupt_payload, dict) else {}
+        error_payload = result_payload.get("error") if isinstance(result_payload, dict) else {}
+        error_message = str(
+            (error_payload or {}).get("message")
+            or (error_payload or {}).get("code")
+            or ""
+        ).strip()
+        detail_text = f"：{error_message}" if error_message else ""
+        return f"深度规划在工具 {tool_name} 阶段失败，流程已暂停{detail_text}，本次未生成可展示行程。"
+    if stop_reason == "rag_review":
+        return "深度规划已暂停，等待人工复核检索证据，本次未生成可展示行程。"
+    if stop_reason in {"human_intervention", "paused"}:
+        return "深度规划已暂停等待人工处理，本次未生成可展示行程。"
+    return ""
 
 
 async def _run_flow_stream(
@@ -611,6 +646,8 @@ async def _run_flow_stream(
     merged_context_texts = list(payload.context_texts or [])
     response_text = ""
     source_evidence: List[Dict[str, Any]] = []
+    kb_context_texts: List[str] = []
+    kb_context_docs: List[Dict[str, Any]] = []
     constraints_satisfied: List[Dict[str, Any]] = []
     conflict_report = ConflictReport().model_dump()
     allow_public_fusion = str(payload.knowledge_scope or "private_plus_public").strip().lower() != "private_only"
@@ -660,77 +697,7 @@ async def _run_flow_stream(
             },
         )
 
-        last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "tool")
-        tool_query = llm_manager._build_tool_query(user_input=user_input, query=flow_query)
-        tool_result: Dict[str, Any] = {"needs_tool": False}
-        if tool_query and allow_public_fusion:
-            tool_result = llm_manager.call_tool_by_llm(tool_query, context_messages)
-            if tool_result.get("needs_tool"):
-                metrics["tool_count"] = 1
-                result_payload = tool_result.get("result")
-                if isinstance(result_payload, dict) and result_payload.get("success"):
-                    merged_context_texts.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
-        
-        kb_context_texts, kb_context_docs = _build_knowledge_context_payload(
-            payload.knowledge_base_id,
-            payload.destination,
-            payload.days,
-            payload.budget,
-            payload.preference,
-            payload.knowledge_query,
-        )
-        merged_context_texts.extend(kb_context_texts)
-        if kb_context_texts:
-            metrics["rag_hit"] = True
-            source_evidence = _build_source_evidence_from_docs(kb_context_docs)
-        
-        merged_context_texts = _merge_context_with_budget(merged_context_texts)
-        metrics["context_count"] = len(merged_context_texts)
-        metrics["context_chars"] = sum([len(item) for item in merged_context_texts])
-        metrics["context_budget"] = {
-            "max_items": _FLOW_CONTEXT_MAX_ITEMS,
-            "item_max_chars": _FLOW_CONTEXT_ITEM_MAX_CHARS,
-            "total_max_chars": _FLOW_CONTEXT_TOTAL_MAX_CHARS,
-        }
-
-        last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "route")
-        escalation = _detect_agent_escalation(flow_mode, intent, user_input, payload.knowledge_query, tool_result)
-        metrics["agent_escalated"] = bool(escalation.get("agent_escalated"))
-        escalation_reasons = list(escalation.get("reasons") or [])
-
-        if metrics["agent_escalated"]:
-            last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "agent")
-            last_sequence += 1
-            await _append_flow_event(
-                message_id,
-                {
-                    "event": "delta",
-                    "sequence": last_sequence,
-                    "message_id": message_id,
-                    "session_id": session_id,
-                    "step": "agent",
-                    "status": "running",
-                    "mode": flow_mode,
-                    "content_delta": "进入深度规划流程",
-                    "is_final": False,
-                    "payload": {"reasons": escalation_reasons},
-                },
-            )
-            thread_id = _build_agent_thread_id(user_id, payload.device_id)
-            final_state = run_agent_loop_sync(
-                llm_manager=llm_manager,
-                user_input=user_input,
-                thread_id=thread_id,
-                agent_config={"mode": flow_mode},
-                user_intent="generate_trip",
-                context=merged_context_texts,
-                resume=False,
-            )
-            if final_state and isinstance(final_state.final_payload, dict):
-                draft_trip = final_state.final_payload.get("draft_trip")
-                if isinstance(draft_trip, dict) and draft_trip:
-                    trip_data = draft_trip
-        elif intent == "general_conversation":
+        if intent == "general_conversation":
             response_chunks: List[str] = []
             stream = llm_manager.stream_chat_response(flow_query, context_messages, current_trip)
             for delta_text in stream:
@@ -780,37 +747,134 @@ async def _run_flow_stream(
                     },
                 )
         else:
-            response_chunks: List[str] = []
-            stream = llm_manager.stream_trip_generation(user_input, merged_context_texts)
-            for event in llm_manager.build_stream_events_from_stream(stream, message_id):
-                last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "generate")
-                raw_event = str(event.get("event") or "")
-                if raw_event not in {"start", "delta", "end"}:
-                    continue
-                if raw_event == "end":
-                    continue
-                delta_text = event.get("content_delta") or ""
-                if raw_event == "delta":
-                    response_chunks.append(delta_text)
+            last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "route")
+            escalation = _detect_agent_escalation(flow_mode, intent, user_input, payload.knowledge_query)
+            metrics["agent_escalated"] = bool(escalation.get("agent_escalated"))
+            escalation_reasons = list(escalation.get("reasons") or [])
+
+            if metrics["agent_escalated"]:
+                kb_context_texts, kb_context_docs = _build_knowledge_context_payload(
+                    payload.knowledge_base_id,
+                    payload.destination,
+                    payload.days,
+                    payload.budget,
+                    payload.preference,
+                    payload.knowledge_query,
+                )
+                merged_context_texts.extend(kb_context_texts)
+                if kb_context_texts:
+                    metrics["rag_hit"] = True
+                    source_evidence = _build_source_evidence_from_docs(kb_context_docs)
+                merged_context_texts = _merge_context_with_budget(merged_context_texts)
+                metrics["context_count"] = len(merged_context_texts)
+                metrics["context_chars"] = sum([len(item) for item in merged_context_texts])
+                metrics["context_budget"] = {
+                    "max_items": _FLOW_CONTEXT_MAX_ITEMS,
+                    "item_max_chars": _FLOW_CONTEXT_ITEM_MAX_CHARS,
+                    "total_max_chars": _FLOW_CONTEXT_TOTAL_MAX_CHARS,
+                }
+                last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "agent")
                 last_sequence += 1
                 await _append_flow_event(
                     message_id,
                     {
-                        "event": raw_event,
+                        "event": "delta",
                         "sequence": last_sequence,
                         "message_id": message_id,
                         "session_id": session_id,
-                        "step": "generate",
+                        "step": "agent",
                         "status": "running",
                         "mode": flow_mode,
-                        "content_delta": delta_text,
+                        "content_delta": "进入深度规划流程",
                         "is_final": False,
-                        "payload": {},
+                        "payload": {"reasons": escalation_reasons},
                     },
                 )
-                await asyncio.sleep(0)
-            response_text = "".join(response_chunks)
-            trip_data = llm_manager.parse_trip_from_response_text(response_text)
+                thread_id = _build_agent_thread_id(user_id, payload.device_id)
+                final_state = run_agent_loop_sync(
+                    llm_manager=llm_manager,
+                    user_input=user_input,
+                    thread_id=thread_id,
+                    agent_config={"mode": flow_mode},
+                    user_intent="generate_trip",
+                    context=merged_context_texts,
+                    resume=False,
+                )
+                if final_state and isinstance(final_state.final_payload, dict):
+                    draft_trip = final_state.final_payload.get("draft_trip")
+                    if isinstance(draft_trip, dict) and draft_trip:
+                        trip_data = draft_trip
+                    else:
+                        response_text = _build_agent_pause_response(final_state)
+                        if response_text:
+                            logger.warning(
+                                "Agent未产出行程草案 message_id=%s session_id=%s response=%s",
+                                message_id,
+                                session_id,
+                                response_text,
+                            )
+            else:
+                last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "tool")
+                tool_query = llm_manager._build_tool_query(user_input=user_input, query=flow_query)
+                tool_result: Dict[str, Any] = {"needs_tool": False}
+                if tool_query and allow_public_fusion:
+                    tool_result = llm_manager.call_tool_by_llm(tool_query, context_messages)
+                    if tool_result.get("needs_tool"):
+                        metrics["tool_count"] = 1
+                        result_payload = tool_result.get("result")
+                        if isinstance(result_payload, dict) and result_payload.get("success"):
+                            merged_context_texts.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
+                kb_context_texts, kb_context_docs = _build_knowledge_context_payload(
+                    payload.knowledge_base_id,
+                    payload.destination,
+                    payload.days,
+                    payload.budget,
+                    payload.preference,
+                    payload.knowledge_query,
+                )
+                merged_context_texts.extend(kb_context_texts)
+                if kb_context_texts:
+                    metrics["rag_hit"] = True
+                    source_evidence = _build_source_evidence_from_docs(kb_context_docs)
+                merged_context_texts = _merge_context_with_budget(merged_context_texts)
+                metrics["context_count"] = len(merged_context_texts)
+                metrics["context_chars"] = sum([len(item) for item in merged_context_texts])
+                metrics["context_budget"] = {
+                    "max_items": _FLOW_CONTEXT_MAX_ITEMS,
+                    "item_max_chars": _FLOW_CONTEXT_ITEM_MAX_CHARS,
+                    "total_max_chars": _FLOW_CONTEXT_TOTAL_MAX_CHARS,
+                }
+                response_chunks: List[str] = []
+                stream = llm_manager.stream_trip_generation(user_input, merged_context_texts)
+                for event in llm_manager.build_stream_events_from_stream(stream, message_id):
+                    last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "generate")
+                    raw_event = str(event.get("event") or "")
+                    if raw_event not in {"start", "delta", "end"}:
+                        continue
+                    if raw_event == "end":
+                        continue
+                    delta_text = event.get("content_delta") or ""
+                    if raw_event == "delta":
+                        response_chunks.append(delta_text)
+                    last_sequence += 1
+                    await _append_flow_event(
+                        message_id,
+                        {
+                            "event": raw_event,
+                            "sequence": last_sequence,
+                            "message_id": message_id,
+                            "session_id": session_id,
+                            "step": "generate",
+                            "status": "running",
+                            "mode": flow_mode,
+                            "content_delta": delta_text,
+                            "is_final": False,
+                            "payload": {},
+                        },
+                    )
+                    await asyncio.sleep(0)
+                response_text = "".join(response_chunks)
+                trip_data = llm_manager.parse_trip_from_response_text(response_text)
 
         if trip_data:
             if isinstance(trip_data, dict):

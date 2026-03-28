@@ -23,8 +23,6 @@ from src.observability import (
     BudgetManager,
     ConstraintChecker,
     log_event,
-    log_llm_end,
-    log_llm_start,
     summarize_value,
 )
 from src.config import Config  # 读取全局配置预算
@@ -45,7 +43,7 @@ def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
 
 
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
-    log_event(logger, logging.INFO, f"Agent LLM 输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
+    log_event(logger, logging.DEBUG, f"Agent LLM 输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
 
 
 class AgentGraphState(TypedDict):
@@ -213,26 +211,29 @@ SOP 模板: {json.dumps(sop_templates, ensure_ascii=False)}
         sop_templates = [{"name": "default_trip", "tasks": [task.model_dump() for task in sop_plan.tasks]}]
         # 构建 prompt
         prompt = self._build_plan_prompt(user_intent, user_input, tool_registry, sop_templates, error_context=error_context)
-        started_at = log_llm_start(
-            logger,
-            stage="Agent 任务规划",
-            model=str(getattr(self._llm_manager.get_analysis_llm(), "model", getattr(self._llm_manager.get_analysis_llm(), "model_name", "未知模型"))),
-            prompt=prompt,
-            extra={"用户意图": user_intent, "工具数": len(tool_registry)},
-        )
+        # Agent 任务规划阶段只保留完成态摘要，避免把提示词与原始模型输出刷到主终端。
+        started_at = datetime.now()
         raw_response = self._llm_manager.get_analysis_llm().invoke(prompt)
         
         response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
         cleaned_response_text = _strip_think_content(response_text)
         _log_llm_output("plan_response", cleaned_response_text)
-        
-        log_llm_end(logger, stage="Agent 任务规划", started_at=started_at, output=cleaned_response_text)
 
         plan = self._parse_plan_response(str(cleaned_response_text))
         plan.validate_plan(tool_whitelist=set(tool_whitelist))
 
         tools = [t.tool for t in plan.tasks if t.type == "tool_call"]
-        log_event(logger, logging.INFO, "任务规划完成", {"工具序列": tools, "任务数": len(plan.tasks)})
+        log_event(
+            logger,
+            logging.INFO,
+            "Agent 任务规划完成",
+            {
+                "成功": True,
+                "任务数": len(plan.tasks),
+                "工具序列": tools,
+                "耗时秒": (datetime.now() - started_at).total_seconds(),
+            },
+        )
         return plan
 
 
@@ -295,6 +296,41 @@ def _deserialize_shared_context(payload: Any) -> SharedContext:
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     revisions = payload.get("revisions") if isinstance(payload.get("revisions"), list) else []
     return SharedContext(data=data, revisions=revisions)
+
+
+def _normalize_prefilled_context(prefilled_context: Optional[Dict[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(prefilled_context, dict):
+        return {}
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for task_id, bucket in prefilled_context.items():
+        task_key = str(task_id or "").strip()
+        if not task_key or not isinstance(bucket, dict):
+            continue
+        normalized_bucket: Dict[str, Any] = {}
+        for output_key, value in bucket.items():
+            normalized_key = str(output_key or "").strip()
+            if normalized_key:
+                normalized_bucket[normalized_key] = value
+        if normalized_bucket:
+            normalized[task_key] = normalized_bucket
+    return normalized
+
+
+def _build_prefilled_state(
+    prefilled_context: Optional[Dict[str, Dict[str, Any]]],
+) -> Tuple[SharedContext, List[str], Dict[str, Any], Dict[str, str]]:
+    shared_context = SharedContext()
+    completed_tasks: List[str] = []
+    task_results: Dict[str, Any] = {}
+    task_summaries: Dict[str, str] = {}
+    normalized_prefilled = _normalize_prefilled_context(prefilled_context)
+    for task_id, bucket in normalized_prefilled.items():
+        for output_key, value in bucket.items():
+            shared_context.write(task_id, output_key, value)
+        completed_tasks.append(task_id)
+        task_results[task_id] = {"success": True, "data": bucket, "prefilled": True}
+        task_summaries[task_id] = f"{task_id}:prefilled:success"
+    return shared_context, completed_tasks, task_results, task_summaries
 
 
 def _serialize_plan_items(tasks: List[Task]) -> List[Dict[str, Any]]:
@@ -638,6 +674,7 @@ class AgentExecutor:
         retry_limit: int = 1,
         max_replan_depth: int = 2,
         initial_state: Optional[TripState] = None,
+        prefilled_context: Optional[Dict[str, Dict[str, Any]]] = None,
         resume: bool = False,
     ) -> TripState:
         return await asyncio.to_thread(
@@ -652,6 +689,7 @@ class AgentExecutor:
             retry_limit,
             max_replan_depth,
             initial_state,
+            prefilled_context,
             resume,
         )
 
@@ -664,11 +702,13 @@ def _build_initial_graph_state(
     plan_override: Optional[Plan],
     retry_limit: int,
     max_replan_depth: int,
+    prefilled_context: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> AgentGraphState:
     plan_items = _serialize_plan_items(plan_override.tasks) if plan_override else []
     merged_config = dict(agent_config or {})
     merged_config["retry_limit"] = int(retry_limit)
     merged_config["max_replan_depth"] = int(max_replan_depth)
+    shared_context, completed_tasks, task_results, task_summaries = _build_prefilled_state(prefilled_context)
     return {
         "user_intent": user_intent or "",
         "user_input": user_input or {},
@@ -677,12 +717,12 @@ def _build_initial_graph_state(
         "plan": plan_items,
         "plan_history": [],
         "execution_queue": [],
-        "completed_tasks": [],
+        "completed_tasks": completed_tasks,
         "failed_tasks": [],
         "pending_count": 0,
-        "task_summaries": {},
-        "shared_context": _serialize_shared_context(SharedContext()),
-        "task_results": {},
+        "task_summaries": task_summaries,
+        "shared_context": _serialize_shared_context(shared_context),
+        "task_results": task_results,
         "context_revisions": [],
         "final_payload": {},
         "status": "running",
@@ -1016,6 +1056,7 @@ def run_agent_loop_sync(
     retry_limit: int = 1,
     max_replan_depth: int = 2,
     initial_state: Optional[TripState] = None,
+    prefilled_context: Optional[Dict[str, Dict[str, Any]]] = None,
     resume: bool = False,
 ) -> TripState:
     logger.info(
@@ -1048,6 +1089,7 @@ def run_agent_loop_sync(
                     plan_override=plan_override,
                     retry_limit=retry_limit,
                     max_replan_depth=max_replan_depth,
+                    prefilled_context=prefilled_context,
                 ),
                 config=config,
             )
@@ -1061,6 +1103,7 @@ def run_agent_loop_sync(
                 plan_override=plan_override,
                 retry_limit=retry_limit,
                 max_replan_depth=max_replan_depth,
+                prefilled_context=prefilled_context,
             ),
             config=config,
         )

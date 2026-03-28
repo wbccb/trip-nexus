@@ -115,7 +115,7 @@ class MultiSourceSearcher:
                     if len(results) >= 5:
                         break
             
-            logger.info(f"DuckDuckGo fallback 拿到 {len(results)} results")
+            logger.debug(f"DuckDuckGo fallback 拿到 {len(results)} results")
             # 记录 fallback 成功指标
             self._metrics.record("search_fallback_success", {"engine": "duckduckgo_html", "results": len(results)})
             return results
@@ -183,7 +183,7 @@ class MultiSourceSearcher:
         filtered_urls = [u for u in candidate_urls if self._circuit_breaker.allow(u)]
         # 若全部熔断则直接进入 fallback
         if not filtered_urls:
-            logger.error("All SearXNG instances are circuit-open. Trying DuckDuckGo fallback...")
+            logger.debug("All SearXNG instances are circuit-open. Trying DuckDuckGo fallback...")
             return self._search_duckduckgo_fallback(params.get("q") or "")
         # 限制并发数量
         concurrency = max(1, int(self.config.SEARCH_INSTANCE_CONCURRENCY))
@@ -198,7 +198,7 @@ class MultiSourceSearcher:
                 base_url = future_to_url[future]
                 # 检查全局超时
                 if (time.time() - start_ts) > self.config.SEARCH_GLOBAL_TIMEOUT_SECONDS:
-                    logger.warning("SearXNG global timeout reached, aborting remaining instances")
+                    logger.debug("SearXNG global timeout reached, aborting remaining instances")
                     self._metrics.record("search_timeout", {"scope": "global"})
                     break
                 try:
@@ -207,11 +207,11 @@ class MultiSourceSearcher:
                     if results:
                         return results
                 except Exception as e:
-                    logger.warning(f"SearXNG instance failed: {base_url}, error={e}")
+                    logger.debug(f"SearXNG instance failed: {base_url}, error={e}")
                     self._circuit_breaker.record_failure(base_url)
                     self._metrics.record("search_instance_failed", {"base_url": base_url, "error": str(e)})
                     continue
-        logger.error("All SearXNG instances failed. Trying DuckDuckGo fallback...")
+        logger.debug("All SearXNG instances failed. Trying DuckDuckGo fallback...")
         return self._search_duckduckgo_fallback(params.get("q") or "")
 
     def _fetch_searxng(
@@ -226,7 +226,7 @@ class MultiSourceSearcher:
         else:
             url = base_url
         # 记录实例尝试日志
-        logger.info(f"Trying SearXNG instance: {base_url}")
+        logger.debug(f"Trying SearXNG instance: {base_url}")
         # 发起请求，使用实例超时配置
         response = requests.get(
             url,
@@ -236,20 +236,20 @@ class MultiSourceSearcher:
         )
         # 非 200 直接返回失败
         if response.status_code != 200:
-            logger.warning(f"SearXNG {base_url} returned status {response.status_code}")
+            logger.debug(f"SearXNG {base_url} returned status {response.status_code}")
             self._circuit_breaker.record_failure(base_url)
             self._metrics.record("search_instance_failed", {"base_url": base_url, "status": response.status_code})
             return []
         try:
             data = response.json()
         except ValueError as e:
-            logger.warning(f"SearXNG {base_url} returned invalid JSON")
+            logger.debug(f"SearXNG {base_url} returned invalid JSON")
             self._circuit_breaker.record_failure(base_url)
             self._metrics.record("search_instance_failed", {"base_url": base_url, "error": "invalid_json"})
             return []
         search_results = data.get("results", [])
         if not search_results:
-            logger.warning(f"No results from {base_url}, trying next...")
+            logger.debug(f"No results from {base_url}, trying next...")
             self._circuit_breaker.record_failure(base_url)
             self._metrics.record("search_instance_failed", {"base_url": base_url, "error": "empty_results"})
             return []
@@ -267,5 +267,5 @@ class MultiSourceSearcher:
         # 记录实例成功指标
         self._circuit_breaker.record_success(base_url)
         self._metrics.record("search_instance_success", {"base_url": base_url, "results": len(processed_results)})
-        logger.info(f"Successfully retrieved {len(processed_results)} results from {base_url}")
+        logger.debug(f"Successfully retrieved {len(processed_results)} results from {base_url}")
         return processed_results

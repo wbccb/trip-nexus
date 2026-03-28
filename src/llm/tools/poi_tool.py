@@ -13,12 +13,14 @@ def search_poi(
     top_k: int = 5,
     defer_answer: bool = False,
 ) -> Dict[str, Any]:
+    """执行 POI 搜索，并把详细检索日志下沉到 DEBUG，避免主终端刷屏。"""
     search_query = f"{city} {query}".strip() if city else query
-    log_event(logger, logging.INFO, "POI 搜索开始", {"查询": search_query, "TopK": top_k, "延迟回答": defer_answer})
+    # 主终端只保留上层“工具路由执行完成”摘要，这里的细节切到 DEBUG。
+    log_event(logger, logging.DEBUG, "POI 搜索开始", {"查询": search_query, "TopK": top_k, "延迟回答": defer_answer})
     
     # 兼容 AIRetrievalPipeline (RAG)
     if hasattr(searcher, 'run'):
-        log_event(logger, logging.INFO, "POI 搜索走 RAG Pipeline", {"查询": search_query})
+        log_event(logger, logging.DEBUG, "POI 搜索走 RAG Pipeline", {"查询": search_query})
         # 构造默认意图，避免 Pipeline 内部重复识别
         # POI 搜索肯定是 travel 且需要搜索
         intent_info = {
@@ -38,7 +40,7 @@ def search_poi(
         # 日志已经在 rag_main.py 中打印
     else:
         # MultiSourceSearcher
-        log_event(logger, logging.INFO, "POI 搜索走 MultiSourceSearcher", {"查询": search_query})
+        log_event(logger, logging.DEBUG, "POI 搜索走 MultiSourceSearcher", {"查询": search_query})
         intent_info = {"primary_intent": "travel", "needs_search": True}
         results = searcher.search(search_query, intent_info)
         evidence = None
@@ -50,5 +52,5 @@ def search_poi(
         "evidence": evidence,
         "rag_answer": rag_answer
     }
-    log_event(logger, logging.INFO, "POI 搜索完成", {"查询": search_query, "结果数": len(result.get("results") or [])})
+    log_event(logger, logging.DEBUG, "POI 搜索完成", {"查询": search_query, "结果数": len(result.get("results") or [])})
     return result

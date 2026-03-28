@@ -29,7 +29,7 @@ def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
 
 
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
-    log_event(logger, logging.INFO, f"RAG LLM 输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
+    log_event(logger, logging.DEBUG, f"RAG LLM 输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
 
 class AIRetrievalPipeline:
     def __init__(self, llm):
@@ -186,7 +186,7 @@ class AIRetrievalPipeline:
         max_item_chars = self.config.EVIDENCE_SUMMARY_ITEM_MAX_CHARS
         top_k = self.config.EVIDENCE_SUMMARY_TOP_K
         
-        log_event(logger, logging.INFO, "开始构建摘要证据", {"预算字符": budget, "单条上限": max_item_chars, "TopK": top_k})
+        log_event(logger, logging.DEBUG, "开始构建摘要证据", {"预算字符": budget, "单条上限": max_item_chars, "TopK": top_k})
         
         summary_items = []
         summary_candidates = []
@@ -233,7 +233,7 @@ class AIRetrievalPipeline:
             })
             used += len(combined)
             
-        log_event(logger, logging.INFO, "摘要证据构建完成", {"摘要条数": len(summary_items), "候选条数": len(summary_candidates), "已用字符": f"{used}/{budget}", "去重跳过": skipped_dup, "预算跳过": skipped_budget})
+        log_event(logger, logging.DEBUG, "摘要证据构建完成", {"摘要条数": len(summary_items), "候选条数": len(summary_candidates), "已用字符": f"{used}/{budget}", "去重跳过": skipped_dup, "预算跳过": skipped_budget})
         return {
             "items": summary_items,
             "candidates": summary_candidates,
@@ -257,7 +257,7 @@ class AIRetrievalPipeline:
         max_chunk_chars = self.config.EVIDENCE_CHUNK_MAX_CHARS
         min_chunk_chars = self.config.EVIDENCE_CHUNK_MIN_CHARS
         
-        log_event(logger, logging.INFO, "开始构建正文证据", {"预算字符": budget, "TopN": top_n, "最小分块": min_chunk_chars, "最大分块": max_chunk_chars})
+        log_event(logger, logging.DEBUG, "开始构建正文证据", {"预算字符": budget, "TopN": top_n, "最小分块": min_chunk_chars, "最大分块": max_chunk_chars})
         
         used = 0
         skipped_short = 0
@@ -287,7 +287,7 @@ class AIRetrievalPipeline:
                 "timestamp": timestamp,
             })
             
-        log_event(logger, logging.INFO, "正文候选构建完成", {"候选条数": len(candidates), "过短跳过": skipped_short, "重复跳过": skipped_dup})
+        log_event(logger, logging.DEBUG, "正文候选构建完成", {"候选条数": len(candidates), "过短跳过": skipped_short, "重复跳过": skipped_dup})
         
         for cand in candidates:
             if len(selected) >= top_n:
@@ -318,7 +318,7 @@ class AIRetrievalPipeline:
             })
             used += len(content)
             
-        log_event(logger, logging.INFO, "正文证据筛选完成", {"入选条数": len(selected), "已用字符": f"{used}/{budget}", "截断次数": truncated_cnt})
+        log_event(logger, logging.DEBUG, "正文证据筛选完成", {"入选条数": len(selected), "已用字符": f"{used}/{budget}", "截断次数": truncated_cnt})
         
         return {
             "items": selected,
@@ -342,7 +342,8 @@ class AIRetrievalPipeline:
         执行完整的AI检索流程
         """
         start_time = time.time()
-        log_event(logger, logging.INFO, "RAG 检索开始", {"查询": query})
+        # RAG 内部阶段切到 DEBUG，只保留关键完成态摘要给主终端。
+        log_event(logger, logging.DEBUG, "RAG 检索开始", {"查询": query})
         
         # 清除旧的向量存储上下文
         self.vector_store.clear()
@@ -350,13 +351,13 @@ class AIRetrievalPipeline:
         # 1. 意图识别 (如果外部未传入，则进行识别)
         if not intent_info:
             intent_info = self.intent_recognizer.classify_intent(query)
-            log_event(logger, logging.INFO, "RAG 意图识别完成", {"主意图": intent_info.get("primary_intent"), "需要检索": intent_info.get("needs_search", True)})
+            log_event(logger, logging.DEBUG, "RAG 意图识别完成", {"主意图": intent_info.get("primary_intent"), "需要检索": intent_info.get("needs_search", True)})
         else:
-            log_event(logger, logging.INFO, "RAG 使用外部传入意图", {"主意图": intent_info.get("primary_intent"), "需要检索": intent_info.get("needs_search")})
+            log_event(logger, logging.DEBUG, "RAG 使用外部传入意图", {"主意图": intent_info.get("primary_intent"), "需要检索": intent_info.get("needs_search")})
 
         # 2. 判断是否需要检索
         if not intent_info.get('needs_search', True):
-            log_event(logger, logging.INFO, "RAG 跳过检索，直接生成回答")
+            log_event(logger, logging.DEBUG, "RAG 跳过检索，直接生成回答")
             answer = None
             if generate_answer:
                 answer = self._generate_direct_answer(query, intent_info)
@@ -371,38 +372,38 @@ class AIRetrievalPipeline:
             }
 
         # 3. 多源搜索 (获取搜索结果摘要)
-        logger.info("【RAG】准备开始SearchXNR搜索url列表")
+        logger.debug("【RAG】准备开始SearchXNR搜索url列表")
         search_results = self.searcher.search(query, intent_info)
         if search_results:
-            logger.info(f"SearchXNR得到: 首条={search_results[0]}, 末条={search_results[-1]}")
+            logger.debug(f"SearchXNR得到: 首条={search_results[0]}, 末条={search_results[-1]}")
         else:
-            logger.info("SearchXNR得到: 无结果")
-        log_event(logger, logging.INFO, "RAG 搜索完成", {"结果数": len(search_results)})
+            logger.debug("SearchXNR得到: 无结果")
+        log_event(logger, logging.DEBUG, "RAG 搜索完成", {"结果数": len(search_results)})
 
-        logger.info("-------------准备质量过滤-------------------")
+        logger.debug("-------------准备质量过滤-------------------")
 
         
 
         # 4. 质量过滤 (基于摘要重排序)
         filtered_results = self.quality_filter.filter_and_rank(search_results, query)
-        logger.info(f"质量过滤 {len(filtered_results)} 结果")
-        log_event(logger, logging.INFO, "RAG 质量过滤完成", {"保留数": len(filtered_results)})
+        logger.debug(f"质量过滤 {len(filtered_results)} 结果")
+        log_event(logger, logging.DEBUG, "RAG 质量过滤完成", {"保留数": len(filtered_results)})
 
-        logger.info("-------------准备内容抓取-------------------")
+        logger.debug("-------------准备内容抓取-------------------")
 
         # 5. 内容抓取 (Deep Fetch)
         # 取 Top K 进行抓取
         urls_to_fetch = [r['url'] for r in filtered_results[:self.config.DETAIL_FETCH_TOP_K]]
         crawled_contents = self.crawler.fetch_urls(urls_to_fetch)
-        logger.info(f"内容抓取 {len(crawled_contents)} pages")
-        log_event(logger, logging.INFO, "RAG 内容抓取完成", {"页面数": len(crawled_contents)})
+        logger.debug(f"内容抓取 {len(crawled_contents)} pages")
+        log_event(logger, logging.DEBUG, "RAG 内容抓取完成", {"页面数": len(crawled_contents)})
 
         if crawled_contents:
             head = str(crawled_contents[0])[:200]
             tail = str(crawled_contents[-1])[-200:]
-            logger.info(f"\n内容抓取（首/尾）: \n{head}\n...\n{tail}\n")
+            logger.debug(f"\n内容抓取（首/尾）: \n{head}\n...\n{tail}\n")
         
-        logger.info("-------------准备向量化存储与检索-------------------")
+        logger.debug("-------------准备向量化存储与检索-------------------")
 
 
         # 6. 向量化存储与检索 (RAG)
@@ -441,7 +442,7 @@ class AIRetrievalPipeline:
             
             # 将联网检索到的正文存入向量库后，检索相关片段作为 Body Evidence 候选（抓取正文的高相关段落）
             relevant_docs = self.vector_store.similarity_search(query, k=self.config.EVIDENCE_BODY_CANDIDATE_K)
-            log_event(logger, logging.INFO, "RAG 向量检索完成", {"候选片段数": len(relevant_docs)})
+            log_event(logger, logging.DEBUG, "RAG 向量检索完成", {"候选片段数": len(relevant_docs)})
             
             # 依据 Top N 与 token长度预算 => 两个都得满足 => 构建 Body Evidence
             body_section = self._build_body_section(relevant_docs)
@@ -459,20 +460,19 @@ class AIRetrievalPipeline:
             logging.INFO,
             "RAG 证据构建完成",
             {
+                "成功": bool(summary_section.get("items") or body_section.get("items")),
                 "摘要条数": len(summary_section.get("items", [])),
-                "摘要预算": f"{summary_section.get('used_chars', 0)}/{summary_section.get('budget_chars', 0)}",
                 "正文条数": len(body_section.get("items", [])),
-                "正文预算": f"{body_section.get('used_chars', 0)}/{body_section.get('budget_chars', 0)}",
                 "上下文长度": len(context_text),
             },
         )
         answer = None
         if generate_answer:
-            logger.info("\n\n\n-------------准备LLM生成回答-------------------")
+            logger.debug("\n\n\n-------------准备LLM生成回答-------------------")
             answer = self._generate_rag_answer(query, context_text)
-            log_event(logger, logging.INFO, "RAG 回答生成完成", {"回答预览": answer})
+            log_event(logger, logging.DEBUG, "RAG 回答生成完成", {"回答预览": answer})
         else:
-            log_event(logger, logging.INFO, "RAG 已构建证据，等待人工复核")
+            log_event(logger, logging.DEBUG, "RAG 已构建证据，等待人工复核")
 
         processing_time = time.time() - start_time
 

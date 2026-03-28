@@ -31,7 +31,7 @@ class QualityFilter:
                 unique_results.append(r)
         
         results = unique_results
-        logger.info(f"【QualityFilter】URL去重: {initial_count} -> {len(results)}")
+        logger.debug(f"【QualityFilter】URL去重: {initial_count} -> {len(results)}")
 
         # 2. 如果有重排序模型，使用模型打分
         if self.reranker:

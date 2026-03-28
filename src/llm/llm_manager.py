@@ -142,10 +142,65 @@ def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
     log_event(
         logger,
-        logging.INFO,
+        logging.DEBUG,
         f"LLM 输出摘要: {tag}",
         {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)},
     )
+
+
+def _summarize_tool_route_result(tool_name: str, result: Any) -> Dict[str, Any]:
+    """将工具执行结果压缩成适合 INFO 日志展示的简明摘要。"""
+    result_payload = result if isinstance(result, dict) else {}
+    success = bool(result_payload.get("success"))
+    data = result_payload.get("data")
+    error = result_payload.get("error")
+    summary: Dict[str, Any] = {
+        "工具名": tool_name,
+        "成功": success,
+    }
+    if tool_name == "poi.search":
+        result_items = data.get("results") if isinstance(data, dict) else []
+        result_items = result_items if isinstance(result_items, list) else []
+        source_set = sorted(
+            {
+                str(item.get("source") or "").strip()
+                for item in result_items
+                if isinstance(item, dict) and str(item.get("source") or "").strip()
+            }
+        )
+        if "duckduckgo_html" in source_set:
+            summary["检索方式"] = "SearchXNR（失败后回退 DuckDuckGo）"
+        else:
+            summary["检索方式"] = "SearchXNR"
+        summary["结果"] = {
+            "query": data.get("query") if isinstance(data, dict) else "",
+            "结果数": len(result_items),
+            "首条标题": (
+                str(result_items[0].get("title") or "").strip()
+                if result_items and isinstance(result_items[0], dict)
+                else ""
+            ),
+        }
+    elif tool_name == "weather.get_daily":
+        daily_items = data.get("daily") if isinstance(data, dict) else []
+        summary["结果"] = {
+            "城市": data.get("city") if isinstance(data, dict) else "",
+            "天数": len(daily_items) if isinstance(daily_items, list) else 0,
+        }
+    elif tool_name == "geo.geocode":
+        summary["结果"] = {
+            "地址": data.get("address") if isinstance(data, dict) else "",
+            "经纬度": (
+                f"{data.get('latitude')},{data.get('longitude')}"
+                if isinstance(data, dict)
+                else ""
+            ),
+        }
+    elif data is not None:
+        summary["结果"] = summarize_value(data, head=80, tail=80)
+    if not success and error:
+        summary["错误"] = error
+    return summary
 
 
 def _collect_template_fields(template: str) -> List[str]:
@@ -727,7 +782,7 @@ class LlmManager:
         edit_cmd: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        构建行程生成的最终提示词，包含约束信息与工具预调用结果。
+        构建行程生成的最终提示词，仅合并外部已准备好的上下文与约束信息。
 
         Args:
             user_input: 已整理的行程生成参数。
@@ -743,15 +798,6 @@ class LlmManager:
             merged_context.extend(context)
         if constraints_text:
             merged_context.append(constraints_text)
-        # 行程生成前先做工具预调用，补充天气/POI/地理编码等外部信息
-        tool_query = self._build_tool_query(user_input=user_input, edit_cmd=edit_cmd)
-        if tool_query:
-            tool_call = self.call_tool_by_llm(tool_query, self._normalize_tool_context(context))
-            if tool_call.get("needs_tool") and tool_call.get("result"):
-                result_payload = tool_call.get("result")
-                if isinstance(result_payload, dict) and result_payload.get("success"):
-                    # 将工具结果注入上下文，参与后续 prompt 构建
-                    merged_context.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
         return self.build_prompt(user_input, merged_context, edit_cmd)
 
     def parse_trip_from_response_text(self, response_text: str) -> Optional[Dict[str, Any]]:
@@ -1020,13 +1066,17 @@ class LlmManager:
         # 第一步：让分析模型决定是否需要工具与工具参数
         decision = self.decide_tool_call(query, context)
         if not decision.get("needs_tool"):
+            # 工具路由未触发时，仅保留一条简洁 INFO，避免刷出模型原始输出。
+            log_event(logger, logging.INFO, "工具路由完成", {"是否触发": False})
             return {"needs_tool": False, "decision": decision, "result": None}
         tool_name = decision.get("tool_name") or ""
         params = decision.get("params") or {}
         # 第二步：执行工具并返回统一结果结构
         result = self.call_tool(tool_name, params)
         res = {"needs_tool": True, "decision": decision, "result": result}
-        log_event(logger, logging.INFO, "工具路由执行完成", {"工具名": tool_name, "参数": params, "结果摘要": res})
+        # 工具执行完成后只打印流程名、工具名、是否成功与结果摘要，细节下沉到 DEBUG。
+        log_event(logger, logging.INFO, "工具路由执行完成", _summarize_tool_route_result(tool_name, result))
+        log_event(logger, logging.DEBUG, "工具路由调试信息", {"工具名": tool_name, "参数": params, "结果摘要": res})
         return res
 
     def _build_tool_query(self, user_input: Optional[Dict[str, Any]] = None, edit_cmd: Optional[Dict[str, Any]] = None, query: Optional[str] = None) -> str:
@@ -1809,13 +1859,8 @@ class LlmManager:
             "llm_analyze_start",
             {"prompt_len": len(analysis_prompt), "context_size": len(context or [])},
         )
-        start_ts = log_llm_start(
-            logger,
-            stage="实体抽取与意图识别",
-            model=str((self._analysis_config or {}).get("model_name") or ""),
-            prompt=analysis_prompt,
-            extra={"查询": query, "上下文条数": len(context or [])},
-        )
+        # 这里改为仅记录完成态摘要，避免终端同时出现“开始/结束/原始输出”三条冗余日志。
+        start_ts = datetime.now()
         raw_analysis_response = self.analysis_llm.invoke(analysis_prompt)
         if hasattr(raw_analysis_response, "content"):
             analysis_response = raw_analysis_response.content
@@ -1831,17 +1876,31 @@ class LlmManager:
             prompt_text=analysis_prompt,
             output_text=cleaned_response,
         )
-        _log_llm_output("analyze_user_message_response", cleaned_response)
-        log_llm_end(
-            logger,
-            stage="实体抽取与意图识别",
-            started_at=start_ts,
-            output=cleaned_response,
-            extra={"原始响应长度": len(str(analysis_response))},
-        )
-
         intent_data = self._parse_intent(cleaned_response)
-        log_event(logger, logging.INFO, "意图识别完成", {"意图": intent_data.get("intent"), "参数": intent_data.get("parameters")})
+        # 主流程终端只保留“流程名 + 是否成功 + 结果”这一条 INFO 日志。
+        log_event(
+            logger,
+            logging.INFO,
+            "实体抽取与意图识别完成",
+            {
+                "成功": True,
+                "结果": {
+                    "intent": intent_data.get("intent"),
+                    "summary": intent_data.get("summary"),
+                    "parameters": intent_data.get("parameters"),
+                },
+            },
+        )
+        log_event(
+            logger,
+            logging.DEBUG,
+            "实体抽取与意图识别调试信息",
+            {
+                "耗时秒": cost,
+                "原始响应长度": len(str(analysis_response)),
+                "原始响应预览": _format_log_text(cleaned_response),
+            },
+        )
         self._metrics.record(
             "llm_analyze_success",
             {"elapsed_ms": int(cost * 1000), "output_len": len(str(analysis_response))},

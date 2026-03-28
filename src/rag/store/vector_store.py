@@ -149,7 +149,7 @@ class VectorStore:
         if docs_to_add:
             try:
                 self.vector_db.add_documents(docs_to_add)
-                logger.info(f"Added {len(docs_to_add)} chunks to vector store")
+                logger.debug(f"Added {len(docs_to_add)} chunks to vector store")
                 return len(docs_to_add)
             except Exception as e:
                 logger.error(f"Error adding documents to vector store: {e}")
@@ -175,6 +175,6 @@ class VectorStore:
             ids = self.vector_db.get()['ids']
             if ids:
                 self.vector_db.delete(ids=ids)
-                logger.info(f"Cleared {len(ids)} documents from collection {self.collection_name}")
+                logger.debug(f"Cleared {len(ids)} documents from collection {self.collection_name}")
         except Exception as e:
             logger.error(f"Error clearing vector store: {e}")
