@@ -1,5 +1,5 @@
 from typing import Optional, Dict, List, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class FlowRequestBase(BaseModel):
     """主流程请求基础模型，描述一次规划任务的核心输入。"""
@@ -19,6 +19,14 @@ class FlowRequestBase(BaseModel):
     intensity: Optional[str] = Field("standard", description="体能强度 leisure/standard/extreme")
     pace: Optional[str] = Field("cultural", description="节奏偏好 cultural/efficient/family_friendly")
     special_constraints: Optional[Dict[str, Any]] = Field(None, description="特殊约束配置")
+
+    @field_validator("budget", mode="before")
+    @classmethod
+    def normalize_budget(cls, value: Any) -> Optional[str]:
+        """兼容前端传入数字预算，并统一归一化为字符串。"""
+        if value in [None, ""]:
+            return None
+        return str(value)
 
 
 class FlowStreamRequest(FlowRequestBase):

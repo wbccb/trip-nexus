@@ -6,8 +6,10 @@ from typing import Dict, List, Optional, Any, Iterable, Callable
 import copy
 import json
 import re
+import requests
 from string import Formatter
 from datetime import datetime
+from urllib.parse import urlparse
 from geopy.geocoders import Nominatim
 from src.rag.network.multi_source_search import MultiSourceSearcher
 from src.rag.rag_main import AIRetrievalPipeline
@@ -55,6 +57,74 @@ class TripPlan(BaseModel):
 
 
 logger = logging.getLogger(__name__)
+
+
+class LocalOllamaResponse:
+    """本地 Ollama 调用结果对象，兼容 LangChain 常见的 .content 读取方式。"""
+
+    def __init__(self, content: str):
+        self.content = content
+
+
+class LocalOllamaLLM:
+    """基于 requests 的轻量 Ollama 适配器，规避部分 SDK 组合在本地服务上的 502 问题。"""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        temperature: float = 0.7,
+        timeout: int = 300,
+        num_ctx: int = 4096,
+    ) -> None:
+        self.model = model
+        self.base_url = str(base_url or "http://localhost:11434").rstrip("/")
+        self.temperature = temperature
+        self.timeout = timeout
+        self.num_ctx = num_ctx
+
+    def _build_payload(self, prompt: Any, stream: bool) -> Dict[str, Any]:
+        """构造 Ollama generate 请求体。"""
+        return {
+            "model": self.model,
+            "prompt": str(prompt or ""),
+            "stream": stream,
+            "options": {
+                "temperature": self.temperature,
+                "num_ctx": self.num_ctx,
+            },
+        }
+
+    def invoke(self, prompt: Any) -> LocalOllamaResponse:
+        """同步调用本地 Ollama generate 接口并返回完整文本。"""
+        response = requests.post(
+            f"{self.base_url}/api/generate",
+            json=self._build_payload(prompt, stream=False),
+            timeout=self.timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Ollama generate 请求失败: HTTP {response.status_code} {response.text[:300]}")
+        payload = response.json()
+        return LocalOllamaResponse(str(payload.get("response") or ""))
+
+    def stream(self, prompt: Any) -> Iterable[str]:
+        """流式调用本地 Ollama generate 接口并逐段返回文本。"""
+        with requests.post(
+            f"{self.base_url}/api/generate",
+            json=self._build_payload(prompt, stream=True),
+            timeout=self.timeout,
+            stream=True,
+        ) as response:
+            if response.status_code >= 400:
+                raise RuntimeError(f"Ollama stream 请求失败: HTTP {response.status_code} {response.text[:300]}")
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                payload = json.loads(raw_line)
+                delta = str(payload.get("response") or "")
+                if delta:
+                    yield delta
 
 
 def _strip_think_content(text: Any) -> str:
@@ -210,6 +280,102 @@ class LlmManager:
             }
         )
 
+    def _normalize_openai_base_url(self, base_url: Any) -> str:
+        """归一化 OpenAI 兼容地址，兼容直接传入 Ollama 根地址时自动补齐 /v1。"""
+        normalized = str(base_url or "http://localhost:11434").strip()
+        if not normalized:
+            normalized = "http://localhost:11434"
+        normalized = normalized.rstrip("/")
+        parsed = urlparse(normalized)
+        hostname = (parsed.hostname or "").lower()
+        path = (parsed.path or "").rstrip("/")
+        is_local_ollama = hostname in {"localhost", "127.0.0.1", "0.0.0.0"} and parsed.port == 11434
+        if is_local_ollama and path != "/v1":
+            upgraded = f"{normalized}/v1"
+            log_event(
+                logger,
+                logging.INFO,
+                "检测到本地 Ollama OpenAI 兼容地址，自动补齐 /v1",
+                {"原地址": normalized, "新地址": upgraded},
+            )
+            return upgraded
+        return normalized
+
+    def _is_local_ollama_base_url(self, base_url: Any) -> bool:
+        """判断地址是否指向本地 Ollama 服务。"""
+        normalized = str(base_url or "http://localhost:11434").strip().rstrip("/")
+        parsed = urlparse(normalized)
+        hostname = (parsed.hostname or "").lower()
+        return hostname in {"localhost", "127.0.0.1", "0.0.0.0"} and parsed.port == 11434
+
+    def _create_ollama_llm(self, model_name: str, base_url: str, temperature: float):
+        """初始化原生 Ollama LLM，统一复用本地模型创建逻辑。"""
+        log_event(logger, logging.INFO, "初始化 Ollama 模型", {"模型": model_name, "地址": base_url})
+        return LocalOllamaLLM(
+            base_url=base_url,
+            model=model_name,
+            temperature=temperature,
+            timeout=300,
+            num_ctx=4096,
+        )
+
+    def _create_openai_compatible_llm(self, cfg: Dict[str, Any]):
+        """初始化 OpenAI 兼容模型，并在缺少 langchain_openai 时自动降级到社区实现。"""
+        model_name = cfg.get("model_name") or "deepseek-r1:7b"
+        base_url = self._normalize_openai_base_url(cfg.get("base_url"))
+        temperature = cfg.get("temperature") or 0.7
+        api_key = cfg.get("api_key") or ""
+        if self._is_local_ollama_base_url(base_url):
+            ollama_root_url = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+            log_event(
+                logger,
+                logging.INFO,
+                "检测到本地 Ollama 地址，优先使用原生 OllamaLLM 规避 OpenAI SDK 兼容问题",
+                {"模型": model_name, "OpenAI地址": base_url, "Ollama地址": ollama_root_url},
+            )
+            return self._create_ollama_llm(model_name, ollama_root_url, temperature)
+        try:
+            from langchain_openai import ChatOpenAI
+
+            client_variant = "langchain_openai"
+            init_kwargs = {
+                "model": model_name,
+                "api_key": api_key,
+                "base_url": base_url,
+                "temperature": temperature,
+                "extra_body": OPENAI_CHAT_TEMPLATE_KWARGS,
+            }
+        except ImportError:
+            try:
+                from langchain_community.chat_models import ChatOpenAI
+            except ImportError as e:
+                raise RuntimeError(
+                    "当前环境缺少 OpenAI 兼容模型依赖，无法初始化 provider=openai_compatible。"
+                    "请安装 langchain_openai，或至少确保 langchain-community 可用，"
+                    "否则请切换 provider=ollama。"
+                ) from e
+            client_variant = "langchain_community"
+            init_kwargs = {
+                "model": model_name,
+                "api_key": api_key,
+                "base_url": base_url,
+                "temperature": temperature,
+            }
+            log_event(
+                logger,
+                logging.WARNING,
+                "langchain_openai 不可用，自动降级到社区版 ChatOpenAI",
+                {"模型": model_name, "地址": base_url},
+            )
+
+        log_event(
+            logger,
+            logging.INFO,
+            "初始化 OpenAI 兼容模型",
+            {"模型": model_name, "地址": base_url, "实现": client_variant},
+        )
+        return ChatOpenAI(**init_kwargs)
+
     def _create_llm(self, cfg: Dict[str, Any]):
         provider = cfg.get("provider") or "ollama"  # 读取提供方配置，缺省为 ollama
         model_name = cfg.get("model_name") or "deepseek-r1:7b"  # 读取模型名称，缺省为 deepseek-r1:7b
@@ -217,41 +383,9 @@ class LlmManager:
         temperature = cfg.get("temperature") or 0.7  # 读取温度参数，缺省为 0.7
 
         if provider == "openai_compatible":  # 仅当 provider 为 openai_compatible 时进入该分支
-            try:
-                from langchain_openai import ChatOpenAI  # 延迟导入，避免不兼容版本在启动时崩溃
-            except ImportError as e:
-                raise RuntimeError(
-                    "当前环境的 langchain_openai 与 langchain_core 版本不兼容，暂不支持 OpenAI 兼容模型。"
-                    "请升级相关依赖或切换 provider=ollama。"
-                ) from e
+            return self._create_openai_compatible_llm(cfg)
 
-            api_key = cfg.get("api_key") or ""  # 读取 API Key，缺省为空字符串
-            log_event(logger, logging.INFO, "初始化 OpenAI 兼容模型", {"模型": model_name, "地址": base_url})
-            return ChatOpenAI(  # 创建 OpenAI 兼容模型实例
-                model=model_name,  # 模型名称
-                api_key=api_key,  # API Key
-                base_url=base_url,  # 远端 Base URL（/v1）
-                temperature=temperature,  # 温度参数
-                extra_body=OPENAI_CHAT_TEMPLATE_KWARGS,  # 统一关闭深度思考，优先响应速度
-            )
-
-        try:
-            from langchain_ollama import OllamaLLM
-        except ImportError as e:
-            raise RuntimeError(
-                "当前环境缺少 langchain_ollama，无法初始化 provider=ollama。"
-                "请先执行 `pip install langchain-ollama` 或切换 provider=openai_compatible。"
-            ) from e
-
-        log_event(logger, logging.INFO, "初始化 Ollama 模型", {"模型": model_name, "地址": base_url})
-        return OllamaLLM(  # 创建 Ollama 模型实例
-            base_url=base_url,  # Ollama Base URL
-            model=model_name,  # 模型名称
-            temperature=temperature,  # 温度参数
-            num_ctx=4096,  # 上下文长度
-            timeout=300,  # 请求超时
-            reasoning=False,  # 等价关闭 thinking/reasoning 模式，避免输出思考内容
-        )
+        return self._create_ollama_llm(model_name, base_url, temperature)
 
     def update_llm_config(self, config: Dict[str, Any]) -> None:
         log_event(logger, logging.INFO, "更新 LLM 配置", {"配置键": list(config.keys())})
@@ -311,7 +445,9 @@ class LlmManager:
         else:
             cfg = self._generation_config
         provider = (cfg.get("provider") or "").lower()
-        return provider == "openai_compatible"
+        if provider != "openai_compatible":
+            return False
+        return not self._is_local_ollama_base_url(cfg.get("base_url"))
 
     def _supports_function_call(self, llm: Any) -> bool:
         """检查模型实例是否支持 FunctionCall（是否具备 bind_tools 接口）。"""
