@@ -148,6 +148,32 @@ def _log_llm_output(tag: str, cleaned_text: str) -> None:
     )
 
 
+def _build_result_preview_fields(
+    items: List[Any],
+    *,
+    prefix: str,
+    max_items: int = 3,
+) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {}
+    for index, item in enumerate(items[:max_items], start=1):
+        if not isinstance(item, dict):
+            fields[f"{prefix}{index}"] = summarize_value(item, head=80, tail=60)
+            continue
+        title = str(item.get("title") or item.get("name") or item.get("attraction") or "").strip()
+        snippet = str(
+            item.get("content_snippet")
+            or item.get("snippet")
+            or item.get("summary")
+            or item.get("recommend_reason")
+            or item.get("text")
+            or item.get("address")
+            or ""
+        ).strip()
+        combined = f"{title}：{snippet}" if title and snippet else (title or snippet or summarize_value(item, head=80, tail=60))
+        fields[f"{prefix}{index}"] = summarize_value(combined, head=90, tail=70)
+    return fields
+
+
 def _summarize_tool_route_result(tool_name: str, result: Any) -> Dict[str, Any]:
     """将工具执行结果压缩成适合 INFO 日志展示的简明摘要。"""
     result_payload = result if isinstance(result, dict) else {}
@@ -181,12 +207,14 @@ def _summarize_tool_route_result(tool_name: str, result: Any) -> Dict[str, Any]:
                 else ""
             ),
         }
+        summary.update(_build_result_preview_fields(result_items, prefix="结果预览", max_items=3))
     elif tool_name == "weather.get_daily":
         daily_items = data.get("daily") if isinstance(data, dict) else []
         summary["结果"] = {
             "城市": data.get("city") if isinstance(data, dict) else "",
             "天数": len(daily_items) if isinstance(daily_items, list) else 0,
         }
+        summary.update(_build_result_preview_fields(daily_items if isinstance(daily_items, list) else [], prefix="天气预览", max_items=3))
     elif tool_name == "geo.geocode":
         summary["结果"] = {
             "地址": data.get("address") if isinstance(data, dict) else "",
@@ -349,7 +377,7 @@ class LlmManager:
             upgraded = f"{normalized}/v1"
             log_event(
                 logger,
-                logging.INFO,
+                logging.DEBUG,
                 "检测到本地 Ollama OpenAI 兼容地址，自动补齐 /v1",
                 {"原地址": normalized, "新地址": upgraded},
             )
@@ -365,7 +393,7 @@ class LlmManager:
 
     def _create_ollama_llm(self, model_name: str, base_url: str, temperature: float):
         """初始化原生 Ollama LLM，统一复用本地模型创建逻辑。"""
-        log_event(logger, logging.INFO, "初始化 Ollama 模型", {"模型": model_name, "地址": base_url})
+        log_event(logger, logging.DEBUG, "初始化 Ollama 模型", {"模型": model_name, "地址": base_url})
         return LocalOllamaLLM(
             base_url=base_url,
             model=model_name,
@@ -384,7 +412,7 @@ class LlmManager:
             ollama_root_url = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
             log_event(
                 logger,
-                logging.INFO,
+                logging.DEBUG,
                 "检测到本地 Ollama 地址，优先使用原生 OllamaLLM 规避 OpenAI SDK 兼容问题",
                 {"模型": model_name, "OpenAI地址": base_url, "Ollama地址": ollama_root_url},
             )
@@ -1884,11 +1912,9 @@ class LlmManager:
             "实体抽取与意图识别完成",
             {
                 "成功": True,
-                "结果": {
-                    "intent": intent_data.get("intent"),
-                    "summary": intent_data.get("summary"),
-                    "parameters": intent_data.get("parameters"),
-                },
+                "意图": intent_data.get("intent"),
+                "摘要": intent_data.get("summary"),
+                "参数": intent_data.get("parameters"),
             },
         )
         log_event(

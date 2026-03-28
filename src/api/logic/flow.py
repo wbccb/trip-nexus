@@ -33,6 +33,7 @@ from src.api.logic.knowledge import (
     _build_knowledge_context_payload,
     _build_source_evidence_from_docs,
 )
+from src.observability import log_event, summarize_value
 
 logger = logging.getLogger(__name__)
 
@@ -608,6 +609,94 @@ def _build_agent_pause_response(final_state: Any) -> str:
     return ""
 
 
+def _build_preview_fields(
+    items: List[Any],
+    *,
+    prefix: str,
+    max_items: int = 3,
+) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {}
+    for index, item in enumerate(items[:max_items], start=1):
+        if isinstance(item, dict):
+            title = str(
+                item.get("title")
+                or item.get("source_url")
+                or item.get("source_id")
+                or item.get("destination")
+                or item.get("attraction")
+                or ""
+            ).strip()
+            text = str(
+                item.get("text")
+                or item.get("summary")
+                or item.get("content")
+                or item.get("response")
+                or item.get("source_type")
+                or ""
+            ).strip()
+            combined = f"{title}：{text}" if title and text else (title or text or summarize_value(item, head=80, tail=60))
+        else:
+            combined = summarize_value(item, head=80, tail=60)
+        fields[f"{prefix}{index}"] = summarize_value(combined, head=100, tail=80)
+    return fields
+
+
+def _summarize_tool_stage(tool_result: Dict[str, Any]) -> Dict[str, Any]:
+    decision = tool_result.get("decision") if isinstance(tool_result, dict) else {}
+    result_payload = tool_result.get("result") if isinstance(tool_result, dict) else {}
+    params = decision.get("params") if isinstance(decision, dict) else {}
+    summary: Dict[str, Any] = {
+        "是否触发": bool(tool_result.get("needs_tool")) if isinstance(tool_result, dict) else False,
+        "工具名": str((decision or {}).get("tool_name") or ""),
+        "工具参数": params if isinstance(params, dict) else {},
+    }
+    if isinstance(result_payload, dict):
+        summary["执行成功"] = bool(result_payload.get("success"))
+        if result_payload.get("error"):
+            summary["错误"] = result_payload.get("error")
+        data = result_payload.get("data")
+        if isinstance(data, dict):
+            result_items = data.get("results")
+            if isinstance(result_items, list):
+                summary["结果数"] = len(result_items)
+                summary.update(_build_preview_fields(result_items, prefix="工具结果", max_items=3))
+            else:
+                summary["结果预览"] = summarize_value(data, head=100, tail=80)
+    return summary
+
+
+def _summarize_trip_stage(trip: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(trip, dict) or not trip:
+        return {"产出行程": False}
+    daily_plan = trip.get("daily_plan") if isinstance(trip.get("daily_plan"), dict) else {}
+    summary: Dict[str, Any] = {
+        "产出行程": True,
+        "目的地": trip.get("destination"),
+        "天数": trip.get("days"),
+        "天计划数": len(daily_plan),
+    }
+    if daily_plan:
+        first_day_key = sorted(daily_plan.keys(), key=lambda item: int(item) if str(item).isdigit() else str(item))[0]
+        day_items = daily_plan.get(first_day_key) if isinstance(daily_plan.get(first_day_key), list) else []
+        summary["首日天数键"] = first_day_key
+        summary["首日行程数"] = len(day_items)
+        summary.update(_build_preview_fields(day_items, prefix="首日行程", max_items=3))
+    return summary
+
+
+def _log_flow_step(
+    message_id: str,
+    session_id: str,
+    step_name: str,
+    status: str,
+    data: Optional[Dict[str, Any]] = None,
+    *,
+    level: int = logging.INFO,
+) -> None:
+    payload = {**(data or {})}
+    log_event(logger, level, f"\n\n{step_name}{status}", payload)
+
+
 async def _run_flow_stream(
     message_id: str,
     session_id: str,
@@ -651,8 +740,23 @@ async def _run_flow_stream(
     constraints_satisfied: List[Dict[str, Any]] = []
     conflict_report = ConflictReport().model_dump()
     allow_public_fusion = str(payload.knowledge_scope or "private_plus_public").strip().lower() != "private_only"
-    
+
     try:
+        _log_flow_step(
+            message_id,
+            session_id,
+            "主流程 Step 0 请求接收",
+            "开始",
+            {
+                "mode": flow_mode,
+                "目的地": payload.destination,
+                "天数": payload.days,
+                "预算": payload.budget,
+                "偏好": payload.preference,
+                "上下文条数": len(merged_context_texts),
+                "knowledge_scope": payload.knowledge_scope,
+            },
+        )
         last_sequence += 1
         await _append_flow_event(
             message_id,
@@ -673,9 +777,32 @@ async def _run_flow_stream(
         flow_query = _build_flow_query_text(payload)
         context_messages = _build_flow_context_messages(merged_context_texts)
         current_trip = _get_storage().get_trip_data(session_id)
+        _log_flow_step(
+            message_id,
+            session_id,
+            "主流程 Step 1 意图识别",
+            "开始",
+            {
+                "查询": flow_query,
+                "上下文消息数": len(context_messages),
+                "存在当前行程": bool(current_trip),
+            },
+        )
         intent_data = llm_manager.analyze_user_message(flow_query, context_messages, current_trip)
         intent = str(intent_data.get("intent") or "generate_trip")
         metrics["intent"] = intent
+        _log_flow_step(
+            message_id,
+            session_id,
+            "主流程 Step 1 意图识别",
+            "完成",
+            {
+                "意图": intent,
+                "摘要": intent_data.get("summary"),
+                "参数": intent_data.get("parameters"),
+                "需要补充信息": bool(intent_data.get("needs_more_info")),
+            },
+        )
         last_sequence += 1
         await _append_flow_event(
             message_id,
@@ -698,6 +825,19 @@ async def _run_flow_stream(
         )
 
         if intent == "general_conversation":
+            _log_flow_step(
+                message_id,
+                session_id,
+                "主流程 Step 2 路由分叉判定",
+                "完成",
+                {
+                    "通用对话路径": "selected",
+                    "修改路径": "skipped",
+                    "快速路径": "skipped",
+                    "深度路径": "skipped",
+                },
+            )
+            _log_flow_step(message_id, session_id, "主流程 通用对话路径", "开始", {"查询": flow_query})
             response_chunks: List[str] = []
             stream = llm_manager.stream_chat_response(flow_query, context_messages, current_trip)
             for delta_text in stream:
@@ -724,11 +864,40 @@ async def _run_flow_stream(
                 )
                 await asyncio.sleep(0)
             response_text = "".join(response_chunks)
+            _log_flow_step(
+                message_id,
+                session_id,
+                "主流程 通用对话路径",
+                "完成",
+                {"输出长度": len(response_text), "回复预览": summarize_value(response_text, head=140, tail=100)},
+            )
         elif intent in {"modify_trip", "add_attraction", "delete_attraction", "reorder_trip"} and current_trip:
+            _log_flow_step(
+                message_id,
+                session_id,
+                "主流程 Step 2 路由分叉判定",
+                "完成",
+                {
+                    "通用对话路径": "skipped",
+                    "修改路径": "selected",
+                    "快速路径": "skipped",
+                    "深度路径": "skipped",
+                },
+            )
             last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "modify")
+            _log_flow_step(
+                message_id,
+                session_id,
+                "主流程 修改路径",
+                "开始",
+                {"存在当前行程": True, "查询": flow_query},
+            )
             change_result = llm_manager.change_trip(flow_query, context_messages, current_trip, constraints=constraints_used)
             trip_data = change_result.get("trip_data")
             response_text = str(change_result.get("response") or "")
+            modify_log_payload = {"回复预览": summarize_value(response_text, head=140, tail=100)}
+            modify_log_payload.update(_summarize_trip_stage(trip_data))
+            _log_flow_step(message_id, session_id, "主流程 修改路径", "完成", modify_log_payload)
             if response_text:
                 last_sequence += 1
                 await _append_flow_event(
@@ -751,8 +920,29 @@ async def _run_flow_stream(
             escalation = _detect_agent_escalation(flow_mode, intent, user_input, payload.knowledge_query)
             metrics["agent_escalated"] = bool(escalation.get("agent_escalated"))
             escalation_reasons = list(escalation.get("reasons") or [])
+            _log_flow_step(
+                message_id,
+                session_id,
+                "主流程 Step 2 路由分叉判定",
+                "完成",
+                {
+                    "通用对话路径": "skipped",
+                    "修改路径": "skipped",
+                    "快速路径": "selected" if not metrics["agent_escalated"] else "skipped",
+                    "深度路径": "selected" if metrics["agent_escalated"] else "skipped",
+                    "升级Agent": metrics["agent_escalated"],
+                    "升级原因": escalation_reasons,
+                },
+            )
 
             if metrics["agent_escalated"]:
+                _log_flow_step(
+                    message_id,
+                    session_id,
+                    "主流程 Step 3b 私有知识库补充",
+                    "开始",
+                    {"knowledge_base_id": payload.knowledge_base_id, "knowledge_query": payload.knowledge_query},
+                )
                 kb_context_texts, kb_context_docs = _build_knowledge_context_payload(
                     payload.knowledge_base_id,
                     payload.destination,
@@ -765,6 +955,16 @@ async def _run_flow_stream(
                 if kb_context_texts:
                     metrics["rag_hit"] = True
                     source_evidence = _build_source_evidence_from_docs(kb_context_docs)
+                kb_log_payload = {"命中文本数": len(kb_context_texts), "命中来源数": len(source_evidence)}
+                kb_log_payload.update(_build_preview_fields(kb_context_texts, prefix="知识命中", max_items=3))
+                _log_flow_step(message_id, session_id, "主流程 Step 3b 私有知识库补充", "完成", kb_log_payload)
+                _log_flow_step(
+                    message_id,
+                    session_id,
+                    "主流程 Step 4b 上下文预算裁剪",
+                    "开始",
+                    {"裁剪前条数": len(merged_context_texts)},
+                )
                 merged_context_texts = _merge_context_with_budget(merged_context_texts)
                 metrics["context_count"] = len(merged_context_texts)
                 metrics["context_chars"] = sum([len(item) for item in merged_context_texts])
@@ -773,7 +973,20 @@ async def _run_flow_stream(
                     "item_max_chars": _FLOW_CONTEXT_ITEM_MAX_CHARS,
                     "total_max_chars": _FLOW_CONTEXT_TOTAL_MAX_CHARS,
                 }
+                context_log_payload = {
+                    "裁剪后条数": metrics["context_count"],
+                    "总字符数": metrics["context_chars"],
+                }
+                context_log_payload.update(_build_preview_fields(merged_context_texts, prefix="上下文", max_items=3))
+                _log_flow_step(message_id, session_id, "主流程 Step 4b 上下文预算裁剪", "完成", context_log_payload)
                 last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "agent")
+                _log_flow_step(
+                    message_id,
+                    session_id,
+                    "主流程 Step 5b Agent SOP 执行",
+                    "开始",
+                    {"任务序列": "t1 weather.get_daily -> t2 poi.search -> t3 geo.geocode -> t4 generate_trip_pure -> t5 map_render -> t6 trip_summarize"},
+                )
                 last_sequence += 1
                 await _append_flow_event(
                     message_id,
@@ -813,10 +1026,23 @@ async def _run_flow_stream(
                                 session_id,
                                 response_text,
                             )
+                agent_log_payload = {
+                    "停止原因": getattr(final_state, "stop_reason", "") if final_state else "",
+                    "回复预览": summarize_value(response_text, head=140, tail=100),
+                }
+                agent_log_payload.update(_summarize_trip_stage(trip_data))
+                _log_flow_step(message_id, session_id, "主流程 Step 5b Agent SOP 执行", "完成", agent_log_payload)
             else:
                 last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "tool")
                 tool_query = llm_manager._build_tool_query(user_input=user_input, query=flow_query)
                 tool_result: Dict[str, Any] = {"needs_tool": False}
+                _log_flow_step(
+                    message_id,
+                    session_id,
+                    "主流程 Step 3a 前置工具阶段",
+                    "开始",
+                    {"工具查询": tool_query, "允许公网融合": allow_public_fusion},
+                )
                 if tool_query and allow_public_fusion:
                     tool_result = llm_manager.call_tool_by_llm(tool_query, context_messages)
                     if tool_result.get("needs_tool"):
@@ -824,6 +1050,26 @@ async def _run_flow_stream(
                         result_payload = tool_result.get("result")
                         if isinstance(result_payload, dict) and result_payload.get("success"):
                             merged_context_texts.append(f"工具结果：{json.dumps(result_payload, ensure_ascii=False)}")
+                else:
+                    tool_result = {
+                        "needs_tool": False,
+                        "decision": {"tool_name": "", "params": {}},
+                        "result": None,
+                    }
+                _log_flow_step(
+                    message_id,
+                    session_id,
+                    "主流程 Step 3a 前置工具阶段",
+                    "完成",
+                    _summarize_tool_stage(tool_result),
+                )
+                _log_flow_step(
+                    message_id,
+                    session_id,
+                    "主流程 Step 4a 私有知识库补充",
+                    "开始",
+                    {"knowledge_base_id": payload.knowledge_base_id, "knowledge_query": payload.knowledge_query},
+                )
                 kb_context_texts, kb_context_docs = _build_knowledge_context_payload(
                     payload.knowledge_base_id,
                     payload.destination,
@@ -836,6 +1082,16 @@ async def _run_flow_stream(
                 if kb_context_texts:
                     metrics["rag_hit"] = True
                     source_evidence = _build_source_evidence_from_docs(kb_context_docs)
+                kb_log_payload = {"命中文本数": len(kb_context_texts), "命中来源数": len(source_evidence)}
+                kb_log_payload.update(_build_preview_fields(kb_context_texts, prefix="知识命中", max_items=3))
+                _log_flow_step(message_id, session_id, "主流程 Step 4a 私有知识库补充", "完成", kb_log_payload)
+                _log_flow_step(
+                    message_id,
+                    session_id,
+                    "主流程 Step 5a 上下文预算裁剪",
+                    "开始",
+                    {"裁剪前条数": len(merged_context_texts)},
+                )
                 merged_context_texts = _merge_context_with_budget(merged_context_texts)
                 metrics["context_count"] = len(merged_context_texts)
                 metrics["context_chars"] = sum([len(item) for item in merged_context_texts])
@@ -844,7 +1100,20 @@ async def _run_flow_stream(
                     "item_max_chars": _FLOW_CONTEXT_ITEM_MAX_CHARS,
                     "total_max_chars": _FLOW_CONTEXT_TOTAL_MAX_CHARS,
                 }
+                context_log_payload = {
+                    "裁剪后条数": metrics["context_count"],
+                    "总字符数": metrics["context_chars"],
+                }
+                context_log_payload.update(_build_preview_fields(merged_context_texts, prefix="上下文", max_items=3))
+                _log_flow_step(message_id, session_id, "主流程 Step 5a 上下文预算裁剪", "完成", context_log_payload)
                 response_chunks: List[str] = []
+                _log_flow_step(
+                    message_id,
+                    session_id,
+                    "主流程 Step 6a 普通流式生成",
+                    "开始",
+                    {"上下文条数": len(merged_context_texts), "目的地": user_input.get("destination"), "天数": user_input.get("days")},
+                )
                 stream = llm_manager.stream_trip_generation(user_input, merged_context_texts)
                 for event in llm_manager.build_stream_events_from_stream(stream, message_id):
                     last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "generate")
@@ -875,8 +1144,15 @@ async def _run_flow_stream(
                     await asyncio.sleep(0)
                 response_text = "".join(response_chunks)
                 trip_data = llm_manager.parse_trip_from_response_text(response_text)
+                generation_log_payload = {
+                    "输出长度": len(response_text),
+                    "回复预览": summarize_value(response_text, head=140, tail=100),
+                }
+                generation_log_payload.update(_summarize_trip_stage(trip_data))
+                _log_flow_step(message_id, session_id, "主流程 Step 6a 普通流式生成", "完成", generation_log_payload)
 
         if trip_data:
+            _log_flow_step(message_id, session_id, "主流程 Step 6 后处理", "开始", _summarize_trip_stage(trip_data))
             if isinstance(trip_data, dict):
                 constraints_satisfied = _build_constraint_statuses(trip_data, constraints_used)
                 generated_conflict_report = llm_manager.build_conflict_report(trip_data, constraints_used)
@@ -907,9 +1183,28 @@ async def _run_flow_stream(
                 trip_data["constraints_satisfied"] = constraints_satisfied
                 trip_data["conflict_report"] = conflict_report
             _get_storage().store_trip_data(session_id, trip_data)
+            _log_flow_step(
+                message_id,
+                session_id,
+                "主流程 Step 6 后处理",
+                "完成",
+                {
+                    "约束条数": len(constraints_satisfied),
+                    "存在冲突": bool(conflict_report.get("has_conflicts")),
+                    "冲突数": len(conflict_report.get("conflicts") or []),
+                    "替代方案数": len(conflict_report.get("alternatives") or []),
+                },
+            )
         else:
             metrics["conflict_detected"] = False
             metrics["plan_alternative_generated"] = False
+            _log_flow_step(
+                message_id,
+                session_id,
+                "主流程 Step 6 后处理",
+                "跳过",
+                {"原因": "未生成结构化 trip_data", "回复预览": summarize_value(response_text, head=140, tail=100)},
+            )
         metrics["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
         _record_flow_metrics(
             {
@@ -964,6 +1259,17 @@ async def _run_flow_stream(
                 },
             },
         )
+        finalize_log_payload = {
+            "耗时毫秒": metrics["latency_ms"],
+            "intent": metrics.get("intent"),
+            "agent_escalated": metrics["agent_escalated"],
+            "rag_hit": metrics["rag_hit"],
+            "source_evidence_count": len(source_evidence),
+            "回复预览": summarize_value(response_text, head=140, tail=100),
+        }
+        finalize_log_payload.update(_summarize_trip_stage(trip_data))
+        finalize_log_payload.update(_build_preview_fields(source_evidence, prefix="来源证据", max_items=3))
+        _log_flow_step(message_id, session_id, "主流程 Step 7 SSE finalize", "完成", finalize_log_payload)
         _record_audit_log(
             action="flow_stream_completed",
             status="success",

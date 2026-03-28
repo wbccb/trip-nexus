@@ -34,7 +34,7 @@ def setup_logging(level: Optional[str] = None) -> None:
     root._tripnexus_logging_ready = True  # type: ignore[attr-defined]
 
 
-def summarize_text(text: Any, head: int = 24, tail: int = 24) -> str:
+def summarize_text(text: Any, head: int = 120, tail: int = 80) -> str:
     if text is None:
         return ""
     value = str(text).strip()
@@ -43,7 +43,7 @@ def summarize_text(text: Any, head: int = 24, tail: int = 24) -> str:
     return f"{value[:head]}...{value[-tail:]}"
 
 
-def summarize_value(value: Any, head: int = 24, tail: int = 24) -> str:
+def summarize_value(value: Any, head: int = 120, tail: int = 80) -> str:
     if value is None:
         return ""
     if isinstance(value, (dict, list, tuple, set)):
