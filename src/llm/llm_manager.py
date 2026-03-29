@@ -640,7 +640,7 @@ class LlmManager:
 
         # 当前先取第一个工具调用，避免多工具时的执行顺序问题
         first_call = tool_calls[0]
-        tool_name = first_call.get("name") if isinstance(first_call, dict) else ""
+        tool_name = self._normalize_tool_name(first_call.get("name") if isinstance(first_call, dict) else "")
         params = first_call.get("args") if isinstance(first_call, dict) else {}
         if not isinstance(params, dict):
             params = {}
@@ -762,7 +762,7 @@ class LlmManager:
         request_id = f"{llm_role}-{start_ts.strftime('%H%M%S%f')}"
         log_event(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             "LLM 流式调用开始",
             {
                 "阶段": stage,
@@ -796,7 +796,7 @@ class LlmManager:
             )
             log_event(
                 logger,
-                logging.INFO,
+                logging.DEBUG,
                 "LLM 流式调用结束",
                 {"阶段": stage, "角色": llm_role, "耗时毫秒": elapsed_ms, "输出长度": output_chars, "请求ID": request_id},
             )
@@ -1029,6 +1029,35 @@ class LlmManager:
         prompt = self._build_chat_prompt(query, context, current_trip)
         return self.stream_llm_text(prompt, llm_role="generation", stage="chat_response_stream")
 
+    def _normalize_tool_name(self, tool_name: Any) -> str:
+        """将工具名归一化为已注册的字符串名称，避免模型返回 list 等异常结构。"""
+        if isinstance(tool_name, str):
+            normalized = tool_name.strip()
+        elif isinstance(tool_name, (list, tuple)):
+            normalized = ""
+            for item in tool_name:
+                candidate = self._normalize_tool_name(item)
+                if candidate:
+                    normalized = candidate
+                    break
+        elif isinstance(tool_name, dict):
+            normalized = self._normalize_tool_name(tool_name.get("name") or tool_name.get("tool_name"))
+        else:
+            normalized = str(tool_name or "").strip()
+        if not normalized:
+            return ""
+        valid_names = {str(item.get("name") or "") for item in self.list_tools() if isinstance(item, dict)}
+        return normalized if normalized in valid_names else ""
+
+    def _normalize_tool_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        """统一修正工具路由结果，避免异常结构直接进入执行阶段。"""
+        normalized = dict(decision or {}) if isinstance(decision, dict) else {}
+        normalized["tool_name"] = self._normalize_tool_name(normalized.get("tool_name"))
+        if not isinstance(normalized.get("params"), dict):
+            normalized["params"] = {}
+        normalized["needs_tool"] = bool(normalized.get("needs_tool")) and bool(normalized.get("tool_name"))
+        return normalized
+
     def decide_tool_call(self, query: str, context: Optional[List[Any]] = None) -> Dict[str, Any]:
         """使用分析模型进行工具路由决策，返回 needs_tool/tool_name/params。"""
         tools = self.list_tools()
@@ -1076,13 +1105,11 @@ class LlmManager:
             data = {"needs_tool": False, "tool_name": "", "params": {}}
         if not isinstance(data, dict):
             return {"needs_tool": False, "tool_name": "", "params": {}}
-        if not isinstance(data.get("params"), dict):
-            data["params"] = {}
         if "needs_tool" not in data:
             data["needs_tool"] = False
         if "tool_name" not in data:
             data["tool_name"] = ""
-        return data
+        return self._normalize_tool_decision(data)
 
     def call_tool_by_llm(self, query: str, context: Optional[List[Any]] = None) -> Dict[str, Any]:
         """根据模型能力选择 FunctionCall 或工具路由，并执行工具调用。"""
@@ -1370,7 +1397,7 @@ class LlmManager:
         # 打印提示词构建的关键输入，便于定位 user_input/context/edit_note 引起的格式化异常
         log_event(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             "构建行程提示词",
             {
                 "目的地": user_input.get("destination"),
@@ -1794,7 +1821,7 @@ class LlmManager:
         cfg = self._generation_config
         log_event(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             "LLM 行程生成开始",
             {
                 "请求ID": request_id,
@@ -1825,7 +1852,7 @@ class LlmManager:
         cost = (datetime.now() - start_ts).total_seconds()
         log_event(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             "LLM 行程生成结束",
             {"请求ID": request_id, "耗时秒": cost, "响应长度": len(str(response_text)), "尝试次数": attempt},
         )
@@ -1857,7 +1884,7 @@ class LlmManager:
         
         log_event(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             "开始纯生成行程",
             {"目的地": user_input.get("destination"), "天数": user_input.get("days")},
         )
@@ -1869,7 +1896,7 @@ class LlmManager:
         prompt = self.build_trip_prompt(user_input, context, edit_cmd)
         log_event(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             "开始生成行程",
             {"目的地": user_input.get("destination"), "天数": user_input.get("days"), "模式": "非流式"},
         )
@@ -2160,7 +2187,7 @@ class LlmManager:
                         total_items += len(v)
             log_event(
                 logger,
-                logging.INFO,
+                logging.DEBUG,
                 "行程生成完成",
                 {"天数": trip_data.get("days"), "已规划天数": len(daily_plan), "行程项数量": total_items},
             )
@@ -2199,7 +2226,7 @@ class LlmManager:
     ) -> Dict[str, Any]:
         log_event(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             "开始处理行程修改",
             {"意图": intent_data.get("intent"), "参数键": list((intent_data.get("parameters") or {}).keys())},
         )
@@ -2217,7 +2244,7 @@ class LlmManager:
                 for _, v in daily_plan.items():
                     if isinstance(v, list):
                         total_items += len(v)
-            log_event(logger, logging.INFO, "行程修改完成", {"已规划天数": len(daily_plan), "行程项数量": total_items})
+            log_event(logger, logging.DEBUG, "行程修改完成", {"已规划天数": len(daily_plan), "行程项数量": total_items})
         else:
             log_event(logger, logging.INFO, "行程修改返回非标准结构", {"类型": str(type(modified_trip)), "文本长度": len(str(modified_trip))})
 

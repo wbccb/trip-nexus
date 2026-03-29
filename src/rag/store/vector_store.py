@@ -2,7 +2,7 @@ from typing import List, Dict, Any
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from chromadb import PersistentClient
+from chromadb import EphemeralClient, PersistentClient
 from src.config import Config
 from src.rag.module.intent_recognition import _get_sentence_transformer
 import logging
@@ -28,10 +28,11 @@ class VectorStore:
     def __init__(self, collection_name: str = "web_search_cache"):
         self.config = Config()
         self.embeddings = _SentenceTransformerEmbeddings(self.config.SENTENCE_BERT_MODEL)
-        self.persist_directory = self.config.CHROMA_DB_PATH
+        self.persist_directory = os.path.abspath(self.config.CHROMA_DB_PATH)
         self.collection_name = self._normalize_collection_name(collection_name)
         self.client = None
         self.vector_db = None
+        self.client_mode = "persistent"
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config.RAG_CHUNK_SIZE,
             chunk_overlap=self.config.RAG_CHUNK_OVERLAP,
@@ -65,13 +66,22 @@ class VectorStore:
     def _build_client(self):
         """构建 Chroma client，初始化失败时自动修复持久化目录后重试。"""
         try:
+            self.client_mode = "persistent"
             return PersistentClient(path=self.persist_directory)
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
             logger.warning(f"PersistentClient init failed, start repair: {exc}")
             self._repair_persist_directory()
-            return PersistentClient(path=self.persist_directory)
+            try:
+                self.client_mode = "persistent"
+                return PersistentClient(path=self.persist_directory)
+            except BaseException as retry_exc:
+                if isinstance(retry_exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                logger.warning(f"PersistentClient retry failed, fallback to EphemeralClient: {retry_exc}")
+                self.client_mode = "ephemeral"
+                return EphemeralClient()
 
     def _repair_persist_directory(self) -> None:
         """修复持久化目录：备份损坏目录并重建空目录。"""

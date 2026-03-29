@@ -94,10 +94,11 @@ def log_llm_start(
     model: str,
     prompt: Any,
     extra: Optional[Dict[str, Any]] = None,
+    level: int = logging.DEBUG,
 ) -> datetime:
     log_event(
         logger,
-        logging.INFO,
+        level,
         f"LLM 调用开始: {stage}\n----------------------",
         {
             "模型": model,
@@ -116,11 +117,12 @@ def log_llm_end(
     started_at: datetime,
     output: Any,
     extra: Optional[Dict[str, Any]] = None,
+    level: int = logging.DEBUG,
 ) -> None:
     cost = (datetime.now() - started_at).total_seconds()
     log_event(
         logger,
-        logging.INFO,
+        level,
         f"LLM 调用结束: {stage}\n----------------------",
         {
             "耗时秒": cost,

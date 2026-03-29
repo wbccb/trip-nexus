@@ -1125,7 +1125,7 @@ async def _run_flow_stream(
                 _log_flow_step(
                     message_id,
                     session_id,
-                    "主流程 Step 6a 普通流式生成",
+                    "主流程 Step 6 行程生成与后处理",
                     "开始",
                     {"上下文条数": len(merged_context_texts), "目的地": user_input.get("destination"), "天数": user_input.get("days")},
                 )
@@ -1164,14 +1164,28 @@ async def _run_flow_stream(
                     "回复预览": summarize_value(response_text, head=140, tail=100),
                 }
                 generation_log_payload.update(_summarize_trip_stage(trip_data))
-                _log_flow_step(message_id, session_id, "主流程 Step 6a 普通流式生成", "完成", generation_log_payload)
+                # 记录行程生成的调试信息，不再在这里打印 Step 完成日志
+                _log_flow_step(message_id, session_id, "行程生成解析完成", "调试", generation_log_payload, level=logging.DEBUG)
 
         if trip_data:
-            _log_flow_step(message_id, session_id, "主流程 Step 6 后处理", "开始", _summarize_trip_stage(trip_data))
+            # 开始后处理逻辑
             if isinstance(trip_data, dict):
+                _log_flow_step(message_id, session_id, "开始约束校验与冲突检测", "调试", level=logging.DEBUG)
                 constraints_satisfied = _build_constraint_statuses(trip_data, constraints_used)
                 generated_conflict_report = llm_manager.build_conflict_report(trip_data, constraints_used)
                 conflict_report = generated_conflict_report.model_dump()
+                _log_flow_step(
+                    message_id,
+                    session_id,
+                    "约束与冲突检测完成",
+                    "调试",
+                    {
+                        "约束数": len(constraints_satisfied),
+                        "冲突数": len(conflict_report.get("conflicts") or []),
+                        "替代方案数": len(conflict_report.get("alternatives") or []),
+                    },
+                    level=logging.DEBUG,
+                )
                 metrics["conflict_detected"] = bool(conflict_report.get("has_conflicts"))
                 metrics["plan_alternative_generated"] = bool(conflict_report.get("alternatives"))
                 if conflict_report.get("has_conflicts"):
@@ -1198,14 +1212,18 @@ async def _run_flow_stream(
                 trip_data["constraints_satisfied"] = constraints_satisfied
                 trip_data["conflict_report"] = conflict_report
             _get_storage().store_trip_data(session_id, trip_data)
+            # 合并 Step 6 整体完成日志
             _log_flow_step(
                 message_id,
                 session_id,
-                "主流程 Step 6 后处理",
+                "主流程 Step 6 行程生成与后处理",
                 "完成",
                 {
-                    "约束条数": len(constraints_satisfied),
-                    "存在冲突": bool(conflict_report.get("has_conflicts")),
+                    "目的地": trip_data.get("destination"),
+                    "天数": trip_data.get("days"),
+                    "约束校验数": len(constraints_satisfied),
+                    "约束满足情况": [c.get("constraint_name") for c in constraints_satisfied if c.get("satisfied")],
+                    "检测到冲突": bool(conflict_report.get("has_conflicts")),
                     "冲突数": len(conflict_report.get("conflicts") or []),
                     "替代方案数": len(conflict_report.get("alternatives") or []),
                 },
@@ -1216,7 +1234,7 @@ async def _run_flow_stream(
             _log_flow_step(
                 message_id,
                 session_id,
-                "主流程 Step 6 后处理",
+                "主流程 Step 6 行程生成与后处理",
                 "跳过",
                 {"原因": "未生成结构化 trip_data", "回复预览": summarize_value(response_text, head=140, tail=100)},
             )
