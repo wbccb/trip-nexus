@@ -1,7 +1,8 @@
 import asyncio
 import json
+import math
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -43,6 +44,34 @@ from src.api.logic.flow import (
 )
 
 router = APIRouter(prefix="/api/flow", tags=["flow"])
+
+
+def _sanitize_sse_payload(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        normalized: Dict[str, Any] = {}
+        for key, item in value.items():
+            normalized[str(key)] = _sanitize_sse_payload(item)
+        return normalized
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_sse_payload(item) for item in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+        return _sanitize_sse_payload(value.model_dump())
+    return value
+
+
+def _serialize_sse_event(event: Dict[str, Any]) -> str:
+    return json.dumps(
+        _sanitize_sse_payload(event),
+        ensure_ascii=False,
+        allow_nan=False,
+        default=str,
+    )
+
+
 
 @router.post("/stream")
 async def stream_main_flow(
@@ -129,7 +158,7 @@ async def stream_main_flow(
                 if events:
                     for event in events:
                         current_sequence = int(event.get("sequence") or current_sequence)
-                        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                        yield f"data: {_serialize_sse_event(event)}\n\n"
                         if bool(event.get("is_final")):
                             return
                 else:

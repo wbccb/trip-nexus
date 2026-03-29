@@ -692,9 +692,24 @@ def _log_flow_step(
     data: Optional[Dict[str, Any]] = None,
     *,
     level: int = logging.INFO,
+    full_payload: bool = False,
 ) -> None:
     payload = {**(data or {})}
-    log_event(logger, level, f"\n\n{step_name}{status}", payload)
+    # 在非 RAG 流程开始时添加空行分隔，使用 print() 避免产生带前缀的空 INFO 日志
+    if status == "开始":
+        import sys
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    log_title = f"{step_name}{status}\n----------------------"
+    if full_payload:
+        # 同样使用三行式输出
+        logger.log(level, "%s\n%s", log_title, json.dumps(payload, ensure_ascii=False, default=str))
+        return
+
+    # 对于完成状态的日志，使用多换行符以分隔后续不同步骤，否则使用分隔线。
+    suffix = "\n\n\n\n\n" if status in ["完成", "结束", "done", "finished"] else "\n==========================="
+    log_event(logger, level, log_title, payload, suffix=suffix)
 
 
 async def _run_flow_stream(
@@ -1227,6 +1242,23 @@ async def _run_flow_stream(
             }
         )
 
+        finalize_event_payload = {
+            "trip_data": trip_data,
+            "response_text": response_text,
+            "metrics": metrics,
+            "constraints_used": constraints_used,
+            "constraints_satisfied": constraints_satisfied,
+            "conflict_report": conflict_report,
+            "source_evidence": source_evidence,
+            "knowledge_debug": {
+                "knowledge_scope": str(payload.knowledge_scope or "private_plus_public"),
+                "allow_public_fusion": allow_public_fusion,
+                "kb_context_count": len(kb_context_texts),
+                "source_evidence_count": len(source_evidence),
+            },
+            "agent_escalated": metrics["agent_escalated"],
+            "escalation_reasons": escalation_reasons,
+        }
         last_sequence += 1
         await _append_flow_event(
             message_id,
@@ -1240,36 +1272,28 @@ async def _run_flow_stream(
                 "mode": flow_mode,
                 "content_delta": "",
                 "is_final": True,
-                "payload": {
-                    "trip_data": trip_data,
-                    "response_text": response_text,
-                    "metrics": metrics,
-                    "constraints_used": constraints_used,
-                    "constraints_satisfied": constraints_satisfied,
-                    "conflict_report": conflict_report,
-                    "source_evidence": source_evidence,
-                    "knowledge_debug": {
-                        "knowledge_scope": str(payload.knowledge_scope or "private_plus_public"),
-                        "allow_public_fusion": allow_public_fusion,
-                        "kb_context_count": len(kb_context_texts),
-                        "source_evidence_count": len(source_evidence),
-                    },
-                    "agent_escalated": metrics["agent_escalated"],
-                    "escalation_reasons": escalation_reasons,
-                },
+                "payload": finalize_event_payload,
             },
         )
-        finalize_log_payload = {
-            "耗时毫秒": metrics["latency_ms"],
-            "intent": metrics.get("intent"),
-            "agent_escalated": metrics["agent_escalated"],
-            "rag_hit": metrics["rag_hit"],
-            "source_evidence_count": len(source_evidence),
-            "回复预览": summarize_value(response_text, head=140, tail=100),
-        }
-        finalize_log_payload.update(_summarize_trip_stage(trip_data))
-        finalize_log_payload.update(_build_preview_fields(source_evidence, prefix="来源证据", max_items=3))
-        _log_flow_step(message_id, session_id, "主流程 Step 7 SSE finalize", "完成", finalize_log_payload)
+        _log_flow_step(
+            message_id,
+            session_id,
+            "主流程 Step 7 SSE finalize",
+            "完成",
+            {
+                "event": "end",
+                "sequence": last_sequence,
+                "message_id": message_id,
+                "session_id": session_id,
+                "step": "finalize",
+                "status": "done",
+                "mode": flow_mode,
+                "content_delta": "",
+                "is_final": True,
+                "payload": finalize_event_payload,
+            },
+            full_payload=True,
+        )
         _record_audit_log(
             action="flow_stream_completed",
             status="success",

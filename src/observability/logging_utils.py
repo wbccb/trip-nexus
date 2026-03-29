@@ -77,11 +77,12 @@ def log_event(
     level: int,
     message: str,
     data: Optional[Dict[str, Any]] = None,
+    suffix: str = "\n===========================",
     **kwargs: Any,
 ) -> None:
     kv_text = format_kv(data, **kwargs)
     if kv_text:
-        logger.log(level, "%s | %s", message, kv_text)
+        logger.log(level, "%s\n%s%s", message, kv_text, suffix)
         return
     logger.log(level, message)
 
@@ -97,7 +98,7 @@ def log_llm_start(
     log_event(
         logger,
         logging.INFO,
-        f"LLM 调用开始: {stage}",
+        f"LLM 调用开始: {stage}\n----------------------",
         {
             "模型": model,
             "提示词长度": len(str(prompt or "")),
@@ -120,7 +121,7 @@ def log_llm_end(
     log_event(
         logger,
         logging.INFO,
-        f"LLM 调用结束: {stage}",
+        f"LLM 调用结束: {stage}\n----------------------",
         {
             "耗时秒": cost,
             "输出长度": len(str(output or "")),

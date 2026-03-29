@@ -62,6 +62,21 @@ function resolveTripConstraints(source) {
   });
 }
 
+function extractTripDataFromText(responseText) {
+  const rawText = String(responseText || "").trim();
+  if (!rawText) {
+    return null;
+  }
+  const fencedMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const jsonText = fencedMatch?.[1] ? fencedMatch[1].trim() : rawText;
+  try {
+    const parsed = JSON.parse(jsonText);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 export function useTrip({
   activeSessionId,
   knowledgeGenerateQuery,
@@ -284,6 +299,15 @@ export function useTrip({
           setActiveSessionId(streamSessionId);
           // 持久化会话 ID
           localStorage.setItem(SESSION_STORAGE_KEY, streamSessionId);
+        }
+        if (!streamTripData && accumulatedText) {
+          streamTripData = extractTripDataFromText(accumulatedText);
+          if (streamTripData) {
+            logDebug("行程", "主流程终态缺少 trip_data，已从流式文本回退解析", {
+              destination: streamTripData?.destination,
+              days: streamTripData?.days,
+            });
+          }
         }
         // 若拿到行程数据则更新
         if (streamTripData) {

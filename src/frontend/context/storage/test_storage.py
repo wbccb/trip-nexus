@@ -2,12 +2,13 @@ import hashlib
 import json
 import sqlite3
 import datetime
+import os
 import time
 from typing import Optional, Dict, List
 from pydantic import ValidationError
 import logging
 from src.frontend.context.entity import SessionContext, CoreEntity
-from src.config import Config
+from src.config import Config, PROJECT_ROOT
 from .base_storage import BaseConversationStorage
 from .date_time_encoder import DateTimeEncoder
 from src.observability import log_event
@@ -21,21 +22,59 @@ class TestConversationStorage(BaseConversationStorage):
     def __init__(self, config: Config):
         # 1. 内存字典模拟Redis（键值对+过期时间）
         self.redis_mock: Dict[str, tuple[[str, float]]] = {}
-        # 2. SQLite连接（文件型数据库，无需安装，也可改用:memory:内存模式）
-        self.sqlite_conn = sqlite3.connect(
-            "trip_test.db",
+        self.sqlite_db_path = os.path.join(PROJECT_ROOT, "trip_test.db")
+        self.sqlite_conn = self._open_sqlite_connection()
+        self._ensure_sqlite_available(recreate_on_failure=True)
+        self._init_sqlite_tables()
+
+    def _open_sqlite_connection(self) -> sqlite3.Connection:
+        sqlite_conn = sqlite3.connect(
+            self.sqlite_db_path,
             check_same_thread=False,
             timeout=5,
         )
-        self.sqlite_conn.row_factory = sqlite3.Row
-        self.sqlite_conn.execute("PRAGMA journal_mode=WAL")
+        sqlite_conn.row_factory = sqlite3.Row
+        return sqlite_conn
+
+    def _recreate_sqlite_db(self, reason: str) -> None:
+        try:
+            self.sqlite_conn.close()
+        except Exception:
+            pass
+        corrupt_path = f"{self.sqlite_db_path}.corrupt.{int(time.time())}"
+        if os.path.exists(self.sqlite_db_path):
+            os.replace(self.sqlite_db_path, corrupt_path)
+        self.sqlite_conn = self._open_sqlite_connection()
         self.sqlite_conn.execute("PRAGMA busy_timeout = 5000")
-        # 初始化SQLite表结构
-        self._init_sqlite_tables()
+        self.sqlite_conn.execute("PRAGMA journal_mode=WAL")
+        log_event(
+            logger,
+            logging.WARNING,
+            "测试存储 SQLite 文件损坏，已自动重建",
+            {"数据库": self.sqlite_db_path, "备份文件": corrupt_path, "原因": reason},
+        )
+
+    def _ensure_sqlite_available(self, recreate_on_failure: bool = False) -> None:
+        try:
+            self.sqlite_conn.execute("PRAGMA busy_timeout = 5000")
+            self.sqlite_conn.execute("PRAGMA journal_mode=WAL")
+            self.sqlite_conn.execute("PRAGMA schema_version")
+        except sqlite3.DatabaseError as exc:
+            if not recreate_on_failure:
+                raise
+            self._recreate_sqlite_db(str(exc))
+
+    def _get_cursor(self) -> sqlite3.Cursor:
+        try:
+            self._ensure_sqlite_available()
+        except sqlite3.DatabaseError as exc:
+            self._recreate_sqlite_db(str(exc))
+            self._init_sqlite_tables()
+        return self.sqlite_conn.cursor()
 
     def _init_sqlite_tables(self):
         """初始化SQLite表（与MySQL表结构一致）"""
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
 
         # 会话数据
         cursor.execute("""
@@ -135,7 +174,7 @@ class TestConversationStorage(BaseConversationStorage):
 
         # 2. SQLite存储（模拟MySQL）
         now = datetime.datetime.now().isoformat()
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         # SQLite的UPSERT语法（对应MySQL的ON DUPLICATE KEY UPDATE）
         cursor.execute("""
         INSERT INTO core_entities (session_id, entities_json, last_updated)
@@ -158,7 +197,7 @@ class TestConversationStorage(BaseConversationStorage):
                 pass  # Redis数据坏了，尝试查数据库或修复
 
         # 2. 再查SQLite
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         cursor.execute("SELECT entities_json FROM core_entities WHERE session_id = ?", (session_id,))
         result = cursor.fetchone()
         
@@ -203,7 +242,7 @@ class TestConversationStorage(BaseConversationStorage):
     def store_long_term_summary(self, session_id: str, summary: str):
         """存储长期摘要（SQLite模拟MySQL）"""
         now = datetime.datetime.now().isoformat()
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         cursor.execute("""
         INSERT INTO long_term_summaries (session_id, summary, last_updated)
         VALUES (?, ?, ?)
@@ -215,7 +254,7 @@ class TestConversationStorage(BaseConversationStorage):
 
     def get_long_term_summary(self, session_id: str) -> str:
         """获取长期摘要（SQLite模拟MySQL）"""
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         cursor.execute("SELECT summary FROM long_term_summaries WHERE session_id = ?", (session_id,))
         result = cursor.fetchone()
         return result[0] if result else ""
@@ -232,7 +271,7 @@ class TestConversationStorage(BaseConversationStorage):
         # 但由于 _init_sqlite_tables 只在初始化调用，我们这里动态检查/创建表比较安全，
         # 或者假设表已存在（需要修改 _init_sqlite_tables）
         # 为方便起见，我们在 store 时检查并创建表（仅供测试用）
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS trip_data_store (
             session_id TEXT PRIMARY KEY,
@@ -264,7 +303,7 @@ class TestConversationStorage(BaseConversationStorage):
                 pass
 
         # 2. SQLite
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         # 确保表存在
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS trip_data_store (
@@ -290,7 +329,7 @@ class TestConversationStorage(BaseConversationStorage):
     def store_session(self, user_id: str, session_id: str):
         update_time = datetime.datetime.now().isoformat()
         name = f"名称{session_id}-{update_time}"
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         cursor.execute("""
                INSERT INTO session_list (session_id, user_id, name, update_time)
                VALUES (?, ?, ?, ?)
@@ -302,20 +341,20 @@ class TestConversationStorage(BaseConversationStorage):
         self.sqlite_conn.commit()
 
     def get_session_list(self, user_id: str):
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         # 根据更新时间倒序排列，更新时间较新的排在最上面
         cursor.execute("SELECT * FROM session_list WHERE user_id = ? ORDER BY update_time DESC", (user_id,))
         return cursor.fetchall()
 
     def get_session_meta(self, session_id: str) -> Optional[Dict]:
         """获取会话元数据（包含 user_id 权属信息）"""
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         cursor.execute("SELECT * FROM session_list WHERE session_id = ?", (session_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
 
     def delete_session(self, session_id: str):
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS trip_data_store (
             session_id TEXT PRIMARY KEY,
@@ -340,7 +379,7 @@ class TestConversationStorage(BaseConversationStorage):
 
     def store_session_chat(self, session_id: str, message: str):
         update_time = datetime.datetime.now().isoformat()
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         cursor.execute("""
             INSERT INTO session_chat (session_id, message, update_time)
             VALUES (?, ?, ?)
@@ -352,7 +391,7 @@ class TestConversationStorage(BaseConversationStorage):
         last_error = None
         for _ in range(3):
             try:
-                cursor = self.sqlite_conn.cursor()
+                cursor = self._get_cursor()
                 cursor.execute("""
                     SELECT message
                     FROM session_chat
@@ -366,6 +405,6 @@ class TestConversationStorage(BaseConversationStorage):
         raise last_error
 
     def delete_session_chat_by_id(self, chat_id: int):
-        cursor = self.sqlite_conn.cursor()
+        cursor = self._get_cursor()
         cursor.execute("DELETE FROM session_chat WHERE id = ?", (chat_id,))
         self.sqlite_conn.commit()

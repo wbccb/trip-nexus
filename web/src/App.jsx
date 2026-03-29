@@ -173,7 +173,7 @@ export default function App() {
   const [tripForm] = Form.useForm()
   tripForm.setFieldsValue({
      destination: "成都",
-      days: 3,
+      days: 1,
       budget: 3000,
       preference: "美食", 
       budget_level: "economy",
@@ -425,13 +425,13 @@ export default function App() {
             total_max_chars: Number(metrics?.context_budget?.total_max_chars || 0),
           },
         }))
-        if (finalizedResponseText) {
-          updateChatMessageById(assistantMessageId, finalizedResponseText)
-        } else if (finalizedTripData) {
+        if (finalizedTripData) {
           updateChatMessageById(
             assistantMessageId,
             `已生成 ${values.destination} 的 ${values.days} 天游程，请查看中间行程详情。`
           )
+        } else if (finalizedResponseText) {
+          updateChatMessageById(assistantMessageId, finalizedResponseText)
         } else if (!streamingText) {
           updateChatMessageById(assistantMessageId, "本次流程已结束，但没有拿到可展示的行程结果，请稍后查看后端日志。")
         }

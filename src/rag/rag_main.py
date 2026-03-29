@@ -32,6 +32,11 @@ def _log_llm_output(tag: str, cleaned_text: str) -> None:
     log_event(logger, logging.DEBUG, f"RAG LLM 输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
 
 
+def _invoke_prompt(llm: Any, prompt: PromptTemplate, **kwargs: Any) -> Any:
+    prompt_text = prompt.format(**kwargs)
+    return llm.invoke(prompt_text)
+
+
 def _build_item_preview_fields(
     items: List[Dict[str, Any]],
     *,
@@ -48,7 +53,7 @@ def _build_item_preview_fields(
 
 
 def _log_rag_step(message: str, data: Optional[Dict[str, Any]] = None) -> None:
-    log_event(logger, logging.INFO, f"\n\n{message}", data)
+    log_event(logger, logging.INFO, f"{message}\n----------------------", data)
 
 
 class AIRetrievalPipeline:
@@ -175,7 +180,6 @@ class AIRetrievalPipeline:
             template=template,
             input_variables=["content", "max_chars"]
         )
-        chain = prompt | self.llm
         started_at = log_llm_start(
             logger,
             stage="RAG 长文本摘要",
@@ -183,7 +187,7 @@ class AIRetrievalPipeline:
             prompt=template.format(content=summarize_value(text, 60, 60), max_chars=max_chars),
             extra={"目标长度": max_chars},
         )
-        response = chain.invoke({"content": text, "max_chars": max_chars})
+        response = _invoke_prompt(self.llm, prompt, content=text, max_chars=max_chars)
         summary_raw = response.content if hasattr(response, "content") else response
         summary = _strip_think_content(summary_raw)
         _log_llm_output("summarize_response", summary)
@@ -586,14 +590,13 @@ class AIRetrievalPipeline:
         log_event(logger, logging.DEBUG, "RAG 回答提示词已构建", {"提示词预览": prompt.format(context=context, query=query)})
 
 
-        chain = prompt | self.llm
         started_at = log_llm_start(
             logger,
             stage="RAG 回答生成",
             model=getattr(self.llm, "model", getattr(self.llm, "model_name", "未知模型")),
             prompt=prompt.format(context=summarize_value(context, 60, 60), query=query),
         )
-        raw_response = chain.invoke({"context": context, "query": query})
+        raw_response = _invoke_prompt(self.llm, prompt, context=context, query=query)
         response_text = raw_response.content if hasattr(raw_response, "content") else raw_response
         cleaned_text = _strip_think_content(response_text)
         _log_llm_output("rag_answer_response", cleaned_text)

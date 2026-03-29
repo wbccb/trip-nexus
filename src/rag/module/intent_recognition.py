@@ -1,5 +1,5 @@
 import json
-from typing import Dict
+from typing import Any, Dict
 from functools import lru_cache
 from langchain_core.prompts import ChatPromptTemplate
 import re
@@ -43,7 +43,14 @@ def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
     log_event(logger, logging.INFO, f"意图识别输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
 
+
+def _invoke_prompt(llm: Any, prompt: ChatPromptTemplate, **kwargs: Any) -> Any:
+    prompt_text = prompt.format_prompt(**kwargs).to_string()
+    return llm.invoke(prompt_text)
+
+
 class IntentRecognizer:
+
     def __init__(self, llm):
         self.config = Config()
         self.llm = llm
@@ -138,8 +145,7 @@ class IntentRecognizer:
         只输出JSON，不要包含其他内容。
         """)
 
-        chain = prompt | self.llm
-        response = chain.invoke({"query": query})
+        response = _invoke_prompt(self.llm, prompt, query=query)
         content = response.content if hasattr(response, 'content') else response
         cleaned_content = _strip_think_content(content)
         cleaned_content = cleaned_content.replace("```json", "").replace("```", "").strip()

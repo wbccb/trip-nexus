@@ -630,7 +630,7 @@ class LlmManager:
 
         # 模型未触发工具时直接返回，不进行额外兜底路由
         if not tool_calls:
-            log_event(logger, logging.INFO, "工具选择完成，未命中工具")
+            log_event(logger, logging.INFO, "工具选择完成，未命中工具\n----------------------")
             return {
                 "needs_tool": False,
                 "decision": {"needs_tool": False, "tool_name": "", "params": {}, "source": "function_call"},
@@ -657,7 +657,7 @@ class LlmManager:
                 "fallback": False,
             }
 
-        log_event(logger, logging.INFO, "工具选择完成", {"工具名": tool_name, "参数": params})
+        log_event(logger, logging.INFO, "工具选择完成\n----------------------", {"工具名": tool_name, "参数": params})
 
 
         # 执行工具并返回标准化结果
@@ -678,7 +678,7 @@ class LlmManager:
         log_event(
             logger,
             logging.INFO if success_flag is not False else logging.WARNING,
-            "工具执行完成",
+            "工具执行完成\n----------------------",
             {"工具名": tool_name, "成功": success_flag, "结果数量": result_size, "错误": error_message},
         )
         return res
@@ -1095,7 +1095,7 @@ class LlmManager:
         decision = self.decide_tool_call(query, context)
         if not decision.get("needs_tool"):
             # 工具路由未触发时，仅保留一条简洁 INFO，避免刷出模型原始输出。
-            log_event(logger, logging.INFO, "工具路由完成", {"是否触发": False})
+            log_event(logger, logging.INFO, "工具路由完成\n----------------------", {"是否触发": False})
             return {"needs_tool": False, "decision": decision, "result": None}
         tool_name = decision.get("tool_name") or ""
         params = decision.get("params") or {}
@@ -1103,7 +1103,7 @@ class LlmManager:
         result = self.call_tool(tool_name, params)
         res = {"needs_tool": True, "decision": decision, "result": result}
         # 工具执行完成后只打印流程名、工具名、是否成功与结果摘要，细节下沉到 DEBUG。
-        log_event(logger, logging.INFO, "工具路由执行完成", _summarize_tool_route_result(tool_name, result))
+        log_event(logger, logging.INFO, "工具路由执行完成\n----------------------", _summarize_tool_route_result(tool_name, result))
         log_event(logger, logging.DEBUG, "工具路由调试信息", {"工具名": tool_name, "参数": params, "结果摘要": res})
         return res
 
@@ -1909,7 +1909,7 @@ class LlmManager:
         log_event(
             logger,
             logging.INFO,
-            "实体抽取与意图识别完成",
+            "实体抽取与意图识别完成\n----------------------",
             {
                 "成功": True,
                 "意图": intent_data.get("intent"),

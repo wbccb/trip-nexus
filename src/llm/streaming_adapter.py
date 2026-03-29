@@ -19,7 +19,7 @@ def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
 
 
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
-    log_event(logger, logging.INFO, f"流式适配输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
+    log_event(logger, logging.INFO, f"流式适配输出: {tag}\n----------------------", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
 
 
 class LlmStreamingAdapter:
