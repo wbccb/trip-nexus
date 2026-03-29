@@ -157,6 +157,7 @@ export default function App() {
   const [sendingChat, setSendingChat] = useState(false)
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false)
   const [isTripModalOpen, setIsTripModalOpen] = useState(false)
+  const [isWorkspaceModalOpen, setIsWorkspaceModalOpen] = useState(false)
   const [selectedPoiId, setSelectedPoiId] = useState("")
   const [flowRuntimeStatus, setFlowRuntimeStatus] = useState({
     intent: "",
@@ -464,37 +465,34 @@ export default function App() {
 
   // Tab 列表在这里集中拼装，而不是散在 JSX 里临时判断，
   // 这样“普通用户无管理页，管理员多一个管理页”这类权限差异会更直观。
-  const tabItems = [
-    {
-      key: "trip",
-      label: "行程详情",
-      children: (
-        <TripTab
-          conflictReport={conflictReport}
-          lockedDays={lockedDays}
-          loadingTrip={loadingTrip}
-          selectedAlternative={selectedAlternative}
-          tripDays={tripDays}
-          tripResult={tripResult}
-          selectedPoiId={selectedPoiId}
-          onApplyAlternative={async (nextTrip) => {
-            updateTripResult(nextTrip)
-            setConflictReport({ has_conflicts: false, conflicts: [], alternatives: [] })
-            setSelectedAlternative(null)
-            await persistFlowTripResult(nextTrip)
-          }}
-          onConflictReportChange={setConflictReport}
-          onLockedDaysChange={setLockedDays}
-          onSelectAlternative={setSelectedAlternative}
-          onSelectPoi={handleSelectPoi}
-          onTripChange={async (nextTrip) => {
-            updateTripResult(nextTrip)
-            await persistFlowTripResult(nextTrip)
-          }}
-          onReplanDay={handleFlowReplanDay}
-        />
-      ),
-    },
+  const tripContent = (
+    <TripTab
+      conflictReport={conflictReport}
+      lockedDays={lockedDays}
+      loadingTrip={loadingTrip}
+      selectedAlternative={selectedAlternative}
+      tripDays={tripDays}
+      tripResult={tripResult}
+      selectedPoiId={selectedPoiId}
+      onApplyAlternative={async (nextTrip) => {
+        updateTripResult(nextTrip)
+        setConflictReport({ has_conflicts: false, conflicts: [], alternatives: [] })
+        setSelectedAlternative(null)
+        await persistFlowTripResult(nextTrip)
+      }}
+      onConflictReportChange={setConflictReport}
+      onLockedDaysChange={setLockedDays}
+      onSelectAlternative={setSelectedAlternative}
+      onSelectPoi={handleSelectPoi}
+      onTripChange={async (nextTrip) => {
+        updateTripResult(nextTrip)
+        await persistFlowTripResult(nextTrip)
+      }}
+      onReplanDay={handleFlowReplanDay}
+    />
+  )
+
+  const workspaceTabItems = [
     {
       key: "knowledge",
       label: "旅行灵感",
@@ -539,7 +537,7 @@ export default function App() {
   ]
 
   if (isAdmin) {
-    tabItems.push({
+    workspaceTabItems.push({
       key: "admin",
       label: "管理",
       children: <AdminPage />,
@@ -552,6 +550,9 @@ export default function App() {
         <div className="header-left">
           <Typography.Title level={4} className="app-title">
             AI 行程助手
+            <Button type="primary" size="small" onClick={() => setIsWorkspaceModalOpen(true)} style={{ marginLeft: 20 }}>
+                旅行灵感与管理
+            </Button>
           </Typography.Title>
           <Typography.Text className="app-subtitle">
             目的地规划 · 生成行程 · 地图概览
@@ -622,10 +623,7 @@ export default function App() {
             </div>
           </div>
           <div className="app-main">
-            <Tabs
-              defaultActiveKey="knowledge"
-              items={tabItems} 
-            />
+            {tripContent}
           </div>
           {/* <div className="app-right">
             <Card title="地图概览" className="panel-card map-card">
@@ -762,6 +760,16 @@ export default function App() {
             ]}
           />
         </Form>
+      </Modal>
+      <Modal
+        title="旅行灵感与管理"
+        open={isWorkspaceModalOpen}
+        onCancel={() => setIsWorkspaceModalOpen(false)}
+        footer={null}
+        width={1200}
+        destroyOnHidden
+      >
+        <Tabs defaultActiveKey="knowledge" items={workspaceTabItems} />
       </Modal>
     </Layout>
   )
