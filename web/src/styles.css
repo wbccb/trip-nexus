@@ -5,6 +5,10 @@ body {
   font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
+#root {
+    overflow: hidden;
+}
+
 .app-root {
   min-height: 100vh;
   height: 100vh;
@@ -71,6 +75,28 @@ body {
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+.app-main .trip-layout {
+    height: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+.app-main .ant-card {
+    display: flex;
+    flex-direction: column;
+
+    height: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+.app-main .ant-card-body {
+    overflow-y: scroll;
+
+    height: 0px;
+    flex: 1;
 }
 
 .app-right {

@@ -48,8 +48,10 @@ export default function LoginPage({ loading, onLogin, onRegister }) {
           maxWidth: 440,
           borderRadius: 24,
           boxShadow: "0 24px 80px rgba(28, 55, 90, 0.14)",
+          body: {
+            padding: 32,
+          },
         }}
-        bodyStyle={{ padding: 32 }}
       >
         <Typography.Title level={2} style={{ marginBottom: 8 }}>
           TripNexus
