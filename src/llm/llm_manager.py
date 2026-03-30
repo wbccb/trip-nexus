@@ -33,7 +33,7 @@ import logging
 
 
 class DailyPlanItem(BaseModel):
-    time: str = Field(description="格式如'09:00-09:30'，必须为半小时粒度时间段")
+    time: str = Field(description="格式如'09:00-12:00'，以3小时粒度时间段")
     attraction: str = Field(description="景点名称，必须准确")
     address: str = Field(description="详细地址，包含街道门牌号")
     city: str = Field(default="", description="城市名称，例如'成都市'")
@@ -1727,12 +1727,26 @@ class LlmManager:
     def build_conflict_report(self, trip_data: Dict[str, Any], constraints: Optional[Dict[str, Any]] = None) -> ConflictReport:
         # 对外统一暴露 build_conflict_report，内部再串联“检测冲突 -> 生成替代方案 -> 指标打点”。
         # 这样 app.py、trip/update、replan_day 都能复用同一套冲突闭环。
+        log_event(logger, logging.INFO, "冲突检测流程开始", {"目的地": trip_data.get("destination"), "天数": trip_data.get("days")})
         conflict_report = self._detect_conflicts(trip_data, constraints)
         if not conflict_report.has_conflicts:
+            log_event(logger, logging.INFO, "冲突检测流程完成", {"检测到冲突": False, "冲突数": 0, "替代方案数": 0})
             self._metrics.record("conflict_detected", {"detected": False})
             self._metrics.record("plan_alternative_generated", {"generated": False})
             return conflict_report
+        log_event(
+            logger,
+            logging.INFO,
+            "冲突检测命中，开始生成替代方案",
+            {"冲突数": len(conflict_report.conflicts), "说明": "当前进入替代方案生成阶段，可能触发额外 LLM 调用"},
+        )
         alternatives = self._generate_alternatives(trip_data, conflict_report.conflicts, constraints)
+        log_event(
+            logger,
+            logging.INFO,
+            "冲突检测流程完成",
+            {"检测到冲突": True, "冲突数": len(conflict_report.conflicts), "替代方案数": len(alternatives)},
+        )
         self._metrics.record("conflict_detected", {"detected": True, "count": len(conflict_report.conflicts)})
         self._metrics.record("plan_alternative_generated", {"generated": bool(alternatives), "count": len(alternatives)})
         return ConflictReport(

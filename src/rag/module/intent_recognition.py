@@ -12,9 +12,24 @@ logger = logging.getLogger(__name__)
 
 try:
     import streamlit as st
-    _st_cache_resource = st.cache_resource
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
 except Exception:
-    _st_cache_resource = None
+    st = None
+    get_script_run_ctx = None
+
+
+def _resolve_cache_resource():
+    if st is None or get_script_run_ctx is None:
+        return None
+    try:
+        if get_script_run_ctx(suppress_warning=True) is None:
+            return None
+        return st.cache_resource
+    except Exception:
+        return None
+
+
+_st_cache_resource = _resolve_cache_resource()
 
 if _st_cache_resource:
     @_st_cache_resource

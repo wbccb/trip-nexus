@@ -3,6 +3,7 @@ from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from chromadb import EphemeralClient, PersistentClient
+from chromadb.config import Settings
 from src.config import Config
 from src.rag.module.intent_recognition import _get_sentence_transformer
 import logging
@@ -67,7 +68,7 @@ class VectorStore:
         """构建 Chroma client，初始化失败时自动修复持久化目录后重试。"""
         try:
             self.client_mode = "persistent"
-            return PersistentClient(path=self.persist_directory)
+            return PersistentClient(path=self.persist_directory, settings=self._build_client_settings())
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
@@ -75,13 +76,17 @@ class VectorStore:
             self._repair_persist_directory()
             try:
                 self.client_mode = "persistent"
-                return PersistentClient(path=self.persist_directory)
+                return PersistentClient(path=self.persist_directory, settings=self._build_client_settings())
             except BaseException as retry_exc:
                 if isinstance(retry_exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 logger.warning(f"PersistentClient retry failed, fallback to EphemeralClient: {retry_exc}")
                 self.client_mode = "ephemeral"
-                return EphemeralClient()
+                return EphemeralClient(settings=self._build_client_settings())
+
+    def _build_client_settings(self) -> Settings:
+        """构建 Chroma settings，关闭匿名 telemetry，避免后端启动时产生无关日志。"""
+        return Settings(anonymized_telemetry=False)
 
     def _repair_persist_directory(self) -> None:
         """修复持久化目录：备份损坏目录并重建空目录。"""

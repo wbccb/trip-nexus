@@ -172,20 +172,18 @@ export default function App() {
   })
   const [lastFlowKnowledgeDebug, setLastFlowKnowledgeDebug] = useState(null)
   const [tripForm] = Form.useForm()
-  useEffect(() => {
     tripForm.setFieldsValue({
-     destination: "成都",
-      days: 1,
-      budget: 3000,
-      preference: "美食", 
-      budget_level: "economy",
-      intensity: "leisure",
-      pace: "cultural",
-      walking_limit_km: 5,
-      need_nap: true,
-      accessibility: false,
+        destination: "成都",
+        days: 1,
+        budget: 3000,
+        preference: "美食", 
+        budget_level: "economy",
+        intensity: "leisure",
+        pace: "cultural",
+        walking_limit_km: 5,
+        need_nap: true,
+        accessibility: false,
     })
-  }, [])
   const isAdmin = authUser?.role === "admin"
 
   const sessionTitle = useMemo(() => {
