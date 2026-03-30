@@ -1497,13 +1497,20 @@ async def _run_flow_stream(
                 )
                 generated_conflict_report = llm_manager.build_conflict_report(trip_data, constraints_used)
                 conflict_report = generated_conflict_report.model_dump()
+                blocking_conflict_count = len(
+                    [item for item in (conflict_report.get("conflicts") or []) if str(item.get("severity") or "") == "error"]
+                )
+                warning_conflict_count = len(
+                    [item for item in (conflict_report.get("conflicts") or []) if str(item.get("severity") or "") == "warning"]
+                )
                 _log_flow_step(
                     message_id,
                     session_id,
                     "主流程 Step 6.4 冲突检测",
                     "完成",
                     {
-                        "冲突数": len(conflict_report.get("conflicts") or []),
+                        "阻断冲突数": blocking_conflict_count,
+                        "告警数": warning_conflict_count,
                         "替代方案数": len(conflict_report.get("alternatives") or []),
                         "检测到冲突": bool(conflict_report.get("has_conflicts")),
                     },
@@ -1571,7 +1578,12 @@ async def _run_flow_stream(
                         "title": "冲突检测",
                         "data": {
                             "检测到冲突": bool(conflict_report.get("has_conflicts")),
-                            "冲突数": len(conflict_report.get("conflicts") or []),
+                            "阻断冲突数": len(
+                                [item for item in (conflict_report.get("conflicts") or []) if str(item.get("severity") or "") == "error"]
+                            ),
+                            "告警数": len(
+                                [item for item in (conflict_report.get("conflicts") or []) if str(item.get("severity") or "") == "warning"]
+                            ),
                             "替代方案数": len(conflict_report.get("alternatives") or []),
                         },
                     },

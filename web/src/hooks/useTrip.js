@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { message } from "antd";
 import {
+  previewConflictAlternative,
   replanFlowDay,
   streamMainFlow,
   updateFlowTripData,
@@ -113,15 +114,24 @@ export function useTrip({
 
   // 持久化主流程产物：将当前行程结果保存到后端会话
   const persistFlowTripResult = useCallback(
-    async (nextTrip, sessionOverride) => {
+    async (nextTrip, options = {}) => {
       if (!nextTrip) {
         return;
       }
+      const sessionOverride =
+        options && typeof options === "object" ? options.sessionIdOverride : options;
       const payload = {
         device_id: DEFAULT_DEVICE_ID,
         session_id: sessionOverride || activeSessionId,
         trip_data: nextTrip,
         constraints: resolveTripConstraints(nextTrip),
+        update_source: typeof options === "object" ? options.updateSource || null : null,
+        selected_alternative_label:
+          typeof options === "object" ? options.selectedAlternativeLabel || null : null,
+        selected_alternative_index:
+          typeof options === "object" && Number.isInteger(options.selectedAlternativeIndex)
+            ? options.selectedAlternativeIndex
+            : null,
       };
       // 即使只是本地编辑后的持久化，也要显式带上 constraints，
       // 这样后端才能重算 constraints_satisfied 与 conflict_report。
@@ -133,6 +143,27 @@ export function useTrip({
       setLockedDays(new Set());
     },
     [activeSessionId, setActiveSessionId],
+  );
+
+  // 记录用户当前预览的是哪个替代方案，便于后端终端日志还原“查看方案 -> 采用方案”的完整链路。
+  const reportAlternativePreview = useCallback(
+    async ({ alternativeLabel, alternativeIndex }) => {
+      if (!alternativeLabel || !Number.isInteger(alternativeIndex)) {
+        return null;
+      }
+      logDebug("行程", "用户当前预览冲突替代方案", {
+        alternativeLabel,
+        alternativeIndex,
+        sessionId: activeSessionId,
+      });
+      return previewConflictAlternative({
+        device_id: DEFAULT_DEVICE_ID,
+        session_id: activeSessionId,
+        alternative_label: alternativeLabel,
+        alternative_index: alternativeIndex,
+      });
+    },
+    [activeSessionId],
   );
 
   // 单日重排：触发主流程的指定天重规划能力
@@ -358,6 +389,7 @@ export function useTrip({
     tripDays,
     tripResult,
     persistFlowTripResult,
+    reportAlternativePreview,
     handleFlowReplanDay,
     updateTripResult,
   };

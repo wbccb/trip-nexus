@@ -1729,25 +1729,45 @@ class LlmManager:
         # 这样 app.py、trip/update、replan_day 都能复用同一套冲突闭环。
         log_event(logger, logging.INFO, "冲突检测流程开始", {"目的地": trip_data.get("destination"), "天数": trip_data.get("days")})
         conflict_report = self._detect_conflicts(trip_data, constraints)
-        if not conflict_report.has_conflicts:
+        # 核心逻辑：warning 级问题继续展示给前端，但不再升级成“需要替代方案”的阻断型冲突。
+        blocking_conflicts = [item for item in (conflict_report.conflicts or []) if getattr(item, "severity", "") == "error"]
+        if not blocking_conflicts:
+            if conflict_report.conflicts:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "冲突检测仅命中告警，跳过替代方案生成",
+                    {"告警数": len(conflict_report.conflicts), "阻断冲突数": 0},
+                )
             log_event(logger, logging.INFO, "冲突检测流程完成", {"检测到冲突": False, "冲突数": 0, "替代方案数": 0})
             self._metrics.record("conflict_detected", {"detected": False})
             self._metrics.record("plan_alternative_generated", {"generated": False})
-            return conflict_report
+            return ConflictReport(has_conflicts=False, conflicts=conflict_report.conflicts, alternatives=[])
         log_event(
             logger,
             logging.INFO,
             "冲突检测命中，开始生成替代方案",
-            {"冲突数": len(conflict_report.conflicts), "说明": "当前进入替代方案生成阶段，可能触发额外 LLM 调用"},
+            {"冲突数": len(blocking_conflicts), "说明": "当前进入替代方案生成阶段，可能触发额外 LLM 调用"},
         )
-        alternatives = self._generate_alternatives(trip_data, conflict_report.conflicts, constraints)
+        alternatives = self._generate_alternatives(trip_data, blocking_conflicts, constraints)
+        if alternatives:
+            log_event(
+                logger,
+                logging.INFO,
+                "冲突替代方案已生成，等待用户选择",
+                {
+                    "方案数": len(alternatives),
+                    "方案标签": [item.label for item in alternatives],
+                    "阻断冲突数": len(blocking_conflicts),
+                },
+            )
         log_event(
             logger,
             logging.INFO,
             "冲突检测流程完成",
-            {"检测到冲突": True, "冲突数": len(conflict_report.conflicts), "替代方案数": len(alternatives)},
+            {"检测到冲突": True, "冲突数": len(blocking_conflicts), "替代方案数": len(alternatives)},
         )
-        self._metrics.record("conflict_detected", {"detected": True, "count": len(conflict_report.conflicts)})
+        self._metrics.record("conflict_detected", {"detected": True, "count": len(blocking_conflicts)})
         self._metrics.record("plan_alternative_generated", {"generated": bool(alternatives), "count": len(alternatives)})
         return ConflictReport(
             has_conflicts=True,

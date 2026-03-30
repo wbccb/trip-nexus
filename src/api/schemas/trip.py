@@ -64,11 +64,28 @@ class TripUpdateRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
     trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
     constraints: Optional[Dict[str, Any]] = Field(None, description="可选约束参数，前端修改行程时显式透传")
+    update_source: Optional[str] = Field(None, description="更新来源，如 manual_edit_or_save/apply_conflict_alternative")
+    selected_alternative_label: Optional[str] = Field(None, description="用户最终采用的替代方案标签")
+    selected_alternative_index: Optional[int] = Field(None, description="用户最终采用的替代方案索引")
 
 
 class TripUpdateResponse(BaseModel):
     session_id: str = Field(..., description="会话ID")
     trip_data: Dict[str, Any] = Field(..., description="结构化行程数据")
+
+
+class TripConflictPreviewRequest(BaseModel):
+    # 该请求只用于记录“用户当前正在预览哪个替代方案”，不改写正式行程。
+    user_id: Optional[str] = Field(None, description="用户唯一ID，鉴权模式下会自动从 JWT 提取")
+    device_id: str = Field(..., description="设备唯一ID")
+    session_id: Optional[str] = Field(None, description="会话ID，可为空以便新建")
+    alternative_label: str = Field(..., description="当前预览的替代方案标签")
+    alternative_index: int = Field(..., description="当前预览的替代方案索引")
+
+
+class TripConflictPreviewResponse(BaseModel):
+    session_id: str = Field(..., description="会话ID")
+    ok: bool = Field(True, description="是否记录成功")
 
 
 class ReplanScope(BaseModel):

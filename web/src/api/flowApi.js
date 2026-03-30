@@ -1,6 +1,6 @@
 // 主流程相关接口封装
 // 引入基础地址与通用请求方法
-import { API_BASE, apiPost, getAuthToken } from "./httpClient.js";
+import { API_BASE, apiPost, apiPut, getAuthToken } from "./httpClient.js";
 import { logDebug } from "../utils/debugLogger.js";
 
 // 主流程流式接口：负责发起 /api/flow/stream 并消费 SSE 事件
@@ -43,7 +43,9 @@ export async function streamMainFlow(payload, onEvent, options = {}) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...(getAuthToken() ? { Authorization: `Bearer ${getAuthToken()}` } : {}),
+          ...(getAuthToken()
+            ? { Authorization: `Bearer ${getAuthToken()}` }
+            : {}),
         },
         body: JSON.stringify(payload || {}),
       });
@@ -196,7 +198,13 @@ export async function renderFlowGeojson(payload) {
 
 // 主流程结果持久化接口：保存用户编辑后的行程数据
 export async function updateFlowTripData(payload) {
-  return apiPost("/api/trip/update", payload);
+  // 后端 /api/trip/update 明确定义为 PUT，这里统一改成 apiPut 避免出现 405 Method Not Allowed。
+  return apiPut("/api/trip/update", payload);
+}
+
+// 冲突替代方案预览记录接口：只记录用户当前查看了哪个方案，不修改正式行程。
+export async function previewConflictAlternative(payload) {
+  return apiPost("/api/trip/conflict/preview", payload);
 }
 
 // 主流程单日重排接口：重新规划指定天的行程

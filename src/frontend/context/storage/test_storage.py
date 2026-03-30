@@ -3,6 +3,7 @@ import json
 import sqlite3
 import datetime
 import os
+import threading
 import time
 from typing import Optional, Dict, List
 from pydantic import ValidationError
@@ -20,44 +21,65 @@ class TestConversationStorage(BaseConversationStorage):
     """测试用例存储： SQLite(模拟MySQL) + 内存字典(模拟Redis)"""
 
     def __init__(self, config: Config):
-        # 1. 内存字典模拟Redis（键值对+过期时间）
+        """初始化测试存储实例并预热 SQLite。"""
         self.redis_mock: Dict[str, tuple[[str, float]]] = {}
         self.sqlite_db_path = os.path.join(PROJECT_ROOT, "trip_test.db")
+        self._sqlite_lock = threading.RLock()
         self.sqlite_conn = self._open_sqlite_connection()
         self._ensure_sqlite_available(recreate_on_failure=True)
         self._init_sqlite_tables()
 
     def _open_sqlite_connection(self) -> sqlite3.Connection:
+        """创建 SQLite 连接并统一设置连接级参数。"""
         sqlite_conn = sqlite3.connect(
             self.sqlite_db_path,
             check_same_thread=False,
             timeout=5,
         )
         sqlite_conn.row_factory = sqlite3.Row
+        sqlite_conn.execute("PRAGMA busy_timeout = 5000")
+        sqlite_conn.execute("PRAGMA journal_mode=WAL")
         return sqlite_conn
 
+    def _sqlite_sidecar_paths(self) -> List[str]:
+        """返回 SQLite 主文件及其 WAL/SHM 附属文件路径。"""
+        return [
+            self.sqlite_db_path,
+            f"{self.sqlite_db_path}-wal",
+            f"{self.sqlite_db_path}-shm",
+        ]
+
+    def _archive_sqlite_artifacts(self, suffix: str) -> List[str]:
+        """归档 SQLite 主文件与 sidecar 文件，避免旧 WAL 残留污染新库。"""
+        archived_paths: List[str] = []
+        for source_path in self._sqlite_sidecar_paths():
+            if not os.path.exists(source_path):
+                continue
+            archived_path = f"{source_path}.{suffix}"
+            os.replace(source_path, archived_path)
+            archived_paths.append(archived_path)
+        return archived_paths
+
     def _recreate_sqlite_db(self, reason: str) -> None:
-        try:
-            self.sqlite_conn.close()
-        except Exception:
-            pass
-        corrupt_path = f"{self.sqlite_db_path}.corrupt.{int(time.time())}"
-        if os.path.exists(self.sqlite_db_path):
-            os.replace(self.sqlite_db_path, corrupt_path)
-        self.sqlite_conn = self._open_sqlite_connection()
-        self.sqlite_conn.execute("PRAGMA busy_timeout = 5000")
-        self.sqlite_conn.execute("PRAGMA journal_mode=WAL")
+        """在检测到数据库异常时重建 SQLite 文件。"""
+        with self._sqlite_lock:
+            try:
+                self.sqlite_conn.close()
+            except Exception:
+                pass
+            suffix = f"corrupt.{int(time.time())}"
+            archived_paths = self._archive_sqlite_artifacts(suffix)
+            self.sqlite_conn = self._open_sqlite_connection()
         log_event(
             logger,
             logging.WARNING,
             "测试存储 SQLite 文件损坏，已自动重建",
-            {"数据库": self.sqlite_db_path, "备份文件": corrupt_path, "原因": reason},
+            {"数据库": self.sqlite_db_path, "备份文件": archived_paths, "原因": reason},
         )
 
     def _ensure_sqlite_available(self, recreate_on_failure: bool = False) -> None:
+        """探活当前 SQLite 连接，必要时触发重建。"""
         try:
-            self.sqlite_conn.execute("PRAGMA busy_timeout = 5000")
-            self.sqlite_conn.execute("PRAGMA journal_mode=WAL")
             self.sqlite_conn.execute("PRAGMA schema_version")
         except sqlite3.DatabaseError as exc:
             if not recreate_on_failure:
@@ -65,6 +87,7 @@ class TestConversationStorage(BaseConversationStorage):
             self._recreate_sqlite_db(str(exc))
 
     def _get_cursor(self) -> sqlite3.Cursor:
+        """返回可用的 SQLite 游标。"""
         try:
             self._ensure_sqlite_available()
         except sqlite3.DatabaseError as exc:
@@ -74,45 +97,46 @@ class TestConversationStorage(BaseConversationStorage):
 
     def _init_sqlite_tables(self):
         """初始化SQLite表（与MySQL表结构一致）"""
-        cursor = self._get_cursor()
-
-        # 会话数据
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS session_list (
-            session_id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            name TEXE NOT NULL,
-            update_time TIMESTAMP NOT NULL
-        )
-        """)
-
-        # 聊天数据
-        cursor.execute("""
-       CREATE TABLE IF NOT EXISTS session_chat (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           session_id TEXT NOT NULL,
-           message TEXT NOT NULL,
-           update_time TIMESTAMP NOT NULL
-       )
-       """)
-
-        # 核心实体表（对应MySQL的core_entities）
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS core_entities (
-            session_id TEXT PRIMARY KEY,
-            entities_json TEXT NOT NULL,
-            last_updated TIMESTAMP NOT NULL
-        )
-        """)
-        # 长期摘要表（对应MySQL的long_term_summaries）
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS long_term_summaries (
-            session_id TEXT PRIMARY KEY,
-            summary TEXT NOT NULL,
-            last_updated TIMESTAMP NOT NULL
-        )
-        """)
-        self.sqlite_conn.commit()
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS session_list (
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                update_time TIMESTAMP NOT NULL
+            )
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS session_chat (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                update_time TIMESTAMP NOT NULL
+            )
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS core_entities (
+                session_id TEXT PRIMARY KEY,
+                entities_json TEXT NOT NULL,
+                last_updated TIMESTAMP NOT NULL
+            )
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS long_term_summaries (
+                session_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                last_updated TIMESTAMP NOT NULL
+            )
+            """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trip_data_store (
+                session_id TEXT PRIMARY KEY,
+                data_json TEXT NOT NULL,
+                last_updated TIMESTAMP NOT NULL
+            )
+            """)
+            self.sqlite_conn.commit()
 
     def _is_key_expired(self, key: str) -> bool:
         """检查redis是否过期"""
@@ -167,23 +191,20 @@ class TestConversationStorage(BaseConversationStorage):
 
     def store_core_entities(self, session_id: str, entities: CoreEntity):
         """存储核心实体（模拟Redis + SQLite）"""
-        # 1. 模拟Redis存储（短期缓存）
         redis_key = f"session:{session_id}:core_entities"
         entities_json = entities.model_dump_json()
         self._redis_setex(redis_key, datetime.timedelta(hours=2), entities_json)
-
-        # 2. SQLite存储（模拟MySQL）
         now = datetime.datetime.now().isoformat()
-        cursor = self._get_cursor()
-        # SQLite的UPSERT语法（对应MySQL的ON DUPLICATE KEY UPDATE）
-        cursor.execute("""
-        INSERT INTO core_entities (session_id, entities_json, last_updated)
-        VALUES (?, ?, ?)
-        ON CONFLICT(session_id) DO UPDATE SET
-            entities_json = excluded.entities_json,
-            last_updated = excluded.last_updated
-        """, (session_id, entities_json, now))
-        self.sqlite_conn.commit()
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("""
+            INSERT INTO core_entities (session_id, entities_json, last_updated)
+            VALUES (?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                entities_json = excluded.entities_json,
+                last_updated = excluded.last_updated
+            """, (session_id, entities_json, now))
+            self.sqlite_conn.commit()
 
     def get_core_entities(self, session_id: str) -> Optional[CoreEntity]:
         """获取核心实体（先查模拟Redis，再查SQLite）"""
@@ -196,10 +217,10 @@ class TestConversationStorage(BaseConversationStorage):
             except ValidationError:
                 pass  # Redis数据坏了，尝试查数据库或修复
 
-        # 2. 再查SQLite
-        cursor = self._get_cursor()
-        cursor.execute("SELECT entities_json FROM core_entities WHERE session_id = ?", (session_id,))
-        result = cursor.fetchone()
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("SELECT entities_json FROM core_entities WHERE session_id = ?", (session_id,))
+            result = cursor.fetchone()
         
         entities_json = None
         if result:
@@ -242,54 +263,41 @@ class TestConversationStorage(BaseConversationStorage):
     def store_long_term_summary(self, session_id: str, summary: str):
         """存储长期摘要（SQLite模拟MySQL）"""
         now = datetime.datetime.now().isoformat()
-        cursor = self._get_cursor()
-        cursor.execute("""
-        INSERT INTO long_term_summaries (session_id, summary, last_updated)
-        VALUES (?, ?, ?)
-        ON CONFLICT(session_id) DO UPDATE SET
-            summary = excluded.summary,
-            last_updated = excluded.last_updated
-        """, (session_id, summary, now))
-        self.sqlite_conn.commit()
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("""
+            INSERT INTO long_term_summaries (session_id, summary, last_updated)
+            VALUES (?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                summary = excluded.summary,
+                last_updated = excluded.last_updated
+            """, (session_id, summary, now))
+            self.sqlite_conn.commit()
 
     def get_long_term_summary(self, session_id: str) -> str:
         """获取长期摘要（SQLite模拟MySQL）"""
-        cursor = self._get_cursor()
-        cursor.execute("SELECT summary FROM long_term_summaries WHERE session_id = ?", (session_id,))
-        result = cursor.fetchone()
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("SELECT summary FROM long_term_summaries WHERE session_id = ?", (session_id,))
+            result = cursor.fetchone()
         return result[0] if result else ""
 
     def store_trip_data(self, session_id: str, trip_data: Dict):
         """存储行程数据（Redis + SQLite）"""
-        # 1. Redis 缓存
         key = f"session:{session_id}:trip_data"
         self._redis_setex(key, datetime.timedelta(hours=2), json.dumps(trip_data, ensure_ascii=False))
-
-        # 2. SQLite 持久化
-        # 这里为了简化，我们复用 core_entities 表结构，或者新建表。
-        # 考虑到这是一个新功能，我们在 _init_sqlite_tables 中添加 trip_data 表
-        # 但由于 _init_sqlite_tables 只在初始化调用，我们这里动态检查/创建表比较安全，
-        # 或者假设表已存在（需要修改 _init_sqlite_tables）
-        # 为方便起见，我们在 store 时检查并创建表（仅供测试用）
-        cursor = self._get_cursor()
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trip_data_store (
-            session_id TEXT PRIMARY KEY,
-            data_json TEXT NOT NULL,
-            last_updated TIMESTAMP NOT NULL
-        )
-        """)
-        
         now = datetime.datetime.now().isoformat()
         data_json = json.dumps(trip_data, ensure_ascii=False)
-        cursor.execute("""
-        INSERT INTO trip_data_store (session_id, data_json, last_updated)
-        VALUES (?, ?, ?)
-        ON CONFLICT(session_id) DO UPDATE SET
-            data_json = excluded.data_json,
-            last_updated = excluded.last_updated
-        """, (session_id, data_json, now))
-        self.sqlite_conn.commit()
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("""
+            INSERT INTO trip_data_store (session_id, data_json, last_updated)
+            VALUES (?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                data_json = excluded.data_json,
+                last_updated = excluded.last_updated
+            """, (session_id, data_json, now))
+            self.sqlite_conn.commit()
 
     def get_trip_data(self, session_id: str) -> Optional[Dict]:
         """获取行程数据（Redis + SQLite）"""
@@ -302,18 +310,10 @@ class TestConversationStorage(BaseConversationStorage):
             except:
                 pass
 
-        # 2. SQLite
-        cursor = self._get_cursor()
-        # 确保表存在
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trip_data_store (
-            session_id TEXT PRIMARY KEY,
-            data_json TEXT NOT NULL,
-            last_updated TIMESTAMP NOT NULL
-        )
-        """)
-        cursor.execute("SELECT data_json FROM trip_data_store WHERE session_id = ?", (session_id,))
-        result = cursor.fetchone()
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("SELECT data_json FROM trip_data_store WHERE session_id = ?", (session_id,))
+            result = cursor.fetchone()
         
         if result:
             try:
@@ -327,47 +327,46 @@ class TestConversationStorage(BaseConversationStorage):
         return None
 
     def store_session(self, user_id: str, session_id: str):
+        """写入会话列表并刷新更新时间。"""
         update_time = datetime.datetime.now().isoformat()
         name = f"名称{session_id}-{update_time}"
-        cursor = self._get_cursor()
-        cursor.execute("""
-               INSERT INTO session_list (session_id, user_id, name, update_time)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(session_id) DO UPDATE SET
-                   name = excluded.name,
-                   update_time = excluded.update_time,
-                   user_id = excluded.user_id
-               """, (session_id, user_id, name, update_time))
-        self.sqlite_conn.commit()
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("""
+                   INSERT INTO session_list (session_id, user_id, name, update_time)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                       name = excluded.name,
+                       update_time = excluded.update_time,
+                       user_id = excluded.user_id
+                   """, (session_id, user_id, name, update_time))
+            self.sqlite_conn.commit()
 
     def get_session_list(self, user_id: str):
-        cursor = self._get_cursor()
-        # 根据更新时间倒序排列，更新时间较新的排在最上面
-        cursor.execute("SELECT * FROM session_list WHERE user_id = ? ORDER BY update_time DESC", (user_id,))
-        return cursor.fetchall()
+        """按更新时间倒序返回用户会话列表。"""
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("SELECT * FROM session_list WHERE user_id = ? ORDER BY update_time DESC", (user_id,))
+            return cursor.fetchall()
 
     def get_session_meta(self, session_id: str) -> Optional[Dict]:
         """获取会话元数据（包含 user_id 权属信息）"""
-        cursor = self._get_cursor()
-        cursor.execute("SELECT * FROM session_list WHERE session_id = ?", (session_id,))
-        row = cursor.fetchone()
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("SELECT * FROM session_list WHERE session_id = ?", (session_id,))
+            row = cursor.fetchone()
         return dict(row) if row else None
 
     def delete_session(self, session_id: str):
-        cursor = self._get_cursor()
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trip_data_store (
-            session_id TEXT PRIMARY KEY,
-            data_json TEXT NOT NULL,
-            last_updated TIMESTAMP NOT NULL
-        )
-        """)
-        cursor.execute("DELETE FROM session_chat WHERE session_id = ?", (session_id,))
-        cursor.execute("DELETE FROM core_entities WHERE session_id = ?", (session_id,))
-        cursor.execute("DELETE FROM long_term_summaries WHERE session_id = ?", (session_id,))
-        cursor.execute("DELETE FROM trip_data_store WHERE session_id = ?", (session_id,))
-        cursor.execute("DELETE FROM session_list WHERE session_id = ?", (session_id,))
-        self.sqlite_conn.commit()
+        """删除会话关联的持久化数据与缓存。"""
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("DELETE FROM session_chat WHERE session_id = ?", (session_id,))
+            cursor.execute("DELETE FROM core_entities WHERE session_id = ?", (session_id,))
+            cursor.execute("DELETE FROM long_term_summaries WHERE session_id = ?", (session_id,))
+            cursor.execute("DELETE FROM trip_data_store WHERE session_id = ?", (session_id,))
+            cursor.execute("DELETE FROM session_list WHERE session_id = ?", (session_id,))
+            self.sqlite_conn.commit()
         redis_keys = [
             f"session:{session_id}:short_term",
             f"session:{session_id}:core_entities",
@@ -378,33 +377,38 @@ class TestConversationStorage(BaseConversationStorage):
                 del self.redis_mock[key]
 
     def store_session_chat(self, session_id: str, message: str):
+        """追加一条会话聊天消息。"""
         update_time = datetime.datetime.now().isoformat()
-        cursor = self._get_cursor()
-        cursor.execute("""
-            INSERT INTO session_chat (session_id, message, update_time)
-            VALUES (?, ?, ?)
-        """, (session_id, message, update_time))
-        self.sqlite_conn.commit()
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("""
+                INSERT INTO session_chat (session_id, message, update_time)
+                VALUES (?, ?, ?)
+            """, (session_id, message, update_time))
+            self.sqlite_conn.commit()
 
     def get_session_chat_list(self, session_id: str) -> List[str]:
         """获取会话的所有聊天记录（按时间正序排列）"""
         last_error = None
         for _ in range(3):
             try:
-                cursor = self._get_cursor()
-                cursor.execute("""
-                    SELECT message
-                    FROM session_chat
-                    WHERE session_id = ?
-                    ORDER BY update_time ASC
-                """, (session_id,))
-                return [row[0] for row in cursor.fetchall()]
+                with self._sqlite_lock:
+                    cursor = self._get_cursor()
+                    cursor.execute("""
+                        SELECT message
+                        FROM session_chat
+                        WHERE session_id = ?
+                        ORDER BY update_time ASC
+                    """, (session_id,))
+                    return [row[0] for row in cursor.fetchall()]
             except sqlite3.OperationalError as exc:
                 last_error = exc
                 time.sleep(0.1)
         raise last_error
 
     def delete_session_chat_by_id(self, chat_id: int):
-        cursor = self._get_cursor()
-        cursor.execute("DELETE FROM session_chat WHERE id = ?", (chat_id,))
-        self.sqlite_conn.commit()
+        """按主键删除单条聊天消息。"""
+        with self._sqlite_lock:
+            cursor = self._get_cursor()
+            cursor.execute("DELETE FROM session_chat WHERE id = ?", (chat_id,))
+            self.sqlite_conn.commit()

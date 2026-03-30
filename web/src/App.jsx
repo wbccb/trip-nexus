@@ -136,6 +136,7 @@ export default function App() {
     lockedDays,
     loadingTrip,
     persistFlowTripResult,
+    reportAlternativePreview,
     selectedAlternative,
     setConflictReport,
     setLockedDays,
@@ -475,14 +476,32 @@ export default function App() {
       tripResult={tripResult}
       selectedPoiId={selectedPoiId}
       onApplyAlternative={async (nextTrip) => {
+        const selectedPlan =
+          Number.isInteger(selectedAlternative) && selectedAlternative >= 0
+            ? conflictReport?.alternatives?.[selectedAlternative] || null
+            : null
         updateTripResult(nextTrip)
         setConflictReport({ has_conflicts: false, conflicts: [], alternatives: [] })
         setSelectedAlternative(null)
-        await persistFlowTripResult(nextTrip)
+        await persistFlowTripResult(nextTrip, {
+          updateSource: "apply_conflict_alternative",
+          selectedAlternativeLabel: selectedPlan?.label || null,
+          selectedAlternativeIndex: Number.isInteger(selectedAlternative) ? selectedAlternative : null,
+        })
       }}
       onConflictReportChange={setConflictReport}
       onLockedDaysChange={setLockedDays}
-      onSelectAlternative={setSelectedAlternative}
+      onSelectAlternative={async (index) => {
+        setSelectedAlternative(index)
+        const selectedPlan =
+          Number.isInteger(index) && index >= 0 ? conflictReport?.alternatives?.[index] || null : null
+        if (selectedPlan?.label) {
+          await reportAlternativePreview({
+            alternativeLabel: selectedPlan.label,
+            alternativeIndex: index,
+          })
+        }
+      }}
       onSelectPoi={handleSelectPoi}
       onTripChange={async (nextTrip) => {
         updateTripResult(nextTrip)
@@ -766,7 +785,7 @@ export default function App() {
         open={isWorkspaceModalOpen}
         onCancel={() => setIsWorkspaceModalOpen(false)}
         footer={null}
-        width={1200}
+        width={"90%"}
         destroyOnHidden
       >
         <Tabs defaultActiveKey="knowledge" items={workspaceTabItems} />

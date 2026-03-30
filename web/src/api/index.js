@@ -8,6 +8,7 @@ export {
 } from "./sessionApi.js";
 // 主流程与地图相关接口导出
 export {
+  previewConflictAlternative,
   renderFlowGeojson,
   renderFlowMap,
   replanFlowDay,

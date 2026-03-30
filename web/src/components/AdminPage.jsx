@@ -284,7 +284,7 @@ export default function AdminPage() {
   );
 
   return (
-    <div style={{ display: "grid", gap: 16 }}>
+    <div style={{ display: "grid", gap: 16, overflow: "auto" }}>
       <div
         style={{
           display: "grid",
