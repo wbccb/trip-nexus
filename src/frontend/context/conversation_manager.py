@@ -289,7 +289,7 @@ class ConversationManager:
         """处理新消息，更新上下文"""
 
         if message.role == "user":
-            log_event(logger, logging.INFO, "准备写入用户消息到会话历史", {"user_id": user_id, "device_id": device_id, "session_id": session_id})
+            log_event(logger, logging.INFO, "准备写入用户消息到会话历史", {"message": message})
         else:
             log_event(logger, logging.INFO, "准备写入 AI 消息到会话历史")
 

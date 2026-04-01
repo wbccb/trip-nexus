@@ -263,55 +263,140 @@ export default function App() {
   }, [activeSessionId, loadChatHistory])
 
 
-  // 聊天消息点击发送
+      // 聊天消息点击发送
   const handleSendChat = async () => {
     const value = chatInput.trim()
     if (!value || sendingChat) {
       return
     }
     const userMessageId = `${Date.now()}-user`
-    setChatMessages((prev) => [
-      ...prev,
-      {
-        id: userMessageId,
-        role: "user",
-        content: value,
-      },
-    ])
+      const assistantMessageId = `${Date.now()}-assistant`
+      
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: userMessageId,
+          role: "user",
+          content: value,
+        },
+        {
+          id: assistantMessageId,
+          role: "assistant",
+          content: "正在准备...",
+        },
+      ])
+      
+      const updateMessage = (text) => {
+        setChatMessages(prev => prev.map(msg => 
+          msg.id === assistantMessageId ? { ...msg, content: `${text} (${new Date().toLocaleTimeString()})` } : msg
+        ))
+      }
     setChatInput("")
+    
     try {
       setSendingChat(true)
+      
       const payload = {
         device_id: DEFAULT_DEVICE_ID,
         session_id: activeSessionId,
+        destination: tripResult?.destination || "未知",
+        days: tripResult?.days || 1,
         message: value,
+        mode: "fast",
+        budget: tripResult?.constraints_used?.budget || "",
+        preference: tripResult?.constraints_used?.preference || "",
+        context_texts: [],
+        knowledge_base_id: selectedKnowledgeBaseId || null,
+        knowledge_query: knowledgeGenerateQuery || value,
+        knowledge_scope: knowledgeScope || "private_plus_public",
+        budget_level: tripResult?.constraints_used?.budget_level || "balanced",
+        intensity: tripResult?.constraints_used?.intensity || "standard",
+        pace: tripResult?.constraints_used?.pace || "cultural",
+        special_constraints: tripResult?.constraints_used?.special_constraints || {
+          walking_limit_km: null,
+          need_nap: false,
+          accessibility: false,
+        }
       }
-      const data = await sendChatMessage(payload)
-      if (data?.session_id && data.session_id !== activeSessionId) {
-        setActiveSessionId(data.session_id)
-        localStorage.setItem(SESSION_STORAGE_KEY, data.session_id)
-      }
-      // 更新AI返回的消息到聊天框中
-      if (data?.response) {
-        setChatMessages((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}-assistant`,
-            role: "assistant",
-            content: data.response,
+
+      let streamingText = ""
+        let currentIntent = ""
+
+        await handleFlowSubmit(payload, {
+          onStreamStart: () => {
+            console.log("[App.jsx] onStreamStart triggered");
+            updateMessage("正在处理...")
           },
-        ])
-      }
-      // 更新中间布局的行程详情
-      if (data?.trip_data) {
-        updateTripResult(data.trip_data)
-      }
-      // 重新加载会话列表
-      if (loadSessions) {
-        await loadSessions()
-      }
+          onStreamDelta: (nextText, event) => {
+            console.log("[App.jsx] onStreamDelta called with step:", event?.step, "currentIntent:", currentIntent);
+          if (event?.step === "intent" && event?.payload?.intent) {
+            currentIntent = event.payload.intent;
+            setFlowRuntimeStatus((prev) => ({
+              ...prev,
+              intent: String(currentIntent || ""),
+            }))
+          }
+
+          const stepTextMap = {
+            intent: "正在识别您的需求...",
+            route: "正在规划处理路径...",
+            tool: "正在查询相关工具...",
+            rag: "正在检索知识库...",
+            context_budget: "正在整理行程上下文...",
+            agent: "正在执行深度规划...",
+            generate: "正在生成行程内容...",
+            modify: "正在修改行程...",
+            constraint_check: "正在进行约束校验...",
+            conflict_check: "正在检查行程冲突...",
+          warning: "正在生成冲突替代方案...",
+          finalize: "行程已生成，请查看详情",
+        };
+
+        if (event?.step === "generate" && currentIntent === "general_conversation") {
+            streamingText = nextText || ""
+            updateMessage(streamingText || "正在思考...")
+          } else {
+            // If the step is mapping to modification intents, handle it specifically
+            if (event?.step === "generate" && currentIntent && ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"].includes(currentIntent)) {
+               console.log("[App.jsx] Updating message to: 正在生成修改内容...");
+               updateMessage("正在生成修改内容...")
+            } else if (event?.step === "modify") {
+               console.log("[App.jsx] Updating message to: 正在修改行程...");
+               updateMessage("正在修改行程...")
+            } else if (stepTextMap[event?.step]) {
+               console.log(`[App.jsx] Updating message to: ${stepTextMap[event?.step]}`);
+               updateMessage(stepTextMap[event?.step])
+            }
+          }
+        },
+        onStreamEnd: async (_, event) => {
+            const payloadData = event?.payload || {}
+            const finalizedTripData = payloadData?.trip_data || null
+            const finalizedResponseText = String(payloadData?.response_text || "").trim()
+
+            if (finalizedTripData) {
+              updateMessage(finalizedResponseText || "行程已更新，请查看详情。")
+              updateTripResult(finalizedTripData)
+            } else if (finalizedResponseText) {
+              updateMessage(finalizedResponseText)
+            } else if (!streamingText) {
+              updateMessage("处理完成。")
+            }
+            
+            if (payloadData?.session_id && payloadData.session_id !== activeSessionId) {
+              setActiveSessionId(payloadData.session_id)
+              localStorage.setItem(SESSION_STORAGE_KEY, payloadData.session_id)
+            }
+
+            if (loadSessions) {
+              await loadSessions()
+            }
+          }
+      })
+
     } catch (error) {
       message.error(`消息发送失败：${error.message}`)
+      updateChatMessageById(assistantMessageId, `发送失败：${error.message}`)
     } finally {
       setSendingChat(false)
     }
@@ -372,6 +457,9 @@ export default function App() {
     tripForm.resetFields()
     // 初始化流式文本
     let streamingText = ""
+    let currentIntent = ""
+    // 核心步骤：将完整提示词与约束内容存入 message，并透传给后端，保证聊天记录中显示初始的完整指令
+    values.message = `${prompt}\n约束：${constraintSummary}`
     // 调用行程生成（流式）
     await handleFlowSubmit(values, {
       // 流开始回调
@@ -379,18 +467,43 @@ export default function App() {
         // 更新为加载提示
         updateChatMessageById(assistantMessageId, "行程生成中...")
       },
-      // 流增量回调
+      // 流增量回调处理
       onStreamDelta: (nextText, event) => {
         if (event?.step === "intent" && event?.payload?.intent) {
+          currentIntent = event.payload.intent;
           setFlowRuntimeStatus((prev) => ({
             ...prev,
-            intent: String(event.payload.intent || ""),
+            intent: String(currentIntent || ""),
           }))
         }
-        // 只有真正的生成文本才写入聊天气泡，避免把流程状态误当成最终回答
-        if (event?.step === "generate") {
+        
+        const stepTextMap = {
+          intent: "正在识别您的需求...",
+          route: "正在规划处理路径...",
+          tool: "正在查询相关工具...",
+          rag: "正在检索知识库...",
+          context_budget: "正在整理行程上下文...",
+          agent: "正在执行深度规划...",
+          generate: "正在生成行程内容...",
+          modify: "正在修改行程...",
+          constraint_check: "正在进行约束校验...",
+          conflict_check: "正在检查行程冲突...",
+          warning: "正在生成冲突替代方案...",
+          finalize: "行程已生成，请查看右侧详情",
+        };
+
+        if (event?.step === "generate" && currentIntent === "general_conversation") {
           streamingText = nextText || ""
-          updateChatMessageById(assistantMessageId, streamingText || "行程生成中...")
+          updateChatMessageById(assistantMessageId, streamingText || "...")
+        } else {
+          // If the step is mapping to modification intents, handle it specifically
+          if (event?.step === "generate" && currentIntent && ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"].includes(currentIntent)) {
+             updateChatMessageById(assistantMessageId, "正在生成修改内容...")
+          } else if (event?.step === "modify") {
+             updateChatMessageById(assistantMessageId, "正在修改行程...")
+          } else if (stepTextMap[event?.step]) {
+             updateChatMessageById(assistantMessageId, stepTextMap[event?.step])
+          }
         }
       },
       // 流结束回调

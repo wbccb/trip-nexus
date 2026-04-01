@@ -27,7 +27,10 @@ from src.api.dependencies import (
     _get_storage,
     _get_llm_manager,
     _record_audit_log,
+    _get_conversation_manager,
+    _get_context_messages,
 )
+from src.frontend.context.entity import Message, MessageType
 from src.api.logic.trip import _normalize_trip_constraints, _build_constraint_statuses
 from src.api.logic.knowledge import (
     _build_knowledge_context_payload,
@@ -548,12 +551,12 @@ def _build_flow_query_text(payload: FlowStreamRequest) -> str:
     return f"规划去{payload.destination}的{payload.days}天行程"
 
 
-def _build_flow_context_messages(context_texts: List[str]) -> List[Dict[str, str]]:
-    from src.frontend.context.entity import MessageType
-    messages = []
+def _build_flow_context_messages(session_id: str, context_texts: List[str]) -> List[Dict[str, str]]:
+    storage = _get_storage()
+    messages = _get_context_messages(storage, session_id)
     for text in context_texts:
         if text:
-            messages.append({"role": MessageType.USER, "content": text})
+            messages.append({"role": "user", "content": text})
     return messages
 
 
@@ -838,9 +841,29 @@ async def _run_flow_stream(
                 "payload": {},
             },
         )
+        
+        last_sequence += 1
+        await _append_flow_event(
+            message_id,
+            {
+                "event": "delta",
+                "sequence": last_sequence,
+                "message_id": message_id,
+                "session_id": session_id,
+                "step": "intent",
+                "status": "running",
+                "mode": flow_mode,
+                "content_delta": "",
+                "is_final": False,
+                "payload": {},
+            },
+        )
         last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "intent")
+        
+        print(f"[FLOW DEBUG] Emitting intent start/delta. last_sequence: {last_sequence}")
+        
         flow_query = _build_flow_query_text(payload)
-        context_messages = _build_flow_context_messages(merged_context_texts)
+        context_messages = _build_flow_context_messages(session_id, merged_context_texts)
         current_trip = _get_storage().get_trip_data(session_id)
         _log_flow_step(
             message_id,
@@ -856,6 +879,22 @@ async def _run_flow_stream(
         intent_data = llm_manager.analyze_user_message(flow_query, context_messages, current_trip)
         intent = str(intent_data.get("intent") or "generate_trip")
         metrics["intent"] = intent
+
+        user_message = Message(
+            role=MessageType.USER,
+            content=flow_query,
+            timestamp=datetime.now(),
+            metadata={},
+        )
+        conversation_manager = _get_conversation_manager()
+        conversation_manager.process_new_message(
+            user_id,
+            payload.device_id,
+            user_message,
+            session_id,
+            intent_data=intent_data,
+        )
+
         _log_flow_step(
             message_id,
             session_id,
@@ -992,7 +1031,7 @@ async def _run_flow_stream(
                         "sequence": last_sequence,
                         "message_id": message_id,
                         "session_id": session_id,
-                        "step": "generate",
+                        "step": "modify",
                         "status": "running",
                         "mode": flow_mode,
                         "content_delta": response_text,
@@ -1221,6 +1260,22 @@ async def _run_flow_stream(
                 }
                 agent_log_payload.update(_summarize_trip_stage(trip_data))
                 _log_flow_step(message_id, session_id, "主流程 Step 5b Agent SOP 执行", "完成", agent_log_payload)
+                last_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": "delta",
+                        "sequence": last_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "agent",
+                        "status": "done",
+                        "mode": flow_mode,
+                        "content_delta": "",
+                        "is_final": False,
+                        "payload": {},
+                    },
+                )
             else:
                 # 快速路径后续步骤：
                 # Step 3a 先尝试一次前置工具增强；
@@ -1271,6 +1326,22 @@ async def _run_flow_stream(
                     "完成",
                     _summarize_tool_stage(tool_result),
                 )
+                last_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": "delta",
+                        "sequence": last_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "tool",
+                        "status": "done",
+                        "mode": flow_mode,
+                        "content_delta": "",
+                        "is_final": False,
+                        "payload": {},
+                    },
+                )
                 _log_flow_step_grouped(
                     "主流程 Step 4a 私有知识库补充",
                     "开始",
@@ -1306,6 +1377,24 @@ async def _run_flow_stream(
                 kb_log_payload = {"命中文本数": len(kb_context_texts), "命中来源数": len(source_evidence)}
                 kb_log_payload.update(_build_preview_fields(kb_context_texts, prefix="知识命中", max_items=3))
                 _log_flow_step(message_id, session_id, "主流程 Step 4a 私有知识库补充", "完成", kb_log_payload)
+                
+                last_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": "delta",
+                        "sequence": last_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "rag",
+                        "status": "done",
+                        "mode": flow_mode,
+                        "content_delta": "",
+                        "is_final": False,
+                        "payload": {},
+                    },
+                )
+
                 _log_flow_step_grouped(
                     "主流程 Step 5a 上下文预算裁剪",
                     "开始",
@@ -1339,6 +1428,22 @@ async def _run_flow_stream(
                 }
                 context_log_payload.update(_build_preview_fields(merged_context_texts, prefix="上下文", max_items=3))
                 _log_flow_step(message_id, session_id, "主流程 Step 5a 上下文预算裁剪", "完成", context_log_payload)
+                last_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": "delta",
+                        "sequence": last_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "context_budget",
+                        "status": "done",
+                        "mode": flow_mode,
+                        "content_delta": "",
+                        "is_final": False,
+                        "payload": {},
+                    },
+                )
                 response_chunks: List[str] = []
                 stream_chunk_count = 0
                 stream_char_count = 0
@@ -1375,6 +1480,24 @@ async def _run_flow_stream(
                     "开始",
                     {"执行链路": "stream_trip_generation -> build_trip_prompt(纯构造) -> stream_llm_text"},
                 )
+                
+                last_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": "delta",
+                        "sequence": last_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "generate",
+                        "status": "running",
+                        "mode": flow_mode,
+                        "content_delta": "",
+                        "is_final": False,
+                        "payload": {},
+                    },
+                )
+
                 stream = llm_manager.stream_trip_generation(user_input, merged_context_texts)
                 for event in llm_manager.build_stream_events_from_stream(stream, message_id):
                     last_sequence = await _pause_checkpoint(message_id, session_id, last_sequence, flow_mode, "generate")
@@ -1477,6 +1600,22 @@ async def _run_flow_stream(
                     "开始",
                     {"约束输入数": len(constraints_used)},
                 )
+                last_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": "delta",
+                        "sequence": last_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "constraint_check",
+                        "status": "running",
+                        "mode": flow_mode,
+                        "content_delta": "",
+                        "is_final": False,
+                        "payload": {},
+                    },
+                )
                 constraints_satisfied = _build_constraint_statuses(trip_data, constraints_used)
                 _log_flow_step(
                     message_id,
@@ -1494,6 +1633,22 @@ async def _run_flow_stream(
                     "主流程 Step 6.4 冲突检测",
                     "开始",
                     {"检测方式": "启发式规则检测，命中冲突时继续生成替代方案"},
+                )
+                last_sequence += 1
+                await _append_flow_event(
+                    message_id,
+                    {
+                        "event": "delta",
+                        "sequence": last_sequence,
+                        "message_id": message_id,
+                        "session_id": session_id,
+                        "step": "conflict_check",
+                        "status": "running",
+                        "mode": flow_mode,
+                        "content_delta": "",
+                        "is_final": False,
+                        "payload": {},
+                    },
                 )
                 generated_conflict_report = llm_manager.build_conflict_report(trip_data, constraints_used)
                 conflict_report = generated_conflict_report.model_dump()
@@ -1627,9 +1782,17 @@ async def _run_flow_stream(
             }
         )
 
+        # 核心步骤：清理思考过程，并根据意图构造展示文本。若生成了行程则展示提示文案，避免暴露并存储冗长的 JSON 数据。
+        import re
+        cleaned_response = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
+        
+        display_content = cleaned_response
+        if bool(trip_data) or intent in ["generate_trip", "modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
+            display_content = "行程已生成，请查看右侧详情"
+
         finalize_event_payload = {
             "trip_data": trip_data,
-            "response_text": response_text,
+            "response_text": display_content,
             "metrics": metrics,
             "constraints_used": constraints_used,
             "constraints_satisfied": constraints_satisfied,
@@ -1679,6 +1842,23 @@ async def _run_flow_stream(
             },
             full_payload=True,
         )
+
+        assistant_message = Message(
+            role=MessageType.ASSISTANT,
+            content=display_content,
+            timestamp=datetime.now(),
+            metadata={
+                "intent": intent,
+                "has_trip_data": bool(trip_data),
+            },
+        )
+        conversation_manager.process_new_message(
+            user_id,
+            payload.device_id,
+            assistant_message,
+            session_id,
+        )
+
         _record_audit_log(
             action="flow_stream_completed",
             status="success",

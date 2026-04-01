@@ -102,11 +102,39 @@ def update_trip(
             )
         constraints_used = _normalize_trip_constraints(payload.constraints or trip_data.get("constraints_used") or {})
         constraints_satisfied = _build_constraint_statuses(trip_data, constraints_used)
-        conflict_report = llm_manager.build_conflict_report(trip_data, constraints_used).model_dump()
+        if is_applying_alternative:
+            log_event(
+                logger,
+                logging.INFO,
+                "采用替代方案后开始冲突复检",
+                {
+                    "session_id": session_id,
+                    "方案标签": payload.selected_alternative_label,
+                    "方案索引": payload.selected_alternative_index,
+                    "说明": "这里只做冲突复检，不再重复生成新的替代方案",
+                },
+            )
+        conflict_report = llm_manager.build_conflict_report(
+            trip_data,
+            constraints_used,
+            include_alternatives=not is_applying_alternative,
+        ).model_dump()
         trip_data["constraints_used"] = constraints_used
         trip_data["constraints_satisfied"] = constraints_satisfied
         trip_data["conflict_report"] = conflict_report
         storage.store_trip_data(session_id, trip_data)
+        if is_applying_alternative:
+            log_event(
+                logger,
+                logging.INFO,
+                "采用替代方案后的冲突复检完成",
+                {
+                    "session_id": session_id,
+                    "当前阻断冲突": bool(conflict_report.get("has_conflicts")),
+                    "当前冲突总数": len(conflict_report.get("conflicts") or []),
+                    "当前替代方案数": len(conflict_report.get("alternatives") or []),
+                },
+            )
         log_event(
             logger,
             logging.INFO,

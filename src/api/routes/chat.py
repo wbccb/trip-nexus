@@ -1,6 +1,6 @@
+import logging
 import re
 from datetime import datetime
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -22,8 +22,11 @@ from src.api.dependencies import (
     _ensure_session_id,
     _get_context_messages,
 )
+from src.api.logic.trip import _build_constraint_statuses, _normalize_trip_constraints
+from src.observability import log_event
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+logger = logging.getLogger(__name__)
 
 @router.post("/send", response_model=ChatSendResponse)
 def send_chat(
@@ -53,6 +56,16 @@ def send_chat(
         context_messages = _get_context_messages(storage, session_id)
         current_trip = storage.get_trip_data(session_id)
         intent_data = llm_manager.analyze_user_message(payload.message, context_messages, current_trip)
+        log_event(
+            logger,
+            logging.INFO,
+            "聊天消息意图识别完成",
+            {
+                "session_id": session_id,
+                "intent": intent_data.get("intent"),
+                "summary": intent_data.get("summary"),
+            },
+        )
         user_message = Message(
             role=MessageType.USER,
             content=payload.message,
@@ -86,19 +99,67 @@ def send_chat(
             needs_more_info = bool(result.get("needs_more_info"))
         elif intent in ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
             if current_trip:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "聊天触发行程修改开始",
+                    {
+                        "session_id": session_id,
+                        "原目的地": current_trip.get("destination"),
+                        "原天数": current_trip.get("days"),
+                        "用户诉求": intent_data.get("summary"),
+                    },
+                )
                 result = llm_manager._handle_trip_modification(intent_data, current_trip, context_messages)
                 response_text = result.get("response") or ""
                 trip_data = result.get("trip_data")
+                if isinstance(trip_data, dict):
+                    # 核心步骤：聊天修改链路也补齐约束与冲突字段，保证前端中间行程详情拿到的是完整正式数据。
+                    constraints_used = _normalize_trip_constraints(
+                        current_trip.get("constraints_used") if isinstance(current_trip, dict) else {}
+                    )
+                    trip_data["constraints_used"] = constraints_used
+                    trip_data["constraints_satisfied"] = _build_constraint_statuses(trip_data, constraints_used)
+                    trip_data["conflict_report"] = llm_manager.build_conflict_report(trip_data, constraints_used).model_dump()
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "聊天触发行程修改完成",
+                        {
+                            "session_id": session_id,
+                            "新目的地": trip_data.get("destination"),
+                            "新天数": trip_data.get("days"),
+                            "已规划天数": len((trip_data.get("daily_plan") or {}) if isinstance(trip_data.get("daily_plan"), dict) else []),
+                            "检测到阻断冲突": bool((trip_data.get("conflict_report") or {}).get("has_conflicts")),
+                        },
+                    )
             else:
                 response_text = "我需要先为您生成一个基础行程，然后才能进行调整。请先提供目的地、天数和预算信息。"
         else:
             response_text = f"我理解您想{intent_data.get('summary', '进一步讨论行程')}. 请告诉我更多细节，比如目的地、旅行天数和您的偏好，我可以为您规划具体的行程。"
         if trip_data:
             storage.store_trip_data(session_id, trip_data)
+            log_event(
+                logger,
+                logging.INFO,
+                "聊天链路行程已落库",
+                {
+                    "session_id": session_id,
+                    "目的地": trip_data.get("destination"),
+                    "天数": trip_data.get("days"),
+                    "trip_data已返回前端": True,
+                },
+            )
+        # 核心步骤：处理最终给用户的文本响应内容。对于行程操作意图或存在行程数据的场景，避免保存 JSON 数据，展示对应的提示文本。
         cleaned_response = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
+        
+        display_content = cleaned_response
+        if bool(trip_data) or intent in ["generate_trip", "modify_trip", "add_attraction", "delete_attraction", "reorder_trip"]:
+            display_content = "行程已生成，请查看右侧详情"
+
         assistant_message = Message(
             role=MessageType.ASSISTANT,
-            content=cleaned_response,
+            content=display_content,
             timestamp=datetime.now(),
             metadata={
                 "intent": intent,

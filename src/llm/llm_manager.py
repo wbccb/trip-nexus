@@ -1724,12 +1724,24 @@ class LlmManager:
             log_event(logger, logging.WARNING, "替代方案生成降级", {"原因": str(exc)})
             return []
 
-    def build_conflict_report(self, trip_data: Dict[str, Any], constraints: Optional[Dict[str, Any]] = None) -> ConflictReport:
-        # 对外统一暴露 build_conflict_report，内部再串联“检测冲突 -> 生成替代方案 -> 指标打点”。
-        # 这样 app.py、trip/update、replan_day 都能复用同一套冲突闭环。
-        log_event(logger, logging.INFO, "冲突检测流程开始", {"目的地": trip_data.get("destination"), "天数": trip_data.get("days")})
+    def build_conflict_report(
+        self,
+        trip_data: Dict[str, Any],
+        constraints: Optional[Dict[str, Any]] = None,
+        *,
+        include_alternatives: bool = True,
+    ) -> ConflictReport:
+        log_event(
+            logger,
+            logging.INFO,
+            "冲突检测流程开始",
+            {
+                "目的地": trip_data.get("destination"),
+                "天数": trip_data.get("days"),
+                "生成替代方案": include_alternatives,
+            },
+        )
         conflict_report = self._detect_conflicts(trip_data, constraints)
-        # 核心逻辑：warning 级问题继续展示给前端，但不再升级成“需要替代方案”的阻断型冲突。
         blocking_conflicts = [item for item in (conflict_report.conflicts or []) if getattr(item, "severity", "") == "error"]
         if not blocking_conflicts:
             if conflict_report.conflicts:
@@ -1743,6 +1755,16 @@ class LlmManager:
             self._metrics.record("conflict_detected", {"detected": False})
             self._metrics.record("plan_alternative_generated", {"generated": False})
             return ConflictReport(has_conflicts=False, conflicts=conflict_report.conflicts, alternatives=[])
+        if not include_alternatives:
+            log_event(
+                logger,
+                logging.INFO,
+                "冲突复检命中阻断冲突，跳过替代方案生成",
+                {"阻断冲突数": len(blocking_conflicts), "说明": "当前阶段只做冲突复检，不重复生成新的替代方案"},
+            )
+            self._metrics.record("conflict_detected", {"detected": True, "count": len(blocking_conflicts)})
+            self._metrics.record("plan_alternative_generated", {"generated": False, "count": 0})
+            return ConflictReport(has_conflicts=True, conflicts=conflict_report.conflicts, alternatives=[])
         log_event(
             logger,
             logging.INFO,
@@ -1855,7 +1877,7 @@ class LlmManager:
         cfg = self._generation_config
         log_event(
             logger,
-            logging.DEBUG,
+            logging.INFO,
             "LLM 行程生成开始",
             {
                 "请求ID": request_id,
@@ -1886,7 +1908,7 @@ class LlmManager:
         cost = (datetime.now() - start_ts).total_seconds()
         log_event(
             logger,
-            logging.DEBUG,
+            logging.INFO,
             "LLM 行程生成结束",
             {"请求ID": request_id, "耗时秒": cost, "响应长度": len(str(response_text)), "尝试次数": attempt},
         )
@@ -2260,7 +2282,7 @@ class LlmManager:
     ) -> Dict[str, Any]:
         log_event(
             logger,
-            logging.DEBUG,
+            logging.INFO,
             "开始处理行程修改",
             {"意图": intent_data.get("intent"), "参数键": list((intent_data.get("parameters") or {}).keys())},
         )

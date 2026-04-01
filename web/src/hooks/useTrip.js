@@ -245,6 +245,8 @@ export function useTrip({
           budget: values.budget || "",
           // 偏好
           preference: values.preference || "",
+          // 核心步骤：透传表单或者对话的原始 message 文本到后端进行持久化，避免被识别的摘要取代
+          message: values.message || null,
           // 上下文文本
           context_texts: [],
           // 知识库 ID
@@ -282,32 +284,30 @@ export function useTrip({
           const eventType = event?.event || "";
           const deltaText = event?.content_delta || "";
           const step = event?.step || "";
-          if (eventType !== "delta" || step !== "generate") {
-            logDebug("行程", "收到主流程事件", {
-              eventType,
-              step,
-              sequence: event?.sequence,
-              status: event?.status,
-            });
-          }
+          
           if (eventType === "start" && onStreamStart) {
             onStreamStart(event);
           }
-          if (eventType === "delta") {
-            if (step === "generate") {
+          
+          // 对于所有有效的 event 都要触发 onStreamDelta 从而更新 UI
+          // Include eventType === "start" to catch the first "intent" step
+          if (eventType === "start" || eventType === "delta" || step) {
+            if (step === "generate" && eventType === "delta") {
               accumulatedText += deltaText;
             }
             if (step === "warning") {
-              // warning 事件比 finalize 更早到达，前端先用它把冲突区亮起来，
-              // finalize 到达后再以最终 conflict_report 做一次权威覆盖。
               const warningReport = event?.payload?.conflict_report || createEmptyConflictReport();
               setConflictReport(warningReport);
               setSelectedAlternative(null);
             }
+            
+            console.log("[useTrip] Passing event to onStreamDelta:", { eventType, step, currentAccumulatedText: accumulatedText, payload: event?.payload });
             if (onStreamDelta) {
-              onStreamDelta(accumulatedText, event);
+              // We need to wait for a microtask so state updates don't overlap improperly
+              setTimeout(() => onStreamDelta(accumulatedText, event), 0);
             }
           }
+          
           if (eventType === "end" && step === "finalize") {
             streamSessionId = event?.session_id || null;
             const eventPayload = event?.payload || {};

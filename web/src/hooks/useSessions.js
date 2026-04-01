@@ -25,10 +25,11 @@ export function useSessions({ isAuthenticated }) {
     } finally {
       setLoadingSessions(false);
     }
-  }, []);
+  }, [isAuthenticated]);
 
   const startNewSession = useCallback(async () => {
     if (!isAuthenticated) {
+      console.error("用户未认证，无法创建会话");
       return;
     }
     try {
@@ -41,7 +42,7 @@ export function useSessions({ isAuthenticated }) {
     } catch (error) {
       message.error(`创建会话失败：${error.message}`);
     }
-  }, [loadSessions]);
+  }, [isAuthenticated, loadSessions]);
 
   const deleteSessionById = useCallback(
     async (sessionId) => {
@@ -109,7 +110,10 @@ export function useSessions({ isAuthenticated }) {
       // 清理后重新尝试初始化（会触发新建会话）
       startNewSession();
     };
-    window.addEventListener("tripnexus:forbidden-session", handleForbiddenSession);
+    window.addEventListener(
+      "tripnexus:forbidden-session",
+      handleForbiddenSession,
+    );
     return () => {
       window.removeEventListener(
         "tripnexus:forbidden-session",
