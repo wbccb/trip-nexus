@@ -33,6 +33,8 @@ import { useKnowledge } from "./hooks/useKnowledge.js"
 import { useSessions } from "./hooks/useSessions.js"
 import { useTrip } from "./hooks/useTrip.js"
 
+import { getUserLlmConfig, updateUserLlmConfig } from "./api/authApi.js"
+
 const { Header, Content } = Layout
 
 const DEFAULT_TRIP_CONSTRAINTS = {
@@ -159,6 +161,9 @@ export default function App() {
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false)
   const [isTripModalOpen, setIsTripModalOpen] = useState(false)
   const [isWorkspaceModalOpen, setIsWorkspaceModalOpen] = useState(false)
+  const [isLlmConfigModalOpen, setIsLlmConfigModalOpen] = useState(false)
+  const [llmConfigForm] = Form.useForm()
+  const [savingLlm, setSavingLlm] = useState(false)
   const [selectedPoiId, setSelectedPoiId] = useState("")
   const [flowRuntimeStatus, setFlowRuntimeStatus] = useState({
     intent: "",
@@ -186,6 +191,53 @@ export default function App() {
         accessibility: false,
     })
   const isAdmin = authUser?.role === "admin"
+
+  useEffect(() => {
+    if (isAuthenticated && authUser && !authUser.has_llm_config) {
+      setIsLlmConfigModalOpen(true)
+    }
+  }, [isAuthenticated, authUser])
+
+  const handleOpenLlmConfig = async () => {
+    setIsLlmConfigModalOpen(true)
+    try {
+      const data = await getUserLlmConfig()
+      llmConfigForm.setFieldsValue({
+        base_url: data.analysis_base_url || "",
+        api_key: data.analysis_api_key || "",
+        model_name: data.analysis_model_name || ""
+      })
+    } catch (error) {
+      console.error(error)
+    }
+  }
+
+  const handleSaveLlmConfig = async () => {
+    try {
+      const values = await llmConfigForm.validateFields()
+      setSavingLlm(true)
+      const config = {
+        analysis_provider: "openai_compatible",
+        analysis_base_url: values.base_url,
+        analysis_model_name: values.model_name,
+        analysis_api_key: values.api_key || "",
+        analysis_temperature: 0.7,
+        generation_provider: "openai_compatible",
+        generation_base_url: values.base_url,
+        generation_model_name: values.model_name,
+        generation_api_key: values.api_key || "",
+        generation_temperature: 0.7,
+      }
+      await updateUserLlmConfig(config)
+      message.success("LLM 配置测试通过并已保存！")
+      setIsLlmConfigModalOpen(false)
+      setTimeout(() => window.location.reload(), 500)
+    } catch (error) {
+      message.error(`保存失败：${error?.response?.data?.detail || error.message}`)
+    } finally {
+      setSavingLlm(false)
+    }
+  }
 
   const sessionTitle = useMemo(() => {
     const activeSession = sessions.find((item) => item.session_id === activeSessionId)
@@ -682,9 +734,14 @@ export default function App() {
         <div className="header-left">
           <Typography.Title level={4} className="app-title">
             AI 行程助手
-            <Button type="primary" size="small" onClick={() => setIsWorkspaceModalOpen(true)} style={{ marginLeft: 20 }}>
-                旅行灵感与管理
+            <Button type="default" size="small" onClick={handleOpenLlmConfig} style={{ marginLeft: 20 }}>
+                LLM 配置
             </Button>
+            {isAdmin && (
+              <Button type="primary" size="small" onClick={() => setIsWorkspaceModalOpen(true)} style={{ marginLeft: 10 }}>
+                  旅行灵感与管理
+              </Button>
+            )}
           </Typography.Title>
           <Typography.Text className="app-subtitle">
             目的地规划 · 生成行程 · 地图概览
@@ -708,7 +765,7 @@ export default function App() {
                   <div className="chat-title-main">
                     <div>AI 助手</div>
                     <div className="chat-actions">
-                  <Button size="small" onClick={() => setIsTripModalOpen(true)}>
+                  <Button size="small" disabled={!authUser?.has_llm_config} onClick={() => setIsTripModalOpen(true)}>
                     行程输入
                   </Button>
                   <Button size="small" onClick={() => setIsSessionDrawerOpen(true)}>
@@ -736,6 +793,7 @@ export default function App() {
                 <Input.TextArea
                   value={chatInput}
                   onChange={(event) => setChatInput(event.target.value)}
+                  disabled={!authUser?.has_llm_config}
                   onKeyDown={(event) => {
                     // Enter 触发发送
                     if (event.key === "Enter" && !event.shiftKey) {
@@ -745,10 +803,10 @@ export default function App() {
                       handleSendChat()
                     }
                   }}
-                  placeholder="输入要咨询的问题或想法"
+                  placeholder={authUser?.has_llm_config ? "输入要咨询的问题或想法" : "请先配置左上角 LLM 模型以解锁聊天功能"}
                   autoSize={{ minRows: 1, maxRows: 3 }}
                 />
-                <Button type="primary" onClick={handleSendChat} loading={sendingChat}>
+                <Button type="primary" disabled={!authUser?.has_llm_config} onClick={handleSendChat} loading={sendingChat}>
                   发送
                 </Button>
               </div>
@@ -902,6 +960,33 @@ export default function App() {
         destroyOnHidden
       >
         <Tabs defaultActiveKey="knowledge" items={workspaceTabItems} />
+      </Modal>
+      <Modal
+        title="大语言模型 (LLM) 配置"
+        open={isLlmConfigModalOpen}
+        onCancel={() => authUser?.has_llm_config && setIsLlmConfigModalOpen(false)}
+        closable={authUser?.has_llm_config}
+        maskClosable={authUser?.has_llm_config}
+        footer={[
+          <Button key="save" type="primary" loading={savingLlm} onClick={handleSaveLlmConfig}>
+            保存
+          </Button>
+        ]}
+      >
+        <Form form={llmConfigForm} layout="vertical">
+          <Form.Item label="API Base URL" name="base_url" rules={[{ required: true, message: '请输入 Base URL' }]}>
+            <Input placeholder="例如：https://api.openai.com/v1" />
+          </Form.Item>
+          <Form.Item label="模型名称 (Model Name)" name="model_name" rules={[{ required: true, message: '请输入模型名称' }]}>
+            <Input placeholder="例如：gpt-4o-mini 或 deepseek-chat" />
+          </Form.Item>
+          <Form.Item label="API Key" name="api_key">
+            <Input.Password placeholder="输入您的 API Key" />
+          </Form.Item>
+          <Typography.Text type="secondary">
+            支持任何兼容 OpenAI 接口标准的模型服务。点击保存时系统会自动测试连通性。
+          </Typography.Text>
+        </Form>
       </Modal>
     </Layout>
   )

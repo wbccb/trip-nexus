@@ -148,6 +148,38 @@ def init_auth_tables() -> None:
                 cursor.execute("ALTER TABLE audit_log ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
             if "message_id" not in audit_columns:
                 cursor.execute("ALTER TABLE audit_log ADD COLUMN message_id TEXT NOT NULL DEFAULT ''")
+
+            # 对 users 表补齐 llm_config 列
+            cursor.execute("PRAGMA table_info(users)")
+            user_columns = {
+                str(row["name"]) if isinstance(row, sqlite3.Row) else str(row[1])
+                for row in (cursor.fetchall() or [])
+            }
+            if "llm_config" not in user_columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN llm_config TEXT NOT NULL DEFAULT '{}'")
+
+            # 插入超级管理员
+            from src.auth.password import hash_password
+            config = _get_config()
+            admin_email = config.SUPER_ADMIN_EMAIL
+            admin_password = config.SUPER_ADMIN_PASSWORD
+            
+            cursor.execute("SELECT id FROM users WHERE email = ?", (admin_email,))
+            row = cursor.fetchone()
+            if not row:
+                cursor.execute(
+                    """
+                    INSERT INTO users (email, password_hash, nickname, role, status, token_quota, token_used, token_version)
+                    VALUES (?, ?, ?, 'admin', 'active', 999999999, 0, 0)
+                    """,
+                    (admin_email, hash_password(admin_password), "SuperAdmin"),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE users SET role = 'admin' WHERE email = ?",
+                    (admin_email,)
+                )
+            
             conn.commit()
         finally:
             conn.close()

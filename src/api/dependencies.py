@@ -45,51 +45,72 @@ def _get_storage():
     return get_conversation_storage(config)
 
 
-@lru_cache(maxsize=1)
-def _get_llm_manager() -> LlmManager:
-    """缓存 LlmManager 实例，统一行程生成入口"""
+@lru_cache(maxsize=128)
+def _get_llm_manager_for_user(user_id: int) -> LlmManager:
+    """缓存 LlmManager 实例，按用户级别隔离以支持独立配置"""
     config = _get_config()
+    is_prod = config.ENVIRONMENT.lower() == "production"
+
+    base_llm_config = {
+        "provider": config.GENERATION_PROVIDER,
+        "base_url": config.GENERATION_BASE_URL,
+        "model_name": config.GENERATION_MODEL_NAME,
+        "api_key": config.GENERATION_API_KEY,
+        "temperature": config.GENERATION_TEMPERATURE,
+        "analysis_provider": config.ANALYSIS_PROVIDER,
+        "analysis_base_url": config.ANALYSIS_BASE_URL,
+        "analysis_model_name": config.ANALYSIS_MODEL_NAME,
+        "analysis_api_key": config.ANALYSIS_API_KEY,
+        "analysis_temperature": config.ANALYSIS_TEMPERATURE,
+        "generation_provider": config.GENERATION_PROVIDER,
+        "generation_base_url": config.GENERATION_BASE_URL,
+        "generation_model_name": config.GENERATION_MODEL_NAME,
+        "generation_api_key": config.GENERATION_API_KEY,
+        "generation_temperature": config.GENERATION_TEMPERATURE,
+    }
+
+    user_configured = False
+    if user_id > 0:
+        user_row = _get_user_row(user_id)
+        if user_row and user_row.get("llm_config"):
+            try:
+                user_llm_config = json.loads(user_row.get("llm_config"))
+                if isinstance(user_llm_config, dict) and user_llm_config:
+                    base_llm_config.update(user_llm_config)
+                    user_configured = True
+            except Exception as e:
+                logger.warning(f"解析用户 {user_id} 的 LLM 配置失败: {e}")
+
+    if is_prod and not user_configured:
+        raise HTTPException(status_code=400, detail="生产环境必须先配置大语言模型才能使用。请在界面左上角进行 LLM 配置。")
+
     llm_manager = LlmManager(
-        model_name=config.GENERATION_MODEL_NAME,
-        ollama_base_url=config.GENERATION_BASE_URL,
-        provider=config.GENERATION_PROVIDER,
-        base_url=config.GENERATION_BASE_URL,
-        api_key=config.GENERATION_API_KEY,
-        temperature=config.GENERATION_TEMPERATURE,
+        model_name=base_llm_config["generation_model_name"],
+        ollama_base_url=base_llm_config["generation_base_url"],
+        provider=base_llm_config["generation_provider"],
+        base_url=base_llm_config["generation_base_url"],
+        api_key=base_llm_config["generation_api_key"],
+        temperature=base_llm_config["generation_temperature"],
     )
-    llm_manager.update_llm_config(
-        {
-            "provider": config.GENERATION_PROVIDER,
-            "base_url": config.GENERATION_BASE_URL,
-            "model_name": config.GENERATION_MODEL_NAME,
-            "api_key": config.GENERATION_API_KEY,
-            "temperature": config.GENERATION_TEMPERATURE,
-            "analysis_provider": config.ANALYSIS_PROVIDER,
-            "analysis_base_url": config.ANALYSIS_BASE_URL,
-            "analysis_model_name": config.ANALYSIS_MODEL_NAME,
-            "analysis_api_key": config.ANALYSIS_API_KEY,
-            "analysis_temperature": config.ANALYSIS_TEMPERATURE,
-            "generation_provider": config.GENERATION_PROVIDER,
-            "generation_base_url": config.GENERATION_BASE_URL,
-            "generation_model_name": config.GENERATION_MODEL_NAME,
-            "generation_api_key": config.GENERATION_API_KEY,
-            "generation_temperature": config.GENERATION_TEMPERATURE,
-        }
-    )
+    llm_manager.update_llm_config(base_llm_config)
     llm_manager.set_usage_observer(_llm_usage_observer)
     return llm_manager
 
+def _get_llm_manager() -> LlmManager:
+    """获取当前上下文用户的 LlmManager 实例，统一行程生成入口"""
+    ctx = _REQUEST_OBSERVABILITY_CONTEXT.get({})
+    user_id = int(ctx.get("user_id") or 0)
+    return _get_llm_manager_for_user(user_id)
 
-@lru_cache(maxsize=1)
+
 def _get_conversation_manager() -> ConversationManager:
     storage = _get_storage()
     llm_manager = _get_llm_manager()
     return ConversationManager(storage, llm_manager)
 
 
-@lru_cache(maxsize=1)
 def _get_rag_pipeline() -> AIRetrievalPipeline:
-    """缓存 RAG Pipeline 实例，提供知识库检索能力"""
+    """每次获取最新的 LLM 实例用于 RAG"""
     llm_manager = _get_llm_manager()
     return AIRetrievalPipeline(llm_manager.get_analysis_llm())
 
@@ -110,6 +131,15 @@ def _normalize_knowledge_base_id(raw_id: str) -> str:
 
 
 def _row_to_public_user_profile(row: Dict[str, Any]) -> PublicUserProfile:
+    llm_config_str = str(row.get("llm_config") or "{}")
+    has_llm_config = False
+    if llm_config_str and llm_config_str != "{}":
+        try:
+            parsed = json.loads(llm_config_str)
+            has_llm_config = bool(parsed and isinstance(parsed, dict))
+        except Exception:
+            pass
+
     return PublicUserProfile(
         user_id=int(row.get("id") or 0),
         email=str(row.get("email") or ""),
@@ -118,6 +148,7 @@ def _row_to_public_user_profile(row: Dict[str, Any]) -> PublicUserProfile:
         status=str(row.get("status") or "active"),
         token_quota=int(row.get("token_quota") or 0),
         token_used=int(row.get("token_used") or 0),
+        has_llm_config=has_llm_config,
         created_at=str(row.get("created_at") or ""),
         updated_at=str(row.get("updated_at") or ""),
     )

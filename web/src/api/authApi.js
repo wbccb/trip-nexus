@@ -27,3 +27,11 @@ export async function updateUserProfile(payload) {
 export async function updateUserPassword(payload) {
   return apiPut("/api/user/password", payload || {});
 }
+
+export async function getUserLlmConfig() {
+  return apiGet("/api/user/llm-config");
+}
+
+export async function updateUserLlmConfig(payload) {
+  return apiPut("/api/user/llm-config", payload || {});
+}

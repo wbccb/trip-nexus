@@ -46,6 +46,20 @@ class UserProfileUpdateRequest(BaseModel):
     nickname: Optional[str] = Field(None, description="昵称")
 
 
+class UserLlmConfig(BaseModel):
+    analysis_provider: str = Field(..., description="第 1 次调用-模型提供方")
+    analysis_base_url: str = Field(..., description="第 1 次调用-Base URL")
+    analysis_model_name: str = Field(..., description="第 1 次调用-模型名称")
+    analysis_api_key: str = Field("", description="第 1 次调用-API Key")
+    analysis_temperature: float = Field(0.7, description="第 1 次调用-温度")
+    
+    generation_provider: str = Field(..., description="第 2 次调用-模型提供方")
+    generation_base_url: str = Field(..., description="第 2 次调用-Base URL")
+    generation_model_name: str = Field(..., description="第 2 次调用-模型名称")
+    generation_api_key: str = Field("", description="第 2 次调用-API Key")
+    generation_temperature: float = Field(0.7, description="第 2 次调用-温度")
+
+
 class UserPasswordUpdateRequest(BaseModel):
     old_password: str = Field(..., description="旧密码")
     new_password: str = Field(..., description="新密码")

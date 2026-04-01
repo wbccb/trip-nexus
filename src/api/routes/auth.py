@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from uuid import uuid4
 from typing import Dict, List, Any, Optional
@@ -24,6 +25,7 @@ from src.api.schemas.auth import (
     SimpleMessageResponse,
     UserProfileUpdateRequest,
     UserPasswordUpdateRequest,
+    UserLlmConfig,
 )
 from src.api.schemas.admin import AdminUserListResponse
 from src.models.user import PublicUserProfile
@@ -37,6 +39,7 @@ from src.api.dependencies import (
     _apply_auth_request_guard,
     _reset_observability_context,
     _record_audit_log,
+    _get_llm_manager_for_user,
 )
 
 router = APIRouter(prefix="/api", tags=["auth"])
@@ -269,3 +272,89 @@ def update_user_password(
     finally:
         conn.close()
     return SimpleMessageResponse(message="密码更新成功，请重新登录")
+
+@router.get("/auth/user/llm-config", response_model=UserLlmConfig)
+@router.get("/user/llm-config", response_model=UserLlmConfig)
+def get_user_llm_config(current_user: AuthenticatedUser = Depends(get_current_user)) -> UserLlmConfig:
+    """获取当前登录用户的私有大模型配置"""
+    user_row = _get_user_row(current_user.user_id)
+    if not user_row:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    llm_config_str = str(user_row.get("llm_config") or "{}")
+    user_config = {}
+    if llm_config_str and llm_config_str != "{}":
+        try:
+            parsed = json.loads(llm_config_str)
+            if isinstance(parsed, dict):
+                user_config = parsed
+        except Exception:
+            pass
+
+    config = _get_config()
+    return UserLlmConfig(
+        analysis_provider=user_config.get("analysis_provider", config.ANALYSIS_PROVIDER),
+        analysis_base_url=user_config.get("analysis_base_url", config.ANALYSIS_BASE_URL),
+        analysis_model_name=user_config.get("analysis_model_name", config.ANALYSIS_MODEL_NAME),
+        analysis_api_key=user_config.get("analysis_api_key", config.ANALYSIS_API_KEY),
+        analysis_temperature=user_config.get("analysis_temperature", config.ANALYSIS_TEMPERATURE),
+        generation_provider=user_config.get("generation_provider", config.GENERATION_PROVIDER),
+        generation_base_url=user_config.get("generation_base_url", config.GENERATION_BASE_URL),
+        generation_model_name=user_config.get("generation_model_name", config.GENERATION_MODEL_NAME),
+        generation_api_key=user_config.get("generation_api_key", config.GENERATION_API_KEY),
+        generation_temperature=user_config.get("generation_temperature", config.GENERATION_TEMPERATURE),
+    )
+
+
+@router.put("/auth/user/llm-config", response_model=SimpleMessageResponse)
+@router.put("/user/llm-config", response_model=SimpleMessageResponse)
+def update_user_llm_config(
+    payload: UserLlmConfig,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> SimpleMessageResponse:
+    """更新当前登录用户的私有大模型配置（保存前自动测试连通性）"""
+    from src.llm.llm_manager import LlmManager
+    from langchain_core.messages import HumanMessage
+    
+    test_config = payload.model_dump()
+    
+    # 自动测试 LLM 配置的连通性
+    try:
+        temp_llm_manager = LlmManager(
+            model_name=test_config["generation_model_name"],
+            ollama_base_url=test_config["generation_base_url"],
+            provider=test_config["generation_provider"],
+            base_url=test_config["generation_base_url"],
+            api_key=test_config["generation_api_key"],
+            temperature=test_config["generation_temperature"],
+        )
+        temp_llm_manager.update_llm_config(test_config)
+        
+        # 测试意图识别模型
+        analysis_llm = temp_llm_manager.get_analysis_llm()
+        analysis_response = analysis_llm.invoke([HumanMessage(content="Hello! Please reply with just 'OK'.")])
+        if not analysis_response or not getattr(analysis_response, "content", ""):
+            raise HTTPException(status_code=400, detail="模型连接测试失败，未返回有效内容")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"模型连接失败: {str(e)}")
+
+    # 测试通过，落库保存
+    llm_config_str = json.dumps(test_config, ensure_ascii=False)
+    conn = get_auth_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET llm_config = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (llm_config_str, current_user.user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 清理 LlmManager 缓存，让下一次调用重新初始化
+    from src.api.dependencies import _get_llm_manager_for_user
+    _get_llm_manager_for_user.cache_clear()
+    
+    return SimpleMessageResponse(message="LLM 配置测试通过并保存成功")

@@ -60,3 +60,7 @@ agent_events.*
 
 
 线上部署方案.md
+
+
+.env.*
+auth.db.*

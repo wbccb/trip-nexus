@@ -1,6 +1,13 @@
 import os
 from dotenv import load_dotenv
 
+# 区分开发环境与生产环境配置
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+if ENVIRONMENT == "production":
+    load_dotenv(".env.production")
+else:
+    load_dotenv(".env.development")
+# 兜底加载默认 .env
 load_dotenv()
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -19,7 +26,11 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", HUGGINGFACE_HUB_CACHE)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 class Config:
+    ENVIRONMENT = ENVIRONMENT
+    SUPER_ADMIN_EMAIL = os.getenv("SUPER_ADMIN_EMAIL", "")
+    SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "")
     LOG_LEVEL = os.getenv("TRIPNEXUS_LOG_LEVEL", "WARNING").upper()
+    SUPER_ADMIN_EMAILS = os.getenv("SUPER_ADMIN_EMAILS", "")
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "tripnexus-dev-secret")
     JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
     JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "120"))
