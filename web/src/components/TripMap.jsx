@@ -45,6 +45,7 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
   const [mapGeojson, setMapGeojson] = useState(null)
   const [loadingMap, setLoadingMap] = useState(false)
   const [mapError, setMapError] = useState("")
+  const [selectedDay, setSelectedDay] = useState(null)
   const [mapViewState, setMapViewState] = useState({
     longitude: 104.065,
     latitude: 30.657,
@@ -88,6 +89,7 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
       })
 
       setMapGeojson(data || null)
+      setSelectedDay(null)
       
       if (data?.bounds && Array.isArray(data.bounds) && data.bounds.length === 4) {
         const viewport = new WebMercatorViewport({
@@ -165,6 +167,106 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
     })
   }, [mapPoints])
 
+  const tripDays = useMemo(() => {
+    const days = new Set();
+    mapPoints.forEach(p => {
+      if (p.properties?.day) days.add(p.properties.day);
+    });
+    return Array.from(days).sort((a, b) => Number(a) - Number(b));
+  }, [mapPoints]);
+
+  const handleDayClick = useCallback((day) => {
+    setSelectedDay(day);
+    
+    if (day === null) {
+      if (mapGeojson?.bounds && Array.isArray(mapGeojson.bounds) && mapGeojson.bounds.length === 4) {
+        try {
+          const viewport = new WebMercatorViewport({
+            width: 800,
+            height: 600,
+          });
+          const nextViewState = viewport.fitBounds(
+            [
+              [mapGeojson.bounds[0], mapGeojson.bounds[1]],
+              [mapGeojson.bounds[2], mapGeojson.bounds[3]],
+            ],
+            { padding: 40 }
+          );
+          setMapViewState(prev => ({
+            ...prev,
+            longitude: nextViewState.longitude,
+            latitude: nextViewState.latitude,
+            zoom: nextViewState.zoom,
+            transitionDuration: 1000,
+          }));
+        } catch (e) {
+          // ignore
+        }
+      }
+      return;
+    }
+
+    const dayPoints = mapPoints.filter(p => String(p.properties?.day) === String(day));
+    const coords = dayPoints.map(getFeatureCoordinates).filter(Boolean);
+    
+    if (coords.length > 0) {
+      const lons = coords.map(c => c[0]);
+      const lats = coords.map(c => c[1]);
+      
+      if (lons.length === 1) {
+         setMapViewState((prev) => ({
+          ...prev,
+          longitude: lons[0],
+          latitude: lats[0],
+          zoom: 16,
+          transitionDuration: 1000,
+        }));
+        return;
+      }
+      
+      const bounds = [
+        [Math.min(...lons), Math.min(...lats)],
+        [Math.max(...lons), Math.max(...lats)]
+      ];
+      
+      try {
+        const viewport = new WebMercatorViewport({
+          width: 800,
+          height: 600,
+        });
+        const nextViewState = viewport.fitBounds(bounds, { padding: 80 });
+        setMapViewState((prev) => ({
+          ...prev,
+          longitude: nextViewState.longitude,
+          latitude: nextViewState.latitude,
+          // 放大地图并限制最大层级
+          zoom: Math.min(nextViewState.zoom, 20),
+          transitionDuration: 1000,
+        }));
+      } catch (e) {
+        setMapViewState((prev) => ({
+          ...prev,
+          longitude: (Math.min(...lons) + Math.max(...lons)) / 2,
+          latitude: (Math.min(...lats) + Math.max(...lats)) / 2,
+          zoom: 15,
+          transitionDuration: 1000,
+        }));
+      }
+    }
+  }, [mapPoints, mapGeojson]);
+
+  const selectedDaySummary = useMemo(() => {
+    if (!selectedDay || !tripResult?.daily_plan) return null;
+    let plan = tripResult.daily_plan[selectedDay];
+    if (!plan && Array.isArray(tripResult.daily_plan) && String(selectedDay) === "1") {
+      plan = tripResult.daily_plan;
+    }
+    if (!plan) return null;
+    
+    const attractions = plan.map(item => item.attraction || item.address).filter(Boolean).join(" ➔ ");
+    return `第 ${selectedDay} 天行程：${attractions}`;
+  }, [selectedDay, tripResult]);
+
   useEffect(() => {
     if (!selectedPoiId) return
     
@@ -187,18 +289,30 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
     const segments = []
     mapRoutes.forEach((feature) => {
       const coords = feature?.geometry?.coordinates
+      const day = feature?.properties?.day
       if (Array.isArray(coords) && coords.length >= 2) {
         for (let i = 0; i < coords.length - 1; i += 1) {
           segments.push({
             source: coords[i],
             target: coords[i + 1],
             color: resolveRouteColor(feature?.properties?.color),
+            day: String(day),
           })
         }
       }
     })
     return segments
   }, [mapRoutes])
+
+  const activeRouteSegments = useMemo(() => {
+    if (!selectedDay) return routeSegments;
+    return routeSegments.filter(s => s.day === String(selectedDay));
+  }, [routeSegments, selectedDay]);
+
+  const activePoints = useMemo(() => {
+    if (!selectedDay) return adjustedPoints;
+    return adjustedPoints.filter(p => String(p?.properties?.day) === String(selectedDay));
+  }, [adjustedPoints, selectedDay]);
 
   const getPoiLabel = useCallback((feature) => {
     if (feature?.properties?.is_collision_cluster) {
@@ -220,7 +334,7 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
       bearing: mapViewState.bearing,
       pitch: mapViewState.pitch,
     })
-    const sourcePoints = adjustedPoints.filter((feature) => Boolean(getFeatureCoordinates(feature)))
+    const sourcePoints = activePoints.filter((feature) => Boolean(getFeatureCoordinates(feature)))
     const projectedPoints = sourcePoints.map((feature) => {
       const coords = getFeatureCoordinates(feature)
       const pixel = viewport.project(coords)
@@ -288,7 +402,7 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
         },
       }
     })
-  }, [adjustedPoints, getPoiLabel, mapViewState])
+  }, [activePoints, getPoiLabel, mapViewState])
 
   const poiLabelCharacterSet = useMemo(() => { // 汇总所有 POI 标签字符，避免 TextLayer 字符集缺失
     const chars = new Set() // 使用 Set 去重字符
@@ -301,20 +415,13 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
   }, [collisionPoints, getPoiLabel])
 
   const mapLayers = useMemo(() => {
-    // logMap("开始构建图层", { 
-    //   points: mapPoints.length, 
-    //   visiblePoints: collisionPoints.length,
-    //   routes: routeSegments.length,
-    //   zoom: mapViewState.zoom,
-    // })
-
     const layers = []
     
-    if (routeSegments.length > 0) {
+    if (activeRouteSegments.length > 0) {
       layers.push(
         new LineLayer({
           id: "trip-routes",
-          data: routeSegments,
+          data: activeRouteSegments,
           getSourcePosition: (d) => d.source,
           getTargetPosition: (d) => d.target,
           getColor: (d) => d.color,
@@ -433,7 +540,7 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
     poiLabelCharacterSet,
     mapPoints.length,
     onSelectPoi,
-    routeSegments,
+    activeRouteSegments,
     selectedPoiId,
     mapViewState.zoom,
   ])
@@ -442,7 +549,7 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
     <Spin spinning={loadingMap} style={{ height: "100%" }}>
       {mapError && <div className="map-placeholder map-large">{mapError}</div>}
       {!mapError && mapGeojson && (
-        <div className="map-canvas">
+        <div className="map-canvas" style={{ position: 'relative', width: '100%', height: '100%' }}>
           <DeckGL
             layers={mapLayers}
             viewState={mapViewState}
@@ -453,6 +560,69 @@ export default function TripMap({ tripResult, selectedPoiId, onSelectPoi }) {
               mapStyle="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"
             />
           </DeckGL>
+          
+          {/* 按天过滤按钮组 */}
+          {tripDays.length > 0 && (
+            <div style={{
+              position: 'absolute',
+              bottom: 24,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 10,
+              display: 'flex',
+              gap: '8px',
+              background: 'rgba(255, 255, 255, 0.85)',
+              backdropFilter: 'blur(4px)',
+              padding: '8px 12px',
+              borderRadius: '8px',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
+              maxWidth: '90%',
+              overflowX: 'auto',
+              whiteSpace: 'nowrap'
+            }}>
+              <Button
+                type={selectedDay === null ? "primary" : "default"}
+                size="small"
+                onClick={() => handleDayClick(null)}
+              >
+                全部路线
+              </Button>
+              {tripDays.map(day => (
+                <Button
+                  key={day}
+                  type={selectedDay === day ? "primary" : "default"}
+                  size="small"
+                  onClick={() => handleDayClick(day)}
+                >
+                  第 {day} 天
+                </Button>
+              ))}
+            </div>
+          )}
+
+          {/* 当天行程概要提示 */}
+          {selectedDaySummary && (
+            <div style={{
+              position: 'absolute',
+              top: 24,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 10,
+              background: 'rgba(255, 255, 255, 0.95)',
+              backdropFilter: 'blur(4px)',
+              padding: '10px 16px',
+              borderRadius: '8px',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+              maxWidth: '80%',
+              textAlign: 'center',
+              fontSize: '14px',
+              color: '#333',
+              fontWeight: 500,
+              pointerEvents: 'none'
+            }}>
+              {selectedDaySummary}
+            </div>
+          )}
         </div>
       )}
       {!mapError && !mapGeojson && !loadingMap && (
