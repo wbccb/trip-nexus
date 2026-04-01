@@ -79,7 +79,7 @@ def get_map_geojson(
         )
     try:
         map_renderer = _get_map_renderer()
-        result = map_renderer.get_trip_geojson(payload.trip_data)
+        result = map_renderer.build_geojson(payload.trip_data)
         if current_user:
             _record_audit_log(
                 action="map_geojson",

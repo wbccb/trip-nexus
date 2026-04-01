@@ -757,7 +757,7 @@ export default function App() {
           <div className="app-main">
             {tripContent}
           </div>
-          {/* <div className="app-right">
+          {<div className="app-right">
             <Card title="地图概览" className="panel-card map-card">
               {!tripResult && (
                 <div className="map-placeholder map-large">
@@ -784,7 +784,7 @@ export default function App() {
                 </div>
               )}
             </Card>
-          </div> */}
+          </div> }
         </div>
       </Content>
       <Drawer

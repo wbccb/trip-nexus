@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.auth.middleware import init_auth_tables
-from src.api.routes import auth, admin, health, session, chat, flow, trip, knowledge
+from src.api.routes import auth, admin, health, session, chat, flow, trip, knowledge, map
 
 # 配置日志
 logging.basicConfig(
@@ -51,6 +51,8 @@ app.include_router(chat.router)
 app.include_router(flow.router)
 app.include_router(trip.router)
 app.include_router(knowledge.router)
+# 注册地图相关路由，解决前端请求 /api/map/geojson 404 的问题
+app.include_router(map.router)
 
 if __name__ == "__main__":
     import uvicorn
