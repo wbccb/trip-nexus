@@ -59,7 +59,6 @@ agent_events.*
 *.db
 
 
-线上部署方案.md
 
 
 .env.*

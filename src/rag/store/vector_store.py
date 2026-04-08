@@ -5,7 +5,7 @@ from langchain_core.documents import Document
 from chromadb import EphemeralClient, PersistentClient
 from chromadb.config import Settings
 from src.config import Config
-from src.rag.module.intent_recognition import _get_sentence_transformer
+from langchain_openai import OpenAIEmbeddings
 import logging
 import os
 import re
@@ -13,22 +13,10 @@ import time
 
 logger = logging.getLogger(__name__)
 
-
-class _SentenceTransformerEmbeddings:
-    def __init__(self, model_name: str) -> None:
-        self._model = _get_sentence_transformer(model_name)
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return self._model.encode(texts, show_progress_bar=False).tolist()
-
-    def embed_query(self, text: str) -> List[float]:
-        return self._model.encode([text], show_progress_bar=False)[0].tolist()
-
-
 class VectorStore:
     def __init__(self, collection_name: str = "web_search_cache"):
         self.config = Config()
-        self.embeddings = _SentenceTransformerEmbeddings(self.config.SENTENCE_BERT_MODEL)
+        self.embeddings = self._build_embeddings()
         self.persist_directory = os.path.abspath(self.config.CHROMA_DB_PATH)
         self.collection_name = self._normalize_collection_name(collection_name)
         self.client = None
@@ -40,6 +28,15 @@ class VectorStore:
             separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?", " ", ""]
         )
         self._init_db()
+
+    def _build_embeddings(self):
+        if self.config.EMBEDDING_PROVIDER == "openai_compatible":
+            return OpenAIEmbeddings(
+                model=self.config.EMBEDDING_MODEL_NAME,
+                api_key=self.config.EMBEDDING_API_KEY,
+                base_url=self.config.EMBEDDING_BASE_URL,
+            )
+        raise RuntimeError("未配置可用的云端 Embedding Provider")
 
     def _normalize_collection_name(self, collection_name: str) -> str:
         """规范化集合名，确保可持久化且命名安全。"""

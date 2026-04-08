@@ -3,7 +3,6 @@ import json
 import datetime
 import redis
 import mysql.connector
-from mysql.connector import pooling
 from typing import Optional, Dict, List
 from pydantic import ValidationError
 import logging
@@ -19,15 +18,23 @@ class ProdConversationStorage(BaseConversationStorage):
 
     def __init__(self, config: Config):
         # 1. Redis连接（短期缓存）
-        self.redis = redis.Redis(
-            host=config.REDIS_HOST,
-            port=config.REDIS_PORT,
-            db=config.REDIS_DB,
-            password=config.REDIS_PASSWORD,
-            decode_responses=True,
-            socket_timeout=5,
-            socket_connect_timeout=5
-        )
+        if config.REDIS_URL:
+            self.redis = redis.from_url(
+                config.REDIS_URL,
+                decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5
+            )
+        else:
+            self.redis = redis.Redis(
+                host=config.REDIS_HOST,
+                port=config.REDIS_PORT,
+                db=config.REDIS_DB,
+                password=config.REDIS_PASSWORD,
+                decode_responses=True,
+                socket_timeout=5,
+                socket_connect_timeout=5
+            )
         # 2. MySQL连接配置
         self.mysql_config = {
             'host': config.MYSQL_HOST,
@@ -37,6 +44,9 @@ class ProdConversationStorage(BaseConversationStorage):
             'database': config.MYSQL_DATABASE,
             'connection_timeout': 10
         }
+        if config.MYSQL_SSL_CA:
+            self.mysql_config['ssl_ca'] = config.MYSQL_SSL_CA
+            self.mysql_config['ssl_verify_cert'] = True
 
     def _get_mysql_connection(self):
         """获取MySQL连接"""

@@ -46,19 +46,15 @@ def admin_list_users(
     )
     try:
         init_auth_tables()
-        conn = get_auth_db_connection()
-        try:
+        with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             like_keyword = f"%{str(keyword or '').strip()}%"
-            where_clause = ""
-            params: List[Any] = []
-            if str(keyword or "").strip():
-                where_clause = "WHERE email LIKE ? OR nickname LIKE ?"
-                params.extend([like_keyword, like_keyword])
+            where_clause = "WHERE email LIKE ? OR nickname LIKE ?" if str(keyword or "").strip() else ""
+            params: List[Any] = [like_keyword, like_keyword] if str(keyword or "").strip() else []
             cursor.execute(f"SELECT COUNT(1) AS total FROM users {where_clause}", params)
             total_row = cursor.fetchone()
-            total = int((dict(total_row) if total_row else {}).get("total") or 0)
-            params.extend([page_size, (page - 1) * page_size])
+            total = int(dict(total_row).get("total") or 0) if total_row else 0
+            
             cursor.execute(
                 f"""
                 SELECT id, email, nickname, role, status, token_quota, token_used, created_at, updated_at
@@ -67,13 +63,11 @@ def admin_list_users(
                 ORDER BY created_at DESC, id DESC
                 LIMIT ? OFFSET ?
                 """,
-                params,
+                params + [page_size, (page - 1) * page_size],
             )
             rows = cursor.fetchall() or []
             items = [_row_to_public_user_profile(dict(row)) for row in rows]
             return AdminUserListResponse(total=total, items=items)
-        finally:
-            conn.close()
     finally:
         _reset_observability_context(guard_token)
 
@@ -99,16 +93,13 @@ def admin_update_user_status(
         target_user = _get_user_row(user_id)
         if not target_user:
             raise HTTPException(status_code=404, detail="用户不存在")
-        conn = get_auth_db_connection()
-        try:
+        with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE users SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (next_status, user_id),
             )
             conn.commit()
-        finally:
-            conn.close()
         refreshed_user = _get_user_row(user_id)
         if not refreshed_user:
             raise HTTPException(status_code=404, detail="用户不存在")
@@ -145,16 +136,13 @@ def admin_update_user_quota(
         target_user = _get_user_row(user_id)
         if not target_user:
             raise HTTPException(status_code=404, detail="用户不存在")
-        conn = get_auth_db_connection()
-        try:
+        with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "UPDATE users SET token_quota = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (next_quota, user_id),
+                (int(payload.token_quota or 0), user_id),
             )
             conn.commit()
-        finally:
-            conn.close()
         refreshed_user = _get_user_row(user_id)
         if not refreshed_user:
             raise HTTPException(status_code=404, detail="用户不存在")
@@ -184,8 +172,7 @@ def admin_dashboard(
     )
     try:
         init_auth_tables()
-        conn = get_auth_db_connection()
-        try:
+        with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -212,8 +199,6 @@ def admin_dashboard(
                 total_token_used=total_used,
                 quota_remaining=max(total_quota - total_used, 0),
             )
-        finally:
-            conn.close()
     finally:
         _reset_observability_context(guard_token)
 
@@ -234,8 +219,7 @@ def admin_user_token_usage(
     )
     try:
         init_auth_tables()
-        conn = get_auth_db_connection()
-        try:
+        with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(1) AS total FROM token_usage_log WHERE user_id = ?", (user_id,))
             total_row = cursor.fetchone()
@@ -254,8 +238,6 @@ def admin_user_token_usage(
             rows = cursor.fetchall() or []
             items = [TokenUsageLogItem(**dict(row)) for row in rows]
             return TokenUsageLogListResponse(total=total, items=items)
-        finally:
-            conn.close()
     finally:
         _reset_observability_context(guard_token)
 
@@ -280,8 +262,7 @@ def admin_audit_logs(
     )
     try:
         init_auth_tables()
-        conn = get_auth_db_connection()
-        try:
+        with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             where_clauses: List[str] = []
             params: List[Any] = []
@@ -318,7 +299,5 @@ def admin_audit_logs(
             rows = cursor.fetchall() or []
             items = [AuditLogItem(**dict(row)) for row in rows]
             return AuditLogListResponse(total=total, items=items)
-        finally:
-            conn.close()
     finally:
         _reset_observability_context(guard_token)

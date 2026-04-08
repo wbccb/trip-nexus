@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from typing import List, Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 
@@ -53,6 +54,7 @@ from src.api.logic.knowledge import (
     _load_knowledge_base_registry,
     _upsert_knowledge_base_registry,
     _delete_knowledge_base_registry,
+    _build_text_preview,
     _extract_text_from_upload,
     _detect_source_type_by_filename,
     _resolve_knowledge_base_collection,
@@ -247,7 +249,8 @@ def delete_knowledge_base(
     )
     try:
         store = _get_knowledge_store()
-        store.vector_db.delete_collection(kb_info["collection_name"])
+        # 删除知识库时统一走 VectorStore 封装，避免直接依赖底层向量实现细节。
+        store.delete_collection(kb_info["collection_name"])
         _delete_knowledge_base_registry(knowledge_base_id)
         _record_audit_log(
             action="knowledge_base_delete",
@@ -299,7 +302,8 @@ async def upload_knowledge_file(
         )
         store = _get_knowledge_store()
         store.switch_collection(kb_info["collection_name"], create_if_missing=False)
-        chunks = store.add_documents([{"content": text_content, "metadata": metadata}])
+        # add_documents 返回的是“新增 chunk 数量”，这里直接按整数使用，避免再做 len()。
+        chunks_count = store.add_documents([{"content": text_content, "metadata": metadata}])
         _record_audit_log(
             action="knowledge_upload",
             status="success",
@@ -309,13 +313,13 @@ async def upload_knowledge_file(
                 "kb_id": knowledge_base_id,
                 "filename": file.filename,
                 "source_id": source_id,
-                "chunks": len(chunks),
+                "chunks": chunks_count,
             },
         )
         return KnowledgeUploadResponse(
             knowledge_base_id=knowledge_base_id,
             filename=file.filename,
-            chunks=len(chunks),
+            chunks=chunks_count,
             metadata=metadata,
             parsed_content_preview=_build_text_preview(text_content, 180),
             parsed_content_chars=len(text_content),
@@ -492,18 +496,19 @@ def ingest_knowledge_url(
         _delete_failed_source_entry(knowledge_base_id, source_id)
         store = _get_knowledge_store()
         store.switch_collection(kb_info["collection_name"], create_if_missing=False)
-        chunks = store.add_documents([{"content": text_content, "metadata": metadata}])
+        # add_documents 返回的是“新增 chunk 数量”，这里直接按整数使用，避免再做 len()。
+        chunks_count = store.add_documents([{"content": text_content, "metadata": metadata}])
         _record_audit_log(
             action="knowledge_ingest_url",
             status="success",
             user_id=current_user.user_id,
             user_email=current_user.email,
-            detail={"kb_id": knowledge_base_id, "url": url, "source_id": source_id, "chunks": len(chunks)},
+            detail={"kb_id": knowledge_base_id, "url": url, "source_id": source_id, "chunks": chunks_count},
         )
         return KnowledgeIngestUrlResponse(
             success=True,
             ingest_status=ingest_status,
-            chunks_count=len(chunks),
+            chunks_count=chunks_count,
             metadata=metadata,
             parsed_content_preview=_build_text_preview(text_content, 180),
             parsed_content_chars=len(text_content),
@@ -641,19 +646,20 @@ def update_knowledge_source(
             store.vector_db.delete(ids=old_chunk_ids)
         if target.get("ingest_status") == "failed":
             _delete_failed_source_entry(knowledge_base_id, source_id)
-        new_chunks = store.add_documents([{"content": next_content, "metadata": next_metadata}])
+        # add_documents 返回的是“新增 chunk 数量”，这里直接按整数使用，避免再做 len()。
+        new_chunks_count = store.add_documents([{"content": next_content, "metadata": next_metadata}])
         _record_audit_log(
             action="knowledge_source_update",
             status="success",
             user_id=current_user.user_id,
             user_email=current_user.email,
-            detail={"kb_id": knowledge_base_id, "source_id": source_id, "chunks": len(new_chunks)},
+            detail={"kb_id": knowledge_base_id, "source_id": source_id, "chunks": new_chunks_count},
         )
         return KnowledgeSourceUpdateResponse(
             knowledge_base_id=knowledge_base_id,
             source_id=source_id,
             success=True,
-            chunks_count=len(new_chunks),
+            chunks_count=new_chunks_count,
             metadata=next_metadata,
             parsed_content_preview=_build_text_preview(next_content, 180),
             parsed_content_chars=len(next_content),

@@ -49,6 +49,10 @@ class Config:
     SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080")
 
     # Embedding 模型配置
+    EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai_compatible")
+    EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "")
+    EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
+    EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
     SENTENCE_BERT_MODEL = os.getenv("SENTENCE_BERT_MODEL", "all-MiniLM-L6-v2")
     MINILM_MODEL = os.getenv("MINILM_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
@@ -143,6 +147,7 @@ class Config:
     CRAWL_GLOBAL_TIMEOUT_SECONDS = int(os.getenv("CRAWL_GLOBAL_TIMEOUT_SECONDS", "15"))
 
     # Redis 配置
+    REDIS_URL = os.getenv('REDIS_URL', '')
     REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
     REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
     REDIS_DB = int(os.getenv('REDIS_DB', '0'))
@@ -154,8 +159,13 @@ class Config:
     MYSQL_USER = os.getenv('MYSQL_USER', 'root')
     MYSQL_PASSWORD = os.getenv('MYSQL_PASSWORD', '')
     MYSQL_DATABASE = os.getenv('MYSQL_DATABASE', 'chat_context')
+    MYSQL_SSL_CA = os.getenv('MYSQL_SSL_CA', '')
+
+    # 认证数据库配置
+    AUTH_DB_BACKEND = os.getenv('AUTH_DB_BACKEND', 'mysql' if ENVIRONMENT == 'production' else 'sqlite')
 
     # 业务配置
+    TRIP_CONTEXT_STORAGE_TYPE = os.getenv('TRIP_CONTEXT_STORAGE_TYPE', 'test') # prod | test
     MAX_SHORT_TERM_MESSAGES = int(os.getenv('MAX_SHORT_TERM_MESSAGES', '10'))
     MAX_CONTEXT_TOKENS = int(os.getenv('MAX_CONTEXT_TOKENS', '4096'))
     SESSION_EXPIRY_HOURS = int(os.getenv('SESSION_EXPIRY_HOURS', '2'))

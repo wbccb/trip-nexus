@@ -39,8 +39,8 @@ from src.api.dependencies import (
     _apply_auth_request_guard,
     _reset_observability_context,
     _record_audit_log,
-    _get_llm_manager_for_user,
 )
+from src.api.dependencies import _get_llm_manager_for_user
 
 router = APIRouter(prefix="/api", tags=["auth"])
 
@@ -69,8 +69,7 @@ def register(payload: AuthRegisterRequest, request: Request) -> AuthResponse:
         nickname = str(payload.nickname or "").strip() or email.split("@")[0]
         role = "admin" if _count_all_users() == 0 else "user"
         init_auth_tables()
-        conn = get_auth_db_connection()
-        try:
+        with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -81,8 +80,6 @@ def register(payload: AuthRegisterRequest, request: Request) -> AuthResponse:
             )
             conn.commit()
             user_id = int(cursor.lastrowid or 0)
-        finally:
-            conn.close()
         user_row = _get_user_row(user_id)
         if not user_row:
             raise HTTPException(status_code=500, detail="用户创建失败")
@@ -136,16 +133,13 @@ def forgot_password(payload: ForgotPasswordRequest, request: Request) -> ForgotP
             return ForgotPasswordResponse(message="如果邮箱存在，重置链接已发送")
         reset_token = uuid4().hex
         expires_at = datetime.now() + timedelta(minutes=_get_config().PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
-        conn = get_auth_db_connection()
-        try:
+        with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO password_reset_tokens (user_id, token, expires_at, used) VALUES (?, ?, ?, 0)",
                 (int(user_row.get("id") or 0), reset_token, expires_at.isoformat()),
             )
             conn.commit()
-        finally:
-            conn.close()
         _record_audit_log(action="auth_forgot_password", status="success", user_id=int(user_row.get("id") or 0), user_email=email, detail={"matched": True})
         return ForgotPasswordResponse(message="开发模式已生成重置 token", reset_token=reset_token)
     finally:
@@ -161,8 +155,7 @@ def reset_password(payload: ResetPasswordRequest, request: Request) -> SimpleMes
             next_password_hash = hash_password(payload.new_password)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        conn = get_auth_db_connection()
-        try:
+        with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -195,8 +188,6 @@ def reset_password(payload: ResetPasswordRequest, request: Request) -> SimpleMes
             )
             conn.commit()
             updated_user = _get_user_row(int(token_data.get("user_id") or 0)) or {}
-        finally:
-            conn.close()
         _record_audit_log(
             action="auth_reset_password",
             status="success",
@@ -226,16 +217,13 @@ def update_user_profile(
     nickname = str(payload.nickname or "").strip()
     if not nickname:
         raise HTTPException(status_code=400, detail="nickname 不能为空")
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE users SET nickname = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (nickname, current_user.user_id),
         )
         conn.commit()
-    finally:
-        conn.close()
     user_row = _get_user_row(current_user.user_id)
     if not user_row:
         raise HTTPException(status_code=404, detail="用户不存在")
@@ -257,8 +245,7 @@ def update_user_password(
         next_password_hash = hash_password(payload.new_password)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -269,8 +256,6 @@ def update_user_password(
             (next_password_hash, current_user.user_id),
         )
         conn.commit()
-    finally:
-        conn.close()
     return SimpleMessageResponse(message="密码更新成功，请重新登录")
 
 @router.get("/auth/user/llm-config", response_model=UserLlmConfig)
@@ -342,19 +327,12 @@ def update_user_llm_config(
 
     # 测试通过，落库保存
     llm_config_str = json.dumps(test_config, ensure_ascii=False)
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE users SET llm_config = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (llm_config_str, current_user.user_id),
         )
         conn.commit()
-    finally:
-        conn.close()
 
-    # 清理 LlmManager 缓存，让下一次调用重新初始化
-    from src.api.dependencies import _get_llm_manager_for_user
-    _get_llm_manager_for_user.cache_clear()
-    
     return SimpleMessageResponse(message="LLM 配置测试通过并保存成功")

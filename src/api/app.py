@@ -33,10 +33,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+import os
+
 # 配置 CORS 跨域
+cors_origins_env = os.getenv("CORS_ORIGINS", "http://localhost:5173")
+cors_origins = [
+    item.strip()
+    for item in cors_origins_env.split(",")
+    if item.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

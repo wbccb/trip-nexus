@@ -1,4 +1,5 @@
 import os
+import random
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -11,9 +12,7 @@ from src.auth.jwt_handler import JwtError, decode_jwt
 from src.config import Config
 
 
-AUTH_DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "auth.db"))
-_AUTH_DB_LOCK = threading.Lock()
-
+from src.auth.database import get_auth_db_connection, _AUTH_DB_LOCK
 
 @dataclass
 class AuthenticatedUser:
@@ -34,20 +33,123 @@ def _get_config() -> Config:
     return Config()
 
 
-def get_auth_db_connection() -> sqlite3.Connection:
-    # 认证系统目前独立落在 auth.db，不和原会话/业务表混在一起，
-    # 目的是先把账号体系快速独立落地，避免牵一发动全身。
-    conn = sqlite3.connect(AUTH_DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def init_auth_tables() -> None:
     # 认证相关表都在这里集中初始化，保证：
     # 1) 任意 auth 路径第一次触达时都能自动建表
     # 2) register/login/profile/admin 等接口不需要各自重复写建表逻辑
     with _AUTH_DB_LOCK:
         conn = get_auth_db_connection()
+        config = _get_config()
+        if conn.backend == 'mysql':
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    email VARCHAR(255) NOT NULL UNIQUE,
+                    password_hash VARCHAR(255) NOT NULL,
+                    nickname VARCHAR(255) NOT NULL DEFAULT '',
+                    role VARCHAR(32) NOT NULL DEFAULT 'user',
+                    status VARCHAR(32) NOT NULL DEFAULT 'active',
+                    token_quota BIGINT NOT NULL DEFAULT 1000000,
+                    token_used BIGINT NOT NULL DEFAULT 0,
+                    token_version BIGINT NOT NULL DEFAULT 0,
+                    llm_config JSON NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+                """)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    user_id BIGINT NOT NULL,
+                    token VARCHAR(255) NOT NULL UNIQUE,
+                    expires_at DATETIME NOT NULL,
+                    used TINYINT(1) NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    used_at DATETIME NULL,
+                    KEY idx_password_reset_user_id (user_id),
+                    CONSTRAINT fk_password_reset_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS auth_blocklist (
+                    jti VARCHAR(255) PRIMARY KEY,
+                    expires_at BIGINT NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS token_usage_log (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    user_id BIGINT NOT NULL,
+                    session_id VARCHAR(128) NOT NULL DEFAULT '',
+                    request_path VARCHAR(255) NOT NULL,
+                    model_name VARCHAR(255) NOT NULL DEFAULT '',
+                    prompt_tokens BIGINT NOT NULL DEFAULT 0,
+                    completion_tokens BIGINT NOT NULL DEFAULT 0,
+                    total_tokens BIGINT NOT NULL DEFAULT 0,
+                    stage VARCHAR(64) NOT NULL DEFAULT '',
+                    message_id VARCHAR(128) NOT NULL DEFAULT '',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    KEY idx_token_usage_user_id (user_id),
+                    KEY idx_token_usage_created_at (created_at)
+                )
+                """)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    user_id BIGINT NULL,
+                    user_email VARCHAR(255) NOT NULL DEFAULT '',
+                    action VARCHAR(128) NOT NULL,
+                    session_id VARCHAR(128) NOT NULL DEFAULT '',
+                    message_id VARCHAR(128) NOT NULL DEFAULT '',
+                    request_path VARCHAR(255) NOT NULL DEFAULT '',
+                    status VARCHAR(64) NOT NULL DEFAULT '',
+                    detail_json LONGTEXT NOT NULL,
+                    ip_address VARCHAR(128) NOT NULL DEFAULT '',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    KEY idx_audit_log_user_id (user_id),
+                    KEY idx_audit_log_created_at (created_at)
+                )
+                """)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS rate_limit_log (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    subject_key VARCHAR(255) NOT NULL,
+                    bucket VARCHAR(64) NOT NULL,
+                    request_path VARCHAR(255) NOT NULL DEFAULT '',
+                    ip_address VARCHAR(128) NOT NULL DEFAULT '',
+                    created_at BIGINT NOT NULL,
+                    KEY idx_rate_limit_subject_bucket_time (subject_key, bucket, created_at)
+                )
+                """)
+                
+                # 插入超级管理员
+                from src.auth.password import hash_password
+                admin_email = config.SUPER_ADMIN_EMAIL
+                admin_password = config.SUPER_ADMIN_PASSWORD
+                if admin_email and admin_password:
+                    cursor.execute("SELECT id FROM users WHERE email = %s", (admin_email,))
+                    row = cursor.fetchone()
+                    if not row:
+                        cursor.execute(
+                            """
+                            INSERT INTO users (email, password_hash, nickname, role, status, token_quota, token_used, token_version)
+                            VALUES (%s, %s, %s, 'admin', 'active', 999999999, 0, 0)
+                            """,
+                            (admin_email, hash_password(admin_password), "SuperAdmin"),
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE users SET role = 'admin' WHERE email = %s",
+                            (admin_email,)
+                        )
+                conn.commit()
+            finally:
+                conn.close()
+            return
+
         try:
             cursor = conn.cursor()
             cursor.execute(
@@ -136,12 +238,9 @@ def init_auth_tables() -> None:
                 )
                 """
             )
-            # audit_log 是 v0.0.7 过程中逐步补强出来的表。
-            # 线上已有旧库时，不能假设表结构和最新代码完全一致，
-            # 所以这里在建表后再做一次“按列补齐”的轻量迁移，保证新增列能自动落地。
             cursor.execute("PRAGMA table_info(audit_log)")
             audit_columns = {
-                str(row["name"]) if isinstance(row, sqlite3.Row) else str(row[1])
+                str(row["name"]) if isinstance(row, dict) else (str(row["name"]) if isinstance(row, sqlite3.Row) else str(row[1]))
                 for row in (cursor.fetchall() or [])
             }
             if "session_id" not in audit_columns:
@@ -149,36 +248,34 @@ def init_auth_tables() -> None:
             if "message_id" not in audit_columns:
                 cursor.execute("ALTER TABLE audit_log ADD COLUMN message_id TEXT NOT NULL DEFAULT ''")
 
-            # 对 users 表补齐 llm_config 列
             cursor.execute("PRAGMA table_info(users)")
             user_columns = {
-                str(row["name"]) if isinstance(row, sqlite3.Row) else str(row[1])
+                str(row["name"]) if isinstance(row, dict) else (str(row["name"]) if isinstance(row, sqlite3.Row) else str(row[1]))
                 for row in (cursor.fetchall() or [])
             }
             if "llm_config" not in user_columns:
                 cursor.execute("ALTER TABLE users ADD COLUMN llm_config TEXT NOT NULL DEFAULT '{}'")
 
-            # 插入超级管理员
             from src.auth.password import hash_password
-            config = _get_config()
             admin_email = config.SUPER_ADMIN_EMAIL
             admin_password = config.SUPER_ADMIN_PASSWORD
             
-            cursor.execute("SELECT id FROM users WHERE email = ?", (admin_email,))
-            row = cursor.fetchone()
-            if not row:
-                cursor.execute(
-                    """
-                    INSERT INTO users (email, password_hash, nickname, role, status, token_quota, token_used, token_version)
-                    VALUES (?, ?, ?, 'admin', 'active', 999999999, 0, 0)
-                    """,
-                    (admin_email, hash_password(admin_password), "SuperAdmin"),
-                )
-            else:
-                cursor.execute(
-                    "UPDATE users SET role = 'admin' WHERE email = ?",
-                    (admin_email,)
-                )
+            if admin_email and admin_password:
+                cursor.execute("SELECT id FROM users WHERE email = ?", (admin_email,))
+                row = cursor.fetchone()
+                if not row:
+                    cursor.execute(
+                        """
+                        INSERT INTO users (email, password_hash, nickname, role, status, token_quota, token_used, token_version)
+                        VALUES (?, ?, ?, 'admin', 'active', 999999999, 0, 0)
+                        """,
+                        (admin_email, hash_password(admin_password), "SuperAdmin"),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE users SET role = 'admin' WHERE email = ?",
+                        (admin_email,)
+                    )
             
             conn.commit()
         finally:
@@ -188,15 +285,11 @@ def init_auth_tables() -> None:
 def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
     # 这里返回 dict 而不是 ORM 对象，保持和项目里现有 sqlite 访问习惯一致。
     init_auth_tables()
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE id = ?", (int(user_id),))
         row = cursor.fetchone()
         return dict(row) if row else None
-    finally:
-        conn.close()
-
 
 def is_token_blocked(jti: str) -> bool:
     # auth_blocklist 主要为“主动失效 token”预留。
@@ -204,32 +297,28 @@ def is_token_blocked(jti: str) -> bool:
     if not jti:
         return False
     now_ts = int(__import__("time").time())
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM auth_blocklist WHERE expires_at <= ?", (now_ts,))
+        # 仅 1% 概率执行清理，降低写入频率
+        if random.random() < 0.01:
+            cursor.execute("DELETE FROM auth_blocklist WHERE expires_at <= ?", (now_ts,))
         cursor.execute("SELECT 1 FROM auth_blocklist WHERE jti = ? LIMIT 1", (jti,))
         row = cursor.fetchone()
         conn.commit()
         return bool(row)
-    finally:
-        conn.close()
 
 
 def revoke_token(jti: str, exp: int) -> None:
     # 未来如果要做 logout / 管理员强制下线，只要把 jti 写进 blocklist 即可。
     if not jti or not exp:
         return
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT OR REPLACE INTO auth_blocklist (jti, expires_at) VALUES (?, ?)",
             (str(jti), int(exp)),
         )
         conn.commit()
-    finally:
-        conn.close()
 
 
 def _build_authenticated_user(user_row: Dict[str, Any]) -> AuthenticatedUser:

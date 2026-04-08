@@ -1,6 +1,5 @@
 import json
 from typing import Any, Dict
-from functools import lru_cache
 from langchain_core.prompts import ChatPromptTemplate
 import re
 import logging
@@ -10,39 +9,6 @@ from src.observability import log_event, summarize_value
 
 logger = logging.getLogger(__name__)
 
-try:
-    import streamlit as st
-    from streamlit.runtime.scriptrunner import get_script_run_ctx
-except Exception:
-    st = None
-    get_script_run_ctx = None
-
-
-def _resolve_cache_resource():
-    if st is None or get_script_run_ctx is None:
-        return None
-    try:
-        if get_script_run_ctx(suppress_warning=True) is None:
-            return None
-        return st.cache_resource
-    except Exception:
-        return None
-
-
-_st_cache_resource = _resolve_cache_resource()
-
-if _st_cache_resource:
-    @_st_cache_resource
-    def _get_sentence_transformer(model_name: str):
-        from sentence_transformers import SentenceTransformer
-        return SentenceTransformer(model_name)
-else:
-    @lru_cache(maxsize=1)
-    def _get_sentence_transformer(model_name: str):
-        from sentence_transformers import SentenceTransformer
-        return SentenceTransformer(model_name)
-
-
 def _strip_think_content(text: str) -> str:
     if text is None:
         return ""
@@ -50,89 +16,40 @@ def _strip_think_content(text: str) -> str:
     cleaned = re.sub(r"</?think>", "", cleaned)
     return cleaned.strip()
 
-
 def _format_log_text(text: str, head: int = 180, tail: int = 180) -> str:
     return summarize_value(text, head=head, tail=tail)
 
-
 def _log_llm_output(tag: str, cleaned_text: str) -> None:
     log_event(logger, logging.INFO, f"意图识别输出: {tag}", {"输出长度": len(cleaned_text), "输出预览": _format_log_text(cleaned_text)})
-
 
 def _invoke_prompt(llm: Any, prompt: ChatPromptTemplate, **kwargs: Any) -> Any:
     prompt_text = prompt.format_prompt(**kwargs).to_string()
     return llm.invoke(prompt_text)
 
+def _looks_like_no_search_needed(query: str) -> bool:
+    no_search_keywords = ["你好", "你是谁", "怎么写", "等于多少", "是谁"]
+    for keyword in no_search_keywords:
+        if keyword in query:
+            return True
+    return False
 
 class IntentRecognizer:
 
     def __init__(self, llm):
         self.config = Config()
         self.llm = llm
-        self.intent_classifier = _get_sentence_transformer(self.config.SENTENCE_BERT_MODEL)
-
-        # 预定义的意图类别和示例
-        # TODO: 初步简单处理，后续需要优化这部分的内置意图
-        self.intent_examples = {
-            "general_knowledge": [
-                "什么是量子计算？",
-                "爱因斯坦的相对论是什么？",
-                "太阳系有多少颗行星？"
-            ],
-            "current_events": [
-                "今天有什么新闻？",
-                "最新的科技趋势是什么？",
-                "最近的体育赛事结果如何？"
-            ],
-            "shopping": [
-                "最好的笔记本电脑推荐",
-                "手机价格比较",
-                "在哪里买便宜的机票？"
-            ],
-            "travel": [
-                "巴黎旅游攻略",
-                "日本签证要求",
-                "最佳旅游季节"
-            ],
-            "no_search_needed": [
-                "你好",
-                "你是谁",
-                "10的9次方等于多少",
-                "Python怎么写for循环"
-            ]
-        }
-        self.intent_embeddings = {}
-        for intent, examples in self.intent_examples.items():
-            embeddings = self.intent_classifier.encode(examples, convert_to_tensor=True)
-            self.intent_embeddings[intent] = embeddings.mean(dim=0) # 为每个意图生成嵌入向量
 
     def classify_intent(self, query:str) -> Dict[str, any]:
         """
-        先使用Sentence-BERT进行初步意图分类
+        不再使用本地模型，使用规则 + LLM进行意图分类
         """
-        from sentence_transformers import util
-
-        query_embedding = self.intent_classifier.encode(query, convert_to_tensor=True)
-
-        # 计算与每个意图类别的相似度
-        similarities = {}
-        for intent, embedding in self.intent_embeddings.items():
-            similarity = util.cos_sim(query_embedding, embedding).item()
-            similarities[intent] = similarity
-
-        # 获取最高相似度的意图
-        top_intent = max(similarities.items(), key=lambda x: x[1])
-
-        # 如果相似度低于阀值
-        if top_intent[1] < 0.6:
-            return self._llm_intent_recongnition(query)
-
-        return {
-            "primary_intent": top_intent[0],
-            "confidence": top_intent[1],
-            "similarities": similarities,
-            "needs_search": top_intent[0] != "no_search_needed"
-        }
+        if _looks_like_no_search_needed(query):
+            return {
+                "primary_intent": "no_search_needed",
+                "confidence": 1.0,
+                "needs_search": False
+            }
+        return self._llm_intent_recongnition(query)
 
     def _llm_intent_recongnition(self, query:str) -> Dict[str, any]:
         """
@@ -165,4 +82,15 @@ class IntentRecognizer:
         cleaned_content = _strip_think_content(content)
         cleaned_content = cleaned_content.replace("```json", "").replace("```", "").strip()
         _log_llm_output("intent_response", cleaned_content)
-        return json.loads(cleaned_content)
+        
+        try:
+            return json.loads(cleaned_content)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"意图识别 JSON 解析失败: {e}, 原始输出: {cleaned_content[:200]}")
+            return {
+                "primary_intent": "general_knowledge",
+                "confidence": 0.5,
+                "needs_search": True,
+                "keywords": [query],
+                "rewritten_queries": [query],
+            }

@@ -45,9 +45,8 @@ def _get_storage():
     return get_conversation_storage(config)
 
 
-@lru_cache(maxsize=128)
 def _get_llm_manager_for_user(user_id: int) -> LlmManager:
-    """缓存 LlmManager 实例，按用户级别隔离以支持独立配置"""
+    """按用户级别隔离以支持独立配置。为支持配置即时生效，移除 lru_cache"""
     config = _get_config()
     is_prod = config.ENVIRONMENT.lower() == "production"
 
@@ -80,9 +79,6 @@ def _get_llm_manager_for_user(user_id: int) -> LlmManager:
                     user_configured = True
             except Exception as e:
                 logger.warning(f"解析用户 {user_id} 的 LLM 配置失败: {e}")
-
-    if is_prod and not user_configured:
-        raise HTTPException(status_code=400, detail="生产环境必须先配置大语言模型才能使用。请在界面左上角进行 LLM 配置。")
 
     llm_manager = LlmManager(
         model_name=base_llm_config["generation_model_name"],
@@ -219,8 +215,7 @@ def _record_audit_log(
 ) -> None:
     init_auth_tables()
     ctx = _REQUEST_OBSERVABILITY_CONTEXT.get({})
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -243,8 +238,6 @@ def _record_audit_log(
             ),
         )
         conn.commit()
-    finally:
-        conn.close()
 
 
 def _record_token_usage(
@@ -262,8 +255,7 @@ def _record_token_usage(
     if int(total_tokens or 0) <= 0:
         return
     init_auth_tables()
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -289,8 +281,6 @@ def _record_token_usage(
             (int(total_tokens or 0), int(user_id)),
         )
         conn.commit()
-    finally:
-        conn.close()
 
 
 def _llm_usage_observer(payload: Dict[str, Any]) -> None:
@@ -312,38 +302,29 @@ def _llm_usage_observer(payload: Dict[str, Any]) -> None:
 
 def _get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     init_auth_tables()
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE email = ?", (email.lower(),))
         row = cursor.fetchone()
         return dict(row) if row else None
-    finally:
-        conn.close()
 
 
 def _get_user_row(user_id: int) -> Optional[Dict[str, Any]]:
     init_auth_tables()
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
-    finally:
-        conn.close()
 
 
 def _count_all_users() -> int:
     init_auth_tables()
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(1) AS total FROM users")
         row = cursor.fetchone()
         return int((dict(row) if row else {}).get("total") or 0)
-    finally:
-        conn.close()
 
 
 def _ensure_session_id(user_id: str, device_id: str, payload_session_id: Optional[str]) -> str:
@@ -416,8 +397,7 @@ def _enforce_rate_limit(
     init_auth_tables()
     now_ts = int(time.time())
     window_start = now_ts - max(1, int(window_seconds))
-    conn = get_auth_db_connection()
-    try:
+    with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM rate_limit_log WHERE created_at < ?", (window_start,))
         cursor.execute(
@@ -451,8 +431,6 @@ def _enforce_rate_limit(
             (str(subject_key or ""), str(bucket or ""), str(request_path or ""), str(ip_address or ""), now_ts),
         )
         conn.commit()
-    finally:
-        conn.close()
 
 
 def _assert_within_quota(current_user: AuthenticatedUser) -> None:
