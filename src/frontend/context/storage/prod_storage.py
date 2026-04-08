@@ -10,8 +10,11 @@ from src.frontend.context.entity import SessionContext, CoreEntity
 from src.config import Config
 from .base_storage import BaseConversationStorage
 from src.observability import log_event
+from src.utils.sql_loader import load_named_sql, load_sql_statements
 
 logger = logging.getLogger(__name__)
+_PROD_STORAGE_INIT_SQL = "storage/prod/init_tables.sql"
+_PROD_STORAGE_QUERIES_SQL = "storage/prod/queries.sql"
 
 class ProdConversationStorage(BaseConversationStorage):
     """生产用存储：Redis + MySQL"""
@@ -47,10 +50,30 @@ class ProdConversationStorage(BaseConversationStorage):
         if config.MYSQL_SSL_CA:
             self.mysql_config['ssl_ca'] = config.MYSQL_SSL_CA
             self.mysql_config['ssl_verify_cert'] = True
+        # 3. 启动时主动确保生产业务表存在，避免首次请求才暴露“表不存在”错误。
+        self._ensure_mysql_tables()
 
     def _get_mysql_connection(self):
         """获取MySQL连接"""
         return mysql.connector.connect(**self.mysql_config)
+
+    def _ensure_mysql_tables(self):
+        """初始化生产环境业务表，保证会话/聊天/实体/摘要/行程数据可直接落库。"""
+        try:
+            conn = self._get_mysql_connection()
+            cursor = conn.cursor()
+            # 业务表结构统一从独立 SQL 文件读取，后续改表时只需要维护一份脚本。
+            for statement in load_sql_statements(_PROD_STORAGE_INIT_SQL):
+                cursor.execute(statement)
+            conn.commit()
+            log_event(logger, logging.INFO, "MySQL 生产业务表初始化完成", {"表数量": 5})
+        except Exception as e:
+            log_event(logger, logging.ERROR, "MySQL 初始化生产业务表失败", {"原因": str(e)})
+            raise
+        finally:
+            if 'conn' in locals() and conn.is_connected():
+                cursor.close()
+                conn.close()
 
     # ------------------------------ 实现抽象方法 ------------------------------
     def generate_session_id(self, user_id: str, device_id: str) -> str:
@@ -87,13 +110,8 @@ class ProdConversationStorage(BaseConversationStorage):
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor()
-            query = """
-            INSERT INTO core_entities (session_id, entities_json, last_updated)
-            VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE entities_json = %s, last_updated = %s
-            """
             now = datetime.datetime.now()
-            cursor.execute(query, (session_id, entities_json, now, entities_json, now))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "upsert_core_entities"), (session_id, entities_json, now, entities_json, now))
             conn.commit()
         except Exception as e:
             log_event(logger, logging.ERROR, "MySQL 存储核心实体失败", {"原因": str(e)})
@@ -118,8 +136,7 @@ class ProdConversationStorage(BaseConversationStorage):
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor(dictionary=True)
-            query = "SELECT entities_json FROM core_entities WHERE session_id = %s"
-            cursor.execute(query, (session_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "select_core_entities"), (session_id,))
             result = cursor.fetchone()
             if result:
                 entities_json = result['entities_json']
@@ -155,13 +172,8 @@ class ProdConversationStorage(BaseConversationStorage):
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor()
-            query = """
-            INSERT INTO long_term_summaries (session_id, summary, last_updated)
-            VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE summary = %s, last_updated = %s
-            """
             now = datetime.datetime.now()
-            cursor.execute(query, (session_id, summary, now, summary, now))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "upsert_long_term_summary"), (session_id, summary, now, summary, now))
             conn.commit()
         except Exception as e:
             log_event(logger, logging.ERROR, "MySQL 存储摘要失败", {"原因": str(e)})
@@ -175,8 +187,7 @@ class ProdConversationStorage(BaseConversationStorage):
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor(dictionary=True)
-            query = "SELECT summary FROM long_term_summaries WHERE session_id = %s"
-            cursor.execute(query, (session_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "select_long_term_summary"), (session_id,))
             result = cursor.fetchone()
             if result:
                 return result['summary']
@@ -195,12 +206,7 @@ class ProdConversationStorage(BaseConversationStorage):
             cursor = conn.cursor()
             now = datetime.datetime.now()
             name = f"会话 {session_id[:8]}"
-            query = """
-            INSERT INTO session_list (session_id, user_id, name, update_time)
-            VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE update_time = %s
-            """
-            cursor.execute(query, (session_id, user_id, name, now, now))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "upsert_session"), (session_id, user_id, name, now, now))
             conn.commit()
         except Exception as e:
             log_event(logger, logging.ERROR, "MySQL 存储会话失败", {"原因": str(e)})
@@ -214,8 +220,7 @@ class ProdConversationStorage(BaseConversationStorage):
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor(dictionary=True)
-            query = "SELECT * FROM session_list WHERE user_id = %s ORDER BY update_time DESC"
-            cursor.execute(query, (user_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "select_session_list"), (user_id,))
             return cursor.fetchall()
         except Exception as e:
             log_event(logger, logging.ERROR, "MySQL 获取会话列表失败", {"原因": str(e)})
@@ -230,8 +235,7 @@ class ProdConversationStorage(BaseConversationStorage):
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor(dictionary=True)
-            query = "SELECT * FROM session_list WHERE session_id = %s"
-            cursor.execute(query, (session_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "select_session_meta"), (session_id,))
             return cursor.fetchone()
         except Exception as e:
             log_event(logger, logging.ERROR, "MySQL 获取会话元数据失败", {"原因": str(e)})
@@ -247,8 +251,7 @@ class ProdConversationStorage(BaseConversationStorage):
             conn = self._get_mysql_connection()
             cursor = conn.cursor()
             now = datetime.datetime.now()
-            query = "INSERT INTO session_chat (session_id, message, update_time) VALUES (%s, %s, %s)"
-            cursor.execute(query, (session_id, message, now))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "insert_session_chat"), (session_id, message, now))
             conn.commit()
         except Exception as e:
             log_event(logger, logging.ERROR, "MySQL 存储聊天记录失败", {"原因": str(e)})
@@ -262,8 +265,7 @@ class ProdConversationStorage(BaseConversationStorage):
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor()
-            query = "SELECT message FROM session_chat WHERE session_id = %s ORDER BY update_time ASC"
-            cursor.execute(query, (session_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "select_session_chat_list"), (session_id,))
             return [row[0] for row in cursor.fetchall()]
         except Exception as e:
             log_event(logger, logging.ERROR, "MySQL 获取聊天记录失败", {"原因": str(e)})
@@ -278,8 +280,7 @@ class ProdConversationStorage(BaseConversationStorage):
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor()
-            query = "DELETE FROM session_chat WHERE id = %s"
-            cursor.execute(query, (chat_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "delete_session_chat_by_id"), (chat_id,))
             conn.commit()
         except Exception as e:
             log_event(logger, logging.ERROR, "MySQL 删除聊天记录失败", {"原因": str(e)})
@@ -295,12 +296,7 @@ class ProdConversationStorage(BaseConversationStorage):
             cursor = conn.cursor()
             data_json = json.dumps(trip_data, ensure_ascii=False)
             now = datetime.datetime.now()
-            query = """
-            INSERT INTO trip_data_store (session_id, data_json, last_updated)
-            VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE data_json = %s, last_updated = %s
-            """
-            cursor.execute(query, (session_id, data_json, now, data_json, now))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "upsert_trip_data"), (session_id, data_json, now, data_json, now))
             conn.commit()
         except Exception as e:
             log_event(logger, logging.ERROR, "MySQL 存储行程数据失败", {"原因": str(e)})
@@ -314,8 +310,7 @@ class ProdConversationStorage(BaseConversationStorage):
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor(dictionary=True)
-            query = "SELECT data_json FROM trip_data_store WHERE session_id = %s"
-            cursor.execute(query, (session_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "select_trip_data"), (session_id,))
             result = cursor.fetchone()
             if result:
                 return json.loads(result['data_json'])
@@ -341,11 +336,12 @@ class ProdConversationStorage(BaseConversationStorage):
         try:
             conn = self._get_mysql_connection()
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM session_chat WHERE session_id = %s", (session_id,))
-            cursor.execute("DELETE FROM core_entities WHERE session_id = %s", (session_id,))
-            cursor.execute("DELETE FROM long_term_summaries WHERE session_id = %s", (session_id,))
-            cursor.execute("DELETE FROM trip_data_store WHERE session_id = %s", (session_id,))
-            cursor.execute("DELETE FROM session_list WHERE session_id = %s", (session_id,))
+            # 删除会话时按固定顺序清理聊天、实体、摘要、行程和会话索引，确保同一份 SQL 模板可复用。
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "delete_session_chat_by_session"), (session_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "delete_core_entities_by_session"), (session_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "delete_long_term_summaries_by_session"), (session_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "delete_trip_data_by_session"), (session_id,))
+            cursor.execute(load_named_sql(_PROD_STORAGE_QUERIES_SQL, "delete_session_list_by_session"), (session_id,))
             conn.commit()
         except Exception as e:
             log_event(logger, logging.ERROR, "MySQL 删除会话数据失败", {"原因": str(e), "session_id": session_id})

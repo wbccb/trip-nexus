@@ -13,8 +13,11 @@ from src.config import Config, PROJECT_ROOT
 from .base_storage import BaseConversationStorage
 from .date_time_encoder import DateTimeEncoder
 from src.observability import log_event
+from src.utils.sql_loader import load_named_sql, load_sql_statements
 
 logger = logging.getLogger(__name__)
+_TEST_STORAGE_INIT_SQL = "storage/test/init_tables.sql"
+_TEST_STORAGE_QUERIES_SQL = "storage/test/queries.sql"
 
 
 class TestConversationStorage(BaseConversationStorage):
@@ -37,8 +40,9 @@ class TestConversationStorage(BaseConversationStorage):
             timeout=5,
         )
         sqlite_conn.row_factory = sqlite3.Row
-        sqlite_conn.execute("PRAGMA busy_timeout = 5000")
-        sqlite_conn.execute("PRAGMA journal_mode=WAL")
+        # SQLite 连接参数也统一从 SQL 文件读取，避免内嵌 PRAGMA 语句。
+        sqlite_conn.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "pragma_busy_timeout"))
+        sqlite_conn.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "pragma_journal_mode_wal"))
         return sqlite_conn
 
     def _sqlite_sidecar_paths(self) -> List[str]:
@@ -80,7 +84,7 @@ class TestConversationStorage(BaseConversationStorage):
     def _ensure_sqlite_available(self, recreate_on_failure: bool = False) -> None:
         """探活当前 SQLite 连接，必要时触发重建。"""
         try:
-            self.sqlite_conn.execute("PRAGMA schema_version")
+            self.sqlite_conn.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "pragma_schema_version"))
         except sqlite3.DatabaseError as exc:
             if not recreate_on_failure:
                 raise
@@ -99,43 +103,9 @@ class TestConversationStorage(BaseConversationStorage):
         """初始化SQLite表（与MySQL表结构一致）"""
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS session_list (
-                session_id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                update_time TIMESTAMP NOT NULL
-            )
-            """)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS session_chat (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                message TEXT NOT NULL,
-                update_time TIMESTAMP NOT NULL
-            )
-            """)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS core_entities (
-                session_id TEXT PRIMARY KEY,
-                entities_json TEXT NOT NULL,
-                last_updated TIMESTAMP NOT NULL
-            )
-            """)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS long_term_summaries (
-                session_id TEXT PRIMARY KEY,
-                summary TEXT NOT NULL,
-                last_updated TIMESTAMP NOT NULL
-            )
-            """)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS trip_data_store (
-                session_id TEXT PRIMARY KEY,
-                data_json TEXT NOT NULL,
-                last_updated TIMESTAMP NOT NULL
-            )
-            """)
+            # 测试存储表结构统一从独立 SQL 文件加载，确保测试库和文档只维护一份定义。
+            for statement in load_sql_statements(_TEST_STORAGE_INIT_SQL):
+                cursor.execute(statement)
             self.sqlite_conn.commit()
 
     def _is_key_expired(self, key: str) -> bool:
@@ -197,13 +167,7 @@ class TestConversationStorage(BaseConversationStorage):
         now = datetime.datetime.now().isoformat()
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("""
-            INSERT INTO core_entities (session_id, entities_json, last_updated)
-            VALUES (?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET
-                entities_json = excluded.entities_json,
-                last_updated = excluded.last_updated
-            """, (session_id, entities_json, now))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "upsert_core_entities"), (session_id, entities_json, now))
             self.sqlite_conn.commit()
 
     def get_core_entities(self, session_id: str) -> Optional[CoreEntity]:
@@ -219,7 +183,7 @@ class TestConversationStorage(BaseConversationStorage):
 
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("SELECT entities_json FROM core_entities WHERE session_id = ?", (session_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "select_core_entities"), (session_id,))
             result = cursor.fetchone()
         
         entities_json = None
@@ -265,20 +229,14 @@ class TestConversationStorage(BaseConversationStorage):
         now = datetime.datetime.now().isoformat()
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("""
-            INSERT INTO long_term_summaries (session_id, summary, last_updated)
-            VALUES (?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET
-                summary = excluded.summary,
-                last_updated = excluded.last_updated
-            """, (session_id, summary, now))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "upsert_long_term_summary"), (session_id, summary, now))
             self.sqlite_conn.commit()
 
     def get_long_term_summary(self, session_id: str) -> str:
         """获取长期摘要（SQLite模拟MySQL）"""
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("SELECT summary FROM long_term_summaries WHERE session_id = ?", (session_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "select_long_term_summary"), (session_id,))
             result = cursor.fetchone()
         return result[0] if result else ""
 
@@ -290,13 +248,7 @@ class TestConversationStorage(BaseConversationStorage):
         data_json = json.dumps(trip_data, ensure_ascii=False)
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("""
-            INSERT INTO trip_data_store (session_id, data_json, last_updated)
-            VALUES (?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET
-                data_json = excluded.data_json,
-                last_updated = excluded.last_updated
-            """, (session_id, data_json, now))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "upsert_trip_data"), (session_id, data_json, now))
             self.sqlite_conn.commit()
 
     def get_trip_data(self, session_id: str) -> Optional[Dict]:
@@ -312,7 +264,7 @@ class TestConversationStorage(BaseConversationStorage):
 
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("SELECT data_json FROM trip_data_store WHERE session_id = ?", (session_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "select_trip_data"), (session_id,))
             result = cursor.fetchone()
         
         if result:
@@ -332,28 +284,21 @@ class TestConversationStorage(BaseConversationStorage):
         name = f"名称{session_id}-{update_time}"
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("""
-                   INSERT INTO session_list (session_id, user_id, name, update_time)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(session_id) DO UPDATE SET
-                       name = excluded.name,
-                       update_time = excluded.update_time,
-                       user_id = excluded.user_id
-                   """, (session_id, user_id, name, update_time))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "upsert_session"), (session_id, user_id, name, update_time))
             self.sqlite_conn.commit()
 
     def get_session_list(self, user_id: str):
         """按更新时间倒序返回用户会话列表。"""
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("SELECT * FROM session_list WHERE user_id = ? ORDER BY update_time DESC", (user_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "select_session_list"), (user_id,))
             return cursor.fetchall()
 
     def get_session_meta(self, session_id: str) -> Optional[Dict]:
         """获取会话元数据（包含 user_id 权属信息）"""
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("SELECT * FROM session_list WHERE session_id = ?", (session_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "select_session_meta"), (session_id,))
             row = cursor.fetchone()
         return dict(row) if row else None
 
@@ -361,11 +306,11 @@ class TestConversationStorage(BaseConversationStorage):
         """删除会话关联的持久化数据与缓存。"""
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("DELETE FROM session_chat WHERE session_id = ?", (session_id,))
-            cursor.execute("DELETE FROM core_entities WHERE session_id = ?", (session_id,))
-            cursor.execute("DELETE FROM long_term_summaries WHERE session_id = ?", (session_id,))
-            cursor.execute("DELETE FROM trip_data_store WHERE session_id = ?", (session_id,))
-            cursor.execute("DELETE FROM session_list WHERE session_id = ?", (session_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "delete_session_chat_by_session"), (session_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "delete_core_entities_by_session"), (session_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "delete_long_term_summaries_by_session"), (session_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "delete_trip_data_by_session"), (session_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "delete_session_list_by_session"), (session_id,))
             self.sqlite_conn.commit()
         redis_keys = [
             f"session:{session_id}:short_term",
@@ -381,10 +326,7 @@ class TestConversationStorage(BaseConversationStorage):
         update_time = datetime.datetime.now().isoformat()
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("""
-                INSERT INTO session_chat (session_id, message, update_time)
-                VALUES (?, ?, ?)
-            """, (session_id, message, update_time))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "insert_session_chat"), (session_id, message, update_time))
             self.sqlite_conn.commit()
 
     def get_session_chat_list(self, session_id: str) -> List[str]:
@@ -394,12 +336,7 @@ class TestConversationStorage(BaseConversationStorage):
             try:
                 with self._sqlite_lock:
                     cursor = self._get_cursor()
-                    cursor.execute("""
-                        SELECT message
-                        FROM session_chat
-                        WHERE session_id = ?
-                        ORDER BY update_time ASC
-                    """, (session_id,))
+                    cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "select_session_chat_list"), (session_id,))
                     return [row[0] for row in cursor.fetchall()]
             except sqlite3.OperationalError as exc:
                 last_error = exc
@@ -410,5 +347,5 @@ class TestConversationStorage(BaseConversationStorage):
         """按主键删除单条聊天消息。"""
         with self._sqlite_lock:
             cursor = self._get_cursor()
-            cursor.execute("DELETE FROM session_chat WHERE id = ?", (chat_id,))
+            cursor.execute(load_named_sql(_TEST_STORAGE_QUERIES_SQL, "delete_session_chat_by_id"), (chat_id,))
             self.sqlite_conn.commit()

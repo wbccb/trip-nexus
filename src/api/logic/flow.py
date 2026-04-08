@@ -37,8 +37,10 @@ from src.api.logic.knowledge import (
     _build_source_evidence_from_docs,
 )
 from src.observability import log_event, summarize_value
+from src.utils.sql_loader import load_named_sql, render_named_sql
 
 logger = logging.getLogger(__name__)
+_FLOW_METRICS_SQL = "flow/metrics.sql"
 
 _flow_streams: Dict[str, Dict[str, Any]] = {}
 _flow_streams_lock = asyncio.Lock()
@@ -56,30 +58,7 @@ def _init_flow_metrics_table() -> None:
         conn = sqlite3.connect(_FLOW_METRICS_DB_PATH, check_same_thread=False)
         try:
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS flow_metrics (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT NOT NULL,
-                    mode TEXT NOT NULL,
-                    intent TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    latency_ms INTEGER NOT NULL DEFAULT 0,
-                    tool_count INTEGER NOT NULL DEFAULT 0,
-                    rag_hit INTEGER NOT NULL DEFAULT 0,
-                    agent_escalated INTEGER NOT NULL DEFAULT 0,
-                    context_count INTEGER NOT NULL DEFAULT 0,
-                    context_chars INTEGER NOT NULL DEFAULT 0,
-                    context_budget_json TEXT NOT NULL DEFAULT '{}',
-                    escalation_reasons_json TEXT NOT NULL DEFAULT '[]',
-                    error_text TEXT,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
+            cursor.execute(load_named_sql(_FLOW_METRICS_SQL, "create_table"))
             conn.commit()
         finally:
             conn.close()
@@ -125,13 +104,7 @@ def _record_flow_metrics(payload: Dict[str, Any]) -> None:
         try:
             cursor = conn.cursor()
             cursor.execute(
-                """
-                INSERT INTO flow_metrics (
-                    message_id, session_id, user_id, device_id, mode, intent, status,
-                    latency_ms, tool_count, rag_hit, agent_escalated, context_count, context_chars,
-                    context_budget_json, escalation_reasons_json, error_text, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                load_named_sql(_FLOW_METRICS_SQL, "insert_metric"),
                 (
                     str(payload.get("message_id") or ""),
                     str(payload.get("session_id") or ""),
@@ -228,19 +201,11 @@ def _query_flow_metrics_rows(
         conn.row_factory = sqlite3.Row
         try:
             cursor = conn.cursor()
-            cursor.execute(f"SELECT COUNT(1) AS total FROM flow_metrics{where_sql}", params)
+            cursor.execute(render_named_sql(_FLOW_METRICS_SQL, "count_metrics", {"__WHERE_CLAUSE__": where_sql}), params)
             total_row = cursor.fetchone()
             total = _to_int(total_row["total"] if total_row else 0, 0)
             cursor.execute(
-                f"""
-                SELECT message_id, session_id, user_id, device_id, mode, intent, status,
-                       latency_ms, tool_count, rag_hit, agent_escalated, context_count, context_chars,
-                       context_budget_json, escalation_reasons_json, error_text, created_at
-                FROM flow_metrics
-                {where_sql}
-                ORDER BY created_at DESC, id DESC
-                LIMIT ? OFFSET ?
-                """,
+                render_named_sql(_FLOW_METRICS_SQL, "list_metrics", {"__WHERE_CLAUSE__": where_sql}),
                 params + [max(1, limit), max(0, offset)],
             )
             rows = []
@@ -294,11 +259,7 @@ def _query_flow_metrics_summary(
         try:
             cursor = conn.cursor()
             cursor.execute(
-                f"""
-                SELECT status, latency_ms, tool_count, rag_hit, agent_escalated
-                FROM flow_metrics
-                {where_sql}
-                """,
+                render_named_sql(_FLOW_METRICS_SQL, "summary_metrics", {"__WHERE_CLAUSE__": where_sql}),
                 params,
             )
             rows = [dict(item) for item in cursor.fetchall()]

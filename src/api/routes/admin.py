@@ -26,6 +26,9 @@ from src.api.dependencies import (
     _reset_observability_context,
     _record_audit_log,
 )
+from src.utils.sql_loader import load_named_sql, render_named_sql
+
+_AUTH_QUERIES_SQL = "auth/queries.sql"
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -51,18 +54,15 @@ def admin_list_users(
             like_keyword = f"%{str(keyword or '').strip()}%"
             where_clause = "WHERE email LIKE ? OR nickname LIKE ?" if str(keyword or "").strip() else ""
             params: List[Any] = [like_keyword, like_keyword] if str(keyword or "").strip() else []
-            cursor.execute(f"SELECT COUNT(1) AS total FROM users {where_clause}", params)
+            cursor.execute(
+                render_named_sql(_AUTH_QUERIES_SQL, "list_users_count", {"__WHERE_CLAUSE__": where_clause}),
+                params,
+            )
             total_row = cursor.fetchone()
             total = int(dict(total_row).get("total") or 0) if total_row else 0
             
             cursor.execute(
-                f"""
-                SELECT id, email, nickname, role, status, token_quota, token_used, created_at, updated_at
-                FROM users
-                {where_clause}
-                ORDER BY created_at DESC, id DESC
-                LIMIT ? OFFSET ?
-                """,
+                render_named_sql(_AUTH_QUERIES_SQL, "list_users_page", {"__WHERE_CLAUSE__": where_clause}),
                 params + [page_size, (page - 1) * page_size],
             )
             rows = cursor.fetchall() or []
@@ -96,7 +96,7 @@ def admin_update_user_status(
         with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "UPDATE users SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                load_named_sql(_AUTH_QUERIES_SQL, "update_user_status"),
                 (next_status, user_id),
             )
             conn.commit()
@@ -139,7 +139,7 @@ def admin_update_user_quota(
         with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "UPDATE users SET token_quota = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                load_named_sql(_AUTH_QUERIES_SQL, "update_user_quota"),
                 (int(payload.token_quota or 0), user_id),
             )
             conn.commit()
@@ -174,18 +174,7 @@ def admin_dashboard(
         init_auth_tables()
         with get_auth_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT
-                    COUNT(1) AS total_users,
-                    SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_users,
-                    SUM(CASE WHEN status = 'banned' THEN 1 ELSE 0 END) AS banned_users,
-                    SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) AS admin_users,
-                    COALESCE(SUM(token_quota), 0) AS total_token_quota,
-                    COALESCE(SUM(token_used), 0) AS total_token_used
-                FROM users
-                """
-            )
+            cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "admin_dashboard"))
             row = cursor.fetchone()
             payload = dict(row) if row else {}
             total_quota = int(payload.get("total_token_quota") or 0)
@@ -221,18 +210,11 @@ def admin_user_token_usage(
         init_auth_tables()
         with get_auth_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(1) AS total FROM token_usage_log WHERE user_id = ?", (user_id,))
+            cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "token_usage_count_by_user"), (user_id,))
             total_row = cursor.fetchone()
             total = int((dict(total_row) if total_row else {}).get("total") or 0)
             cursor.execute(
-                """
-                SELECT id, user_id, session_id, request_path, model_name, prompt_tokens,
-                       completion_tokens, total_tokens, stage, message_id, created_at
-                FROM token_usage_log
-                WHERE user_id = ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
+                load_named_sql(_AUTH_QUERIES_SQL, "token_usage_list_by_user"),
                 (user_id, limit),
             )
             rows = cursor.fetchall() or []
@@ -282,18 +264,14 @@ def admin_audit_logs(
                 where_clauses.append("request_path = ?")
                 params.append(str(request_path).strip())
             where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-            cursor.execute(f"SELECT COUNT(1) AS total FROM audit_log {where_sql}", tuple(params))
+            cursor.execute(
+                render_named_sql(_AUTH_QUERIES_SQL, "audit_logs_count", {"__WHERE_CLAUSE__": where_sql}),
+                tuple(params),
+            )
             total_row = cursor.fetchone()
             total = int((dict(total_row) if total_row else {}).get("total") or 0)
             cursor.execute(
-                f"""
-                SELECT id, user_id, user_email, action, session_id, message_id,
-                       request_path, status, detail_json, ip_address, created_at
-                FROM audit_log
-                {where_sql}
-                ORDER BY id DESC
-                LIMIT ?
-                """,
+                render_named_sql(_AUTH_QUERIES_SQL, "audit_logs_list", {"__WHERE_CLAUSE__": where_sql}),
                 tuple(params + [limit]),
             )
             rows = cursor.fetchall() or []

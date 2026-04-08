@@ -23,8 +23,10 @@ from src.rag.store.vector_store import VectorStore
 from src.models.user import PublicUserProfile
 from src.api.schemas.auth import AuthResponse
 from src.frontend.context.entity import Message
+from src.utils.sql_loader import load_named_sql, render_named_sql
 
 logger = logging.getLogger(__name__)
+_AUTH_QUERIES_SQL = "auth/queries.sql"
 
 _REQUEST_OBSERVABILITY_CONTEXT: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
     "tripnexus_request_observability_context",
@@ -218,13 +220,7 @@ def _record_audit_log(
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO audit_log (
-                user_id, user_email, action, session_id, message_id,
-                request_path, status, detail_json, ip_address
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            load_named_sql(_AUTH_QUERIES_SQL, "insert_audit_log"),
             (
                 int(user_id if user_id is not None else (ctx.get("user_id") or 0)) or None,
                 str(user_email or ctx.get("user_email") or ""),
@@ -258,12 +254,7 @@ def _record_token_usage(
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO token_usage_log (
-                user_id, session_id, request_path, model_name,
-                prompt_tokens, completion_tokens, total_tokens, stage, message_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            load_named_sql(_AUTH_QUERIES_SQL, "insert_token_usage_log"),
             (
                 int(user_id),
                 str(session_id or ""),
@@ -277,7 +268,7 @@ def _record_token_usage(
             ),
         )
         cursor.execute(
-            "UPDATE users SET token_used = token_used + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            load_named_sql(_AUTH_QUERIES_SQL, "increment_user_token_used"),
             (int(total_tokens or 0), int(user_id)),
         )
         conn.commit()
@@ -304,7 +295,7 @@ def _get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     init_auth_tables()
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE email = ?", (email.lower(),))
+        cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "select_user_by_email"), (email.lower(),))
         row = cursor.fetchone()
         return dict(row) if row else None
 
@@ -313,7 +304,7 @@ def _get_user_row(user_id: int) -> Optional[Dict[str, Any]]:
     init_auth_tables()
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "select_user_by_id"), (user_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
 
@@ -322,7 +313,7 @@ def _count_all_users() -> int:
     init_auth_tables()
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(1) AS total FROM users")
+        cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "count_users"))
         row = cursor.fetchone()
         return int((dict(row) if row else {}).get("total") or 0)
 
@@ -399,12 +390,9 @@ def _enforce_rate_limit(
     window_start = now_ts - max(1, int(window_seconds))
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM rate_limit_log WHERE created_at < ?", (window_start,))
+        cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "delete_old_rate_limit_log"), (window_start,))
         cursor.execute(
-            """
-            SELECT COUNT(1) AS total FROM rate_limit_log
-            WHERE subject_key = ? AND bucket = ? AND created_at >= ?
-            """,
+            load_named_sql(_AUTH_QUERIES_SQL, "count_rate_limit_window"),
             (str(subject_key or ""), str(bucket or ""), window_start),
         )
         row = cursor.fetchone()
@@ -424,10 +412,7 @@ def _enforce_rate_limit(
             )
             raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
         cursor.execute(
-            """
-            INSERT INTO rate_limit_log (subject_key, bucket, request_path, ip_address, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
+            load_named_sql(_AUTH_QUERIES_SQL, "insert_rate_limit_log"),
             (str(subject_key or ""), str(bucket or ""), str(request_path or ""), str(ip_address or ""), now_ts),
         )
         conn.commit()

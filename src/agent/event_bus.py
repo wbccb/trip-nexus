@@ -19,6 +19,9 @@ import threading
 import time
 
 from src.config import PROJECT_ROOT
+from src.utils.sql_loader import load_named_sql, render_named_sql
+
+_AGENT_EVENT_BUS_SQL = "agent/event_bus.sql"
 
 
 class AgentEvent(TypedDict):
@@ -63,25 +66,15 @@ class EventBus:
         self._db_path = os.path.join(PROJECT_ROOT, "agent_events.db")
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=5)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+        # Agent 事件库的 SQLite 配置也统一走 SQL 模板，避免连接层遗留硬编码语句。
+        self._conn.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "pragma_journal_mode_wal"))
+        self._conn.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "pragma_busy_timeout"))
         self._init_tables()
 
     def _init_tables(self) -> None:
         cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS agent_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT NOT NULL,
-                node TEXT,
-                kind TEXT NOT NULL,
-                ts REAL NOT NULL,
-                detail_json TEXT NOT NULL
-            )
-            """
-        )
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_events_thread_id ON agent_events(thread_id)")
+        cursor.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "create_agent_events_table"))
+        cursor.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "create_agent_events_thread_idx"))
         self._conn.commit()
 
     def emit(self, kind: str, thread_id: str, node: Optional[str], detail: Dict[str, Any]) -> None:
@@ -100,10 +93,7 @@ class EventBus:
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
-                """
-                INSERT INTO agent_events (thread_id, node, kind, ts, detail_json)
-                VALUES (?, ?, ?, ?, ?)
-                """,
+                load_named_sql(_AGENT_EVENT_BUS_SQL, "insert_agent_event"),
                 (thread_id, node, kind, ts, detail_json),
             )
             self._conn.commit()
@@ -144,13 +134,7 @@ class EventBus:
             clauses.append("id > ?")
             params.append(int(after_sequence))
         where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        sql = f"""
-            SELECT id, thread_id, node, kind, ts, detail_json
-            FROM agent_events
-            {where_clause}
-            ORDER BY id ASC
-            LIMIT ?
-        """
+        sql = render_named_sql(_AGENT_EVENT_BUS_SQL, "list_agent_events", {"__WHERE_CLAUSE__": where_clause})
         params.append(int(limit))
         cursor = self._conn.cursor()
         rows = cursor.execute(sql, params).fetchall()
@@ -183,18 +167,18 @@ class EventBus:
 
         cursor = self._conn.cursor()
         if thread_id is None:
-            cursor.execute("DELETE FROM agent_events")
+            cursor.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "clear_all_agent_events"))
             self._conn.commit()
             self._events = []
             return
-        cursor.execute("DELETE FROM agent_events WHERE thread_id = ?", (thread_id,))
+        cursor.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "clear_thread_agent_events"), (thread_id,))
         self._conn.commit()
         self._events = [event for event in self._events if event["thread_id"] != thread_id]
 
     def latest_sequence(self, thread_id: str) -> int:
         cursor = self._conn.cursor()
         row = cursor.execute(
-            "SELECT MAX(id) AS max_id FROM agent_events WHERE thread_id = ?",
+            load_named_sql(_AGENT_EVENT_BUS_SQL, "latest_agent_event_sequence"),
             (thread_id,),
         ).fetchone()
         return int(row["max_id"] or 0) if row else 0
@@ -223,26 +207,14 @@ class SnapshotStore:
         self._db_path = os.path.join(PROJECT_ROOT, "agent_events.db")
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=5)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "pragma_journal_mode_wal"))
+        self._conn.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "pragma_busy_timeout"))
         self._init_tables()
 
     def _init_tables(self) -> None:
         cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS agent_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT NOT NULL,
-                ts REAL NOT NULL,
-                step TEXT,
-                duration_ms INTEGER,
-                payload_json TEXT,
-                state_json TEXT
-            )
-            """
-        )
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_snapshots_thread_id ON agent_snapshots(thread_id)")
+        cursor.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "create_agent_snapshots_table"))
+        cursor.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "create_agent_snapshots_thread_idx"))
         self._conn.commit()
 
     def add(self, thread_id: str, snapshot: Dict[str, Any]) -> None:
@@ -264,10 +236,7 @@ class SnapshotStore:
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
-                """
-                INSERT INTO agent_snapshots (thread_id, ts, step, duration_ms, payload_json, state_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
+                load_named_sql(_AGENT_EVENT_BUS_SQL, "insert_agent_snapshot"),
                 (thread_id, ts_value, step, duration_ms, payload_json, state_json),
             )
             self._conn.commit()
@@ -286,12 +255,7 @@ class SnapshotStore:
 
         cursor = self._conn.cursor()
         rows = cursor.execute(
-            """
-            SELECT id, thread_id, ts, step, duration_ms, payload_json, state_json
-            FROM agent_snapshots
-            WHERE thread_id = ?
-            ORDER BY id ASC
-            """,
+            load_named_sql(_AGENT_EVENT_BUS_SQL, "list_agent_snapshots"),
             (thread_id,),
         ).fetchall()
         snapshots: List[Dict[str, Any]] = []
@@ -329,13 +293,7 @@ class SnapshotStore:
 
         cursor = self._conn.cursor()
         row = cursor.execute(
-            """
-            SELECT id, thread_id, ts, step, duration_ms, payload_json, state_json
-            FROM agent_snapshots
-            WHERE thread_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
+            load_named_sql(_AGENT_EVENT_BUS_SQL, "latest_agent_snapshot"),
             (thread_id,),
         ).fetchone()
         if not row:
@@ -370,11 +328,11 @@ class SnapshotStore:
 
         cursor = self._conn.cursor()
         if thread_id is None:
-            cursor.execute("DELETE FROM agent_snapshots")
+            cursor.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "clear_all_agent_snapshots"))
             self._conn.commit()
             self._snapshots = {}
             return
-        cursor.execute("DELETE FROM agent_snapshots WHERE thread_id = ?", (thread_id,))
+        cursor.execute(load_named_sql(_AGENT_EVENT_BUS_SQL, "clear_thread_agent_snapshots"), (thread_id,))
         self._conn.commit()
         self._snapshots.pop(thread_id, None)
 

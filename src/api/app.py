@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.auth.middleware import init_auth_tables
 from src.api.routes import auth, admin, health, session, chat, flow, trip, knowledge, map
+from src.api.dependencies import _get_storage
 
 # 配置日志
 logging.basicConfig(
@@ -20,8 +21,10 @@ async def lifespan(app: FastAPI):
     FastAPI 生命周期管理：启动时初始化数据库，关闭时清理资源。
     """
     logger.info("TripNexus API 正在启动...")
-    # 初始化认证相关的数据库表
+    # 初始化认证相关的数据库表，保证登录注册与管理员链路可直接使用。
     init_auth_tables()
+    # 初始化会话/聊天/实体/摘要/行程等业务存储，确保生产环境首启时自动建表。
+    _get_storage()
     yield
     logger.info("TripNexus API 正在关闭...")
 

@@ -41,6 +41,9 @@ from src.api.dependencies import (
     _record_audit_log,
 )
 from src.api.dependencies import _get_llm_manager_for_user
+from src.utils.sql_loader import load_named_sql
+
+_AUTH_QUERIES_SQL = "auth/queries.sql"
 
 router = APIRouter(prefix="/api", tags=["auth"])
 
@@ -72,10 +75,7 @@ def register(payload: AuthRegisterRequest, request: Request) -> AuthResponse:
         with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                """
-                INSERT INTO users (email, password_hash, nickname, role, status, token_quota, token_used, token_version)
-                VALUES (?, ?, ?, ?, 'active', 1000000, 0, 0)
-                """,
+                load_named_sql(_AUTH_QUERIES_SQL, "insert_user"),
                 (email, password_hash, nickname, role),
             )
             conn.commit()
@@ -136,7 +136,7 @@ def forgot_password(payload: ForgotPasswordRequest, request: Request) -> ForgotP
         with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO password_reset_tokens (user_id, token, expires_at, used) VALUES (?, ?, ?, 0)",
+                load_named_sql(_AUTH_QUERIES_SQL, "insert_password_reset_token"),
                 (int(user_row.get("id") or 0), reset_token, expires_at.isoformat()),
             )
             conn.commit()
@@ -158,12 +158,7 @@ def reset_password(payload: ResetPasswordRequest, request: Request) -> SimpleMes
         with get_auth_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                """
-                SELECT * FROM password_reset_tokens
-                WHERE token = ? AND used = 0
-                ORDER BY id DESC
-                LIMIT 1
-                """,
+                load_named_sql(_AUTH_QUERIES_SQL, "select_password_reset_token"),
                 (str(payload.token or "").strip(),),
             )
             token_row = cursor.fetchone()
@@ -175,15 +170,11 @@ def reset_password(payload: ResetPasswordRequest, request: Request) -> SimpleMes
                 _record_audit_log(action="auth_reset_password", status="failed", detail={"reason": "expired_token"})
                 raise HTTPException(status_code=400, detail="重置 token 已过期")
             cursor.execute(
-                """
-                UPDATE users
-                SET password_hash = ?, token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
+                load_named_sql(_AUTH_QUERIES_SQL, "update_user_password_and_token_version"),
                 (next_password_hash, int(token_data.get("user_id") or 0)),
             )
             cursor.execute(
-                "UPDATE password_reset_tokens SET used = 1, used_at = ? WHERE id = ?",
+                load_named_sql(_AUTH_QUERIES_SQL, "update_password_reset_token_used"),
                 (datetime.now().isoformat(), int(token_data.get("id") or 0)),
             )
             conn.commit()
@@ -220,7 +211,7 @@ def update_user_profile(
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE users SET nickname = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            load_named_sql(_AUTH_QUERIES_SQL, "update_user_nickname"),
             (nickname, current_user.user_id),
         )
         conn.commit()
@@ -248,11 +239,7 @@ def update_user_password(
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            UPDATE users
-            SET password_hash = ?, token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
+            load_named_sql(_AUTH_QUERIES_SQL, "update_user_password_and_token_version"),
             (next_password_hash, current_user.user_id),
         )
         conn.commit()
@@ -330,7 +317,7 @@ def update_user_llm_config(
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE users SET llm_config = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            load_named_sql(_AUTH_QUERIES_SQL, "update_user_llm_config"),
             (llm_config_str, current_user.user_id),
         )
         conn.commit()

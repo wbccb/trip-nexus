@@ -13,6 +13,11 @@ from src.config import Config
 
 
 from src.auth.database import get_auth_db_connection, _AUTH_DB_LOCK
+from src.utils.sql_loader import load_named_sql, load_sql_statements
+
+_AUTH_INIT_MYSQL_SQL = "auth/init_mysql.sql"
+_AUTH_INIT_SQLITE_SQL = "auth/init_sqlite.sql"
+_AUTH_QUERIES_SQL = "auth/queries.sql"
 
 @dataclass
 class AuthenticatedUser:
@@ -43,106 +48,24 @@ def init_auth_tables() -> None:
         if conn.backend == 'mysql':
             try:
                 cursor = conn.cursor()
-                cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    email VARCHAR(255) NOT NULL UNIQUE,
-                    password_hash VARCHAR(255) NOT NULL,
-                    nickname VARCHAR(255) NOT NULL DEFAULT '',
-                    role VARCHAR(32) NOT NULL DEFAULT 'user',
-                    status VARCHAR(32) NOT NULL DEFAULT 'active',
-                    token_quota BIGINT NOT NULL DEFAULT 1000000,
-                    token_used BIGINT NOT NULL DEFAULT 0,
-                    token_version BIGINT NOT NULL DEFAULT 0,
-                    llm_config JSON NULL,
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                )
-                """)
-                cursor.execute("""
-                CREATE TABLE IF NOT EXISTS password_reset_tokens (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    user_id BIGINT NOT NULL,
-                    token VARCHAR(255) NOT NULL UNIQUE,
-                    expires_at DATETIME NOT NULL,
-                    used TINYINT(1) NOT NULL DEFAULT 0,
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    used_at DATETIME NULL,
-                    KEY idx_password_reset_user_id (user_id),
-                    CONSTRAINT fk_password_reset_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                )
-                """)
-                cursor.execute("""
-                CREATE TABLE IF NOT EXISTS auth_blocklist (
-                    jti VARCHAR(255) PRIMARY KEY,
-                    expires_at BIGINT NOT NULL,
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """)
-                cursor.execute("""
-                CREATE TABLE IF NOT EXISTS token_usage_log (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    user_id BIGINT NOT NULL,
-                    session_id VARCHAR(128) NOT NULL DEFAULT '',
-                    request_path VARCHAR(255) NOT NULL,
-                    model_name VARCHAR(255) NOT NULL DEFAULT '',
-                    prompt_tokens BIGINT NOT NULL DEFAULT 0,
-                    completion_tokens BIGINT NOT NULL DEFAULT 0,
-                    total_tokens BIGINT NOT NULL DEFAULT 0,
-                    stage VARCHAR(64) NOT NULL DEFAULT '',
-                    message_id VARCHAR(128) NOT NULL DEFAULT '',
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    KEY idx_token_usage_user_id (user_id),
-                    KEY idx_token_usage_created_at (created_at)
-                )
-                """)
-                cursor.execute("""
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    user_id BIGINT NULL,
-                    user_email VARCHAR(255) NOT NULL DEFAULT '',
-                    action VARCHAR(128) NOT NULL,
-                    session_id VARCHAR(128) NOT NULL DEFAULT '',
-                    message_id VARCHAR(128) NOT NULL DEFAULT '',
-                    request_path VARCHAR(255) NOT NULL DEFAULT '',
-                    status VARCHAR(64) NOT NULL DEFAULT '',
-                    detail_json LONGTEXT NOT NULL,
-                    ip_address VARCHAR(128) NOT NULL DEFAULT '',
-                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    KEY idx_audit_log_user_id (user_id),
-                    KEY idx_audit_log_created_at (created_at)
-                )
-                """)
-                cursor.execute("""
-                CREATE TABLE IF NOT EXISTS rate_limit_log (
-                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-                    subject_key VARCHAR(255) NOT NULL,
-                    bucket VARCHAR(64) NOT NULL,
-                    request_path VARCHAR(255) NOT NULL DEFAULT '',
-                    ip_address VARCHAR(128) NOT NULL DEFAULT '',
-                    created_at BIGINT NOT NULL,
-                    KEY idx_rate_limit_subject_bucket_time (subject_key, bucket, created_at)
-                )
-                """)
-                
+                # MySQL 认证表结构统一从独立 SQL 文件加载，避免 Python 代码内嵌 DDL。
+                for statement in load_sql_statements(_AUTH_INIT_MYSQL_SQL):
+                    cursor.execute(statement)
                 # 插入超级管理员
                 from src.auth.password import hash_password
                 admin_email = config.SUPER_ADMIN_EMAIL
                 admin_password = config.SUPER_ADMIN_PASSWORD
                 if admin_email and admin_password:
-                    cursor.execute("SELECT id FROM users WHERE email = %s", (admin_email,))
+                    cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "select_admin_user_id_by_email"), (admin_email,))
                     row = cursor.fetchone()
                     if not row:
                         cursor.execute(
-                            """
-                            INSERT INTO users (email, password_hash, nickname, role, status, token_quota, token_used, token_version)
-                            VALUES (%s, %s, %s, 'admin', 'active', 999999999, 0, 0)
-                            """,
+                            load_named_sql(_AUTH_QUERIES_SQL, "insert_super_admin"),
                             (admin_email, hash_password(admin_password), "SuperAdmin"),
                         )
                     else:
                         cursor.execute(
-                            "UPDATE users SET role = 'admin' WHERE email = %s",
+                            load_named_sql(_AUTH_QUERIES_SQL, "promote_user_to_admin"),
                             (admin_email,)
                         )
                 conn.commit()
@@ -152,128 +75,42 @@ def init_auth_tables() -> None:
 
         try:
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    email TEXT NOT NULL UNIQUE,
-                    password_hash TEXT NOT NULL,
-                    nickname TEXT NOT NULL DEFAULT '',
-                    role TEXT NOT NULL DEFAULT 'user',
-                    status TEXT NOT NULL DEFAULT 'active',
-                    token_quota INTEGER NOT NULL DEFAULT 1000000,
-                    token_used INTEGER NOT NULL DEFAULT 0,
-                    token_version INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS password_reset_tokens (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    token TEXT NOT NULL UNIQUE,
-                    expires_at TEXT NOT NULL,
-                    used INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    used_at TEXT,
-                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                )
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS auth_blocklist (
-                    jti TEXT PRIMARY KEY,
-                    expires_at INTEGER NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS token_usage_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    session_id TEXT NOT NULL DEFAULT '',
-                    request_path TEXT NOT NULL,
-                    model_name TEXT NOT NULL DEFAULT '',
-                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
-                    completion_tokens INTEGER NOT NULL DEFAULT 0,
-                    total_tokens INTEGER NOT NULL DEFAULT 0,
-                    stage TEXT NOT NULL DEFAULT '',
-                    message_id TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    user_email TEXT NOT NULL DEFAULT '',
-                    action TEXT NOT NULL,
-                    session_id TEXT NOT NULL DEFAULT '',
-                    message_id TEXT NOT NULL DEFAULT '',
-                    request_path TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT '',
-                    detail_json TEXT NOT NULL DEFAULT '{}',
-                    ip_address TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS rate_limit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    subject_key TEXT NOT NULL,
-                    bucket TEXT NOT NULL,
-                    request_path TEXT NOT NULL DEFAULT '',
-                    ip_address TEXT NOT NULL DEFAULT '',
-                    created_at INTEGER NOT NULL
-                )
-                """
-            )
-            cursor.execute("PRAGMA table_info(audit_log)")
+            # SQLite 认证表结构与后续兼容性迁移统一从独立 SQL 文件/模板加载。
+            for statement in load_sql_statements(_AUTH_INIT_SQLITE_SQL):
+                cursor.execute(statement)
+            cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "sqlite_pragma_audit_log_columns"))
             audit_columns = {
                 str(row["name"]) if isinstance(row, dict) else (str(row["name"]) if isinstance(row, sqlite3.Row) else str(row[1]))
                 for row in (cursor.fetchall() or [])
             }
             if "session_id" not in audit_columns:
-                cursor.execute("ALTER TABLE audit_log ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
+                cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "sqlite_alter_audit_log_add_session_id"))
             if "message_id" not in audit_columns:
-                cursor.execute("ALTER TABLE audit_log ADD COLUMN message_id TEXT NOT NULL DEFAULT ''")
+                cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "sqlite_alter_audit_log_add_message_id"))
 
-            cursor.execute("PRAGMA table_info(users)")
+            cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "sqlite_pragma_users_columns"))
             user_columns = {
                 str(row["name"]) if isinstance(row, dict) else (str(row["name"]) if isinstance(row, sqlite3.Row) else str(row[1]))
                 for row in (cursor.fetchall() or [])
             }
             if "llm_config" not in user_columns:
-                cursor.execute("ALTER TABLE users ADD COLUMN llm_config TEXT NOT NULL DEFAULT '{}'")
+                cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "sqlite_alter_users_add_llm_config"))
 
             from src.auth.password import hash_password
             admin_email = config.SUPER_ADMIN_EMAIL
             admin_password = config.SUPER_ADMIN_PASSWORD
             
             if admin_email and admin_password:
-                cursor.execute("SELECT id FROM users WHERE email = ?", (admin_email,))
+                cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "select_admin_user_id_by_email"), (admin_email,))
                 row = cursor.fetchone()
                 if not row:
                     cursor.execute(
-                        """
-                        INSERT INTO users (email, password_hash, nickname, role, status, token_quota, token_used, token_version)
-                        VALUES (?, ?, ?, 'admin', 'active', 999999999, 0, 0)
-                        """,
+                        load_named_sql(_AUTH_QUERIES_SQL, "insert_super_admin"),
                         (admin_email, hash_password(admin_password), "SuperAdmin"),
                     )
                 else:
                     cursor.execute(
-                        "UPDATE users SET role = 'admin' WHERE email = ?",
+                        load_named_sql(_AUTH_QUERIES_SQL, "promote_user_to_admin"),
                         (admin_email,)
                     )
             
@@ -287,7 +124,7 @@ def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
     init_auth_tables()
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE id = ?", (int(user_id),))
+        cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "select_user_by_id"), (int(user_id),))
         row = cursor.fetchone()
         return dict(row) if row else None
 
@@ -301,8 +138,8 @@ def is_token_blocked(jti: str) -> bool:
         cursor = conn.cursor()
         # 仅 1% 概率执行清理，降低写入频率
         if random.random() < 0.01:
-            cursor.execute("DELETE FROM auth_blocklist WHERE expires_at <= ?", (now_ts,))
-        cursor.execute("SELECT 1 FROM auth_blocklist WHERE jti = ? LIMIT 1", (jti,))
+            cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "delete_expired_blocklist"), (now_ts,))
+        cursor.execute(load_named_sql(_AUTH_QUERIES_SQL, "select_blocked_token"), (jti,))
         row = cursor.fetchone()
         conn.commit()
         return bool(row)
@@ -315,7 +152,7 @@ def revoke_token(jti: str, exp: int) -> None:
     with get_auth_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT OR REPLACE INTO auth_blocklist (jti, expires_at) VALUES (?, ?)",
+            load_named_sql(_AUTH_QUERIES_SQL, "upsert_blocked_token"),
             (str(jti), int(exp)),
         )
         conn.commit()
