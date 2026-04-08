@@ -212,10 +212,17 @@ export default function App() {
     }
   }
 
+  // 保存用户的 LLM 配置，并在后端连通性验证期间给出明确的前端提示。
   const handleSaveLlmConfig = async () => {
+    const savingMessageKey = "llm-config-saving"
     try {
       const values = await llmConfigForm.validateFields()
       setSavingLlm(true)
+      message.loading({
+        key: savingMessageKey,
+        content: "正在大模型的验证测试中...请稍后",
+        duration: 0,
+      })
       const config = {
         analysis_provider: "openai_compatible",
         analysis_base_url: values.base_url,
@@ -229,11 +236,17 @@ export default function App() {
         generation_temperature: 0.7,
       }
       await updateUserLlmConfig(config)
-      message.success("LLM 配置测试通过并已保存！")
+      message.success({
+        key: savingMessageKey,
+        content: "LLM 配置测试通过并已保存！",
+      })
       setIsLlmConfigModalOpen(false)
       setTimeout(() => window.location.reload(), 500)
     } catch (error) {
-      message.error(`保存失败：${error?.response?.data?.detail || error.message}`)
+      message.error({
+        key: savingMessageKey,
+        content: `保存失败：${error?.response?.data?.detail || error.message}`,
+      })
     } finally {
       setSavingLlm(false)
     }

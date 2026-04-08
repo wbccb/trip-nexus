@@ -1,11 +1,10 @@
 import json
 from datetime import datetime, timedelta
 from uuid import uuid4
-from typing import Dict, List, Any, Optional
+from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from src.auth.jwt_handler import build_access_token
 from src.auth.middleware import (
     AuthenticatedUser,
     get_auth_db_connection,
@@ -27,7 +26,6 @@ from src.api.schemas.auth import (
     UserPasswordUpdateRequest,
     UserLlmConfig,
 )
-from src.api.schemas.admin import AdminUserListResponse
 from src.models.user import PublicUserProfile
 from src.api.dependencies import (
     _get_config,
@@ -40,12 +38,21 @@ from src.api.dependencies import (
     _reset_observability_context,
     _record_audit_log,
 )
-from src.api.dependencies import _get_llm_manager_for_user
 from src.utils.sql_loader import load_named_sql
 
 _AUTH_QUERIES_SQL = "auth/queries.sql"
 
 router = APIRouter(prefix="/api", tags=["auth"])
+
+
+def _build_auth_error_detail(error_code: str, message: str) -> Dict[str, str]:
+    """构建认证接口统一错误详情，便于前端按错误码做精确提示。"""
+    # 登录失败等可预期错误统一返回 error_code + message，
+    # 避免前端只能依赖状态码做粗粒度判断。
+    return {
+        "error_code": str(error_code or "").strip(),
+        "message": str(message or "").strip(),
+    }
 
 @router.get("/auth/providers")
 def list_auth_providers() -> Dict[str, Dict[str, str]]:
@@ -98,13 +105,19 @@ def login(payload: AuthLoginRequest, request: Request) -> AuthResponse:
         user_row = _get_user_by_email(email)
         if not user_row:
             _record_audit_log(action="auth_login", status="failed", detail={"email": email, "reason": "user_not_found"})
-            raise HTTPException(status_code=401, detail="邮箱或密码错误")
+            raise HTTPException(
+                status_code=404,
+                detail=_build_auth_error_detail("AUTH_USER_NOT_FOUND", "用户不存在，请先注册"),
+            )
         if str(user_row.get("status") or "active") != "active":
             _record_audit_log(action="auth_login", status="blocked", user_id=int(user_row.get("id") or 0), user_email=email, detail={"reason": "banned"})
             raise HTTPException(status_code=403, detail="账号已被禁用")
         if not verify_password(payload.password, str(user_row.get("password_hash") or "")):
             _record_audit_log(action="auth_login", status="failed", user_id=int(user_row.get("id") or 0), user_email=email, detail={"reason": "wrong_password"})
-            raise HTTPException(status_code=401, detail="邮箱或密码错误")
+            raise HTTPException(
+                status_code=400,
+                detail=_build_auth_error_detail("AUTH_WRONG_PASSWORD", "密码错误，请重新输入"),
+            )
         _record_audit_log(action="auth_login", status="success", user_id=int(user_row.get("id") or 0), user_email=email, detail={"role": str(user_row.get("role") or "user")})
         return _build_auth_response(user_row)
     finally:

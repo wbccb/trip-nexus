@@ -1,5 +1,4 @@
 import logging
-from typing import List, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -229,11 +228,18 @@ def replan_trip_day(
         constraints_used = _normalize_trip_constraints(payload.constraints or current_trip.get("constraints_used") or {})
         escalation_info = _detect_replan_escalation(current_trip, target_day, time_range, locked_days)
         replan_context = _build_replan_context(current_trip, target_day, time_range, locked_days, replan_instruction)
+        # 核心步骤：把当前行程、scope 和联动信息显式传给 LLM 管理器，
+        # 避免局部重排方法只能从字符串上下文里反推这些关键参数。
         replan_result = llm_manager.replan_trip_day(
             target_day=target_day,
             context=replan_context,
             constraints=constraints_used,
             escalate=bool(escalation_info.get("escalated")),
+            current_trip=current_trip,
+            time_range=time_range,
+            locked_days=locked_days,
+            replan_instruction=replan_instruction,
+            impacted_days=escalation_info.get("impacted_days") or [],
         )
         new_daily_plan = replan_result.get("daily_plan") or {}
         merged_daily_plan = _normalize_daily_plan(current_trip)

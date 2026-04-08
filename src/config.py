@@ -1,14 +1,18 @@
 import os
 from dotenv import load_dotenv
 
-# 区分开发环境与生产环境配置
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-if ENVIRONMENT == "production":
-    load_dotenv(".env.production")
-else:
-    load_dotenv(".env.development")
-# 兜底加载默认 .env
-load_dotenv()
+
+def _load_runtime_env() -> str:
+    """按运行环境只加载开发或生产配置，避免再混入默认 .env。"""
+    environment = os.getenv("ENVIRONMENT", "development").strip().lower() or "development"
+    env_file = ".env.production" if environment == "production" else ".env.development"
+    # 运行时配置统一只从目标环境文件加载；系统环境变量仍然保留更高优先级。
+    load_dotenv(env_file)
+    return environment
+
+
+# 在模块导入阶段先完成环境变量装载，保证后续 Config 读取的是同一套来源。
+ENVIRONMENT = _load_runtime_env()
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", os.path.join(PROJECT_ROOT, "model_cache"))

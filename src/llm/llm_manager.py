@@ -1958,6 +1958,82 @@ class LlmManager:
         )
         return self._execute_trip_generation(prompt)
 
+    def replan_trip_day(
+        self,
+        target_day: int,
+        context: Optional[List[str]] = None,
+        constraints: Optional[Dict[str, Any]] = None,
+        escalate: bool = False,
+        current_trip: Optional[Dict[str, Any]] = None,
+        time_range: Optional[str] = None,
+        locked_days: Optional[List[int]] = None,
+        replan_instruction: Optional[str] = None,
+        impacted_days: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """执行局部重排，并仅返回目标天及联动天的数据，供路由安全 merge。"""
+        if not isinstance(current_trip, dict) or not current_trip:
+            raise ValueError("局部重排缺少 current_trip，无法生成新的局部行程")
+
+        normalized_constraints = constraints if isinstance(constraints, dict) else {}
+        special_constraints = normalized_constraints.get("special_constraints") or {}
+        if not isinstance(special_constraints, dict):
+            special_constraints = {}
+
+        # 核心步骤：沿用当前行程的核心参数作为生成基底，只让模型重算指定天/时段，
+        # 避免局部重排时因为缺少原始背景而把整份计划改偏。
+        user_input = {
+            "destination": current_trip.get("destination") or "未知目的地",
+            "days": current_trip.get("days") or len((current_trip.get("daily_plan") or {})),
+            "budget": current_trip.get("budget") or "未提供",
+            "preference": current_trip.get("preference") or [],
+            "budget_level": normalized_constraints.get("budget_level", "balanced"),
+            "intensity": normalized_constraints.get("intensity", "standard"),
+            "pace": normalized_constraints.get("pace", "cultural"),
+            "special_constraints": special_constraints,
+            "guide_links": [],
+        }
+
+        # 核心步骤：把 scope/锁定天/补充要求收敛进统一 edit_cmd，
+        # 复用现有 prompt 生成逻辑，而不是再维护一套平行的局部重排提示词。
+        edit_cmd = {
+            "type": "modify",
+            "msg": "请基于当前行程执行局部重排，并保持未授权修改的部分尽量不变",
+            "scope": {
+                "day": int(target_day),
+                "time_range": time_range,
+            },
+            "locked_days": [int(day) for day in (locked_days or []) if str(day).isdigit()],
+            "replan_instruction": str(replan_instruction or "").strip(),
+        }
+
+        replanned_trip = self.generate_trip(user_input, context or [], edit_cmd)
+        if not isinstance(replanned_trip, dict):
+            raise ValueError("局部重排未返回有效的行程数据")
+
+        replanned_daily_plan = replanned_trip.get("daily_plan") or {}
+        if not isinstance(replanned_daily_plan, dict):
+            raise ValueError("局部重排行程缺少 daily_plan 结构")
+
+        allowed_days = {int(target_day)}
+        if escalate:
+            allowed_days.update(
+                int(day)
+                for day in (impacted_days or [])
+                if str(day).isdigit()
+            )
+
+        # 核心步骤：仅透出允许被 merge 的天数，避免路由层收到整份 daily_plan 后误覆盖未授权的天。
+        filtered_daily_plan = {
+            str(day): items
+            for day, items in replanned_daily_plan.items()
+            if str(day).isdigit() and int(day) in allowed_days and isinstance(items, list)
+        }
+        return {
+            "destination": replanned_trip.get("destination") or current_trip.get("destination"),
+            "days": replanned_trip.get("days") or current_trip.get("days"),
+            "daily_plan": filtered_daily_plan,
+        }
+
     def analyze_user_message(
         self,
         query: str,

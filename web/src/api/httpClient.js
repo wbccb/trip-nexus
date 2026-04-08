@@ -49,8 +49,30 @@ function emitForbiddenSession() {
   window.dispatchEvent(new CustomEvent("tripnexus:forbidden-session"));
 }
 
+function normalizeErrorDetail(detail) {
+  // 后端有些接口直接返回字符串 detail，有些会返回 { error_code, message }；
+  // 这里统一拍平成前端可消费的结构，避免业务层反复判断类型。
+  if (typeof detail === "string") {
+    return {
+      errorCode: "",
+      message: detail.trim(),
+    };
+  }
+  if (detail && typeof detail === "object") {
+    return {
+      errorCode: String(detail.error_code || "").trim(),
+      message: String(detail.message || detail.detail || "").trim(),
+    };
+  }
+  return {
+    errorCode: "",
+    message: "",
+  };
+}
+
 function buildFriendlyErrorMessage(status, detail, method, path) {
-  const detailText = String(detail || "").trim();
+  const normalized = normalizeErrorDetail(detail);
+  const detailText = normalized.message;
   if (status === 429) {
     if (detailText.includes("Token 额度已用完")) {
       return "当前账号的 AI 调用额度已用完，请联系管理员调整额度。";
@@ -81,13 +103,18 @@ async function parseJsonResponse(response, method, path) {
     } catch (error) {
       detail = "";
     }
+    const normalized = normalizeErrorDetail(detail);
     // 如果是 403 且内容包含“无权访问该会话”，说明本地 session_id 权属不对，触发清理事件
-    if (response.status === 403 && String(detail).includes("无权访问该会话")) {
+    if (response.status === 403 && String(normalized.message).includes("无权访问该会话")) {
       emitForbiddenSession();
     }
-    throw new Error(
+    const error = new Error(
       buildFriendlyErrorMessage(response.status, detail, method, path),
     );
+    // 将后端透出的业务错误码挂到 Error 对象上，方便登录/注册等界面做精确提示。
+    error.code = normalized.errorCode;
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }

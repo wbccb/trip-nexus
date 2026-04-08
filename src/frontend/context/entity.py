@@ -4,10 +4,6 @@ import tiktoken
 from pydantic import BaseModel, Field
 from enum import Enum
 
-
-import os
-from dotenv import load_dotenv
-
 # 初始化token计算器
 ENCODER = tiktoken.get_encoding("cl100k_base")
 
@@ -41,6 +37,3 @@ class SessionContext(BaseModel):
     last_active: datetime = Field(default_factory=datetime.now)
     message_count: int = 0
     trip_data: Optional[Dict[str, Any]] = None  # 完整的行程数据
-
-# 加载 .env 文件
-load_dotenv()
