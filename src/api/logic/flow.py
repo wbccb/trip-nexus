@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import json
@@ -7,10 +9,8 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
-from src.agent import run_agent_loop_sync
-from src.llm.llm_manager import LlmManager
 from src.models.conflicts import ConflictReport
 from src.api.schemas.flow import (
     FlowMetricItem,
@@ -38,6 +38,9 @@ from src.api.logic.knowledge import (
 )
 from src.observability import log_event, summarize_value
 from src.utils.sql_loader import load_named_sql, render_named_sql
+
+if TYPE_CHECKING:
+    from src.llm.llm_manager import LlmManager
 
 logger = logging.getLogger(__name__)
 _FLOW_METRICS_SQL = "flow/metrics.sql"
@@ -1193,6 +1196,7 @@ async def _run_flow_stream(
                     },
                 )
                 thread_id = _build_agent_thread_id(user_id, payload.device_id)
+                from src.agent import run_agent_loop_sync
                 final_state = run_agent_loop_sync(
                     llm_manager=llm_manager,
                     user_input=user_input,
