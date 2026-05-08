@@ -222,7 +222,13 @@ def list_knowledge_bases(
         request_path="/api/knowledge/base/list",
     )
     try:
-        registry_rows = _load_knowledge_base_registry()
+        try:
+            registry_rows = _load_knowledge_base_registry()
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"知识库功能暂不可用：{exc}",
+            ) from exc
         user_id_suffix = f"_{current_user.user_id}"
         user_rows = [row for row in registry_rows if str(row.get("knowledge_base_id") or "").endswith(user_id_suffix)]
         items = [_build_knowledge_base_item(row) for row in user_rows]

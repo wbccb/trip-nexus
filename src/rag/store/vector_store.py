@@ -1,5 +1,6 @@
 from typing import List, Dict, Any
 from langchain_chroma import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from chromadb import EphemeralClient, PersistentClient
@@ -30,13 +31,43 @@ class VectorStore:
         self._init_db()
 
     def _build_embeddings(self):
-        if self.config.EMBEDDING_PROVIDER == "openai_compatible":
-            return OpenAIEmbeddings(
-                model=self.config.EMBEDDING_MODEL_NAME,
-                api_key=self.config.EMBEDDING_API_KEY,
-                base_url=self.config.EMBEDDING_BASE_URL,
-            )
-        raise RuntimeError("未配置可用的云端 Embedding Provider")
+        provider = str(self.config.EMBEDDING_PROVIDER or "").strip().lower()
+        if provider == "openai_compatible":
+            if not self.config.EMBEDDING_BASE_URL or not self.config.EMBEDDING_API_KEY:
+                raise RuntimeError(
+                    "知识库功能需要配置 EMBEDDING_BASE_URL 和 EMBEDDING_API_KEY；"
+                    "当前未配置，无法初始化向量模型"
+                )
+            try:
+                return OpenAIEmbeddings(
+                    model=self.config.EMBEDDING_MODEL_NAME,
+                    api_key=self.config.EMBEDDING_API_KEY,
+                    base_url=self.config.EMBEDDING_BASE_URL,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"知识库向量模型初始化失败，请检查 EMBEDDING_* 配置是否可用：{exc}"
+                ) from exc
+        if provider in {"local_sentence_transformer", "sentence_transformer", "local"}:
+            model_name = str(self.config.EMBEDDING_MODEL_NAME or "").strip()
+            if not model_name:
+                raise RuntimeError("知识库功能需要配置 EMBEDDING_MODEL_NAME 才能加载本地向量模型")
+            cache_folder = os.getenv("SENTENCE_TRANSFORMERS_HOME") or os.getenv("HF_HOME") or None
+            try:
+                return HuggingFaceEmbeddings(
+                    model_name=model_name,
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={"normalize_embeddings": True},
+                    cache_folder=cache_folder,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"本地 embedding 模型初始化失败，请检查模型名/网络/缓存配置：{exc}"
+                ) from exc
+        raise RuntimeError(
+            f"不支持的 EMBEDDING_PROVIDER={self.config.EMBEDDING_PROVIDER}，"
+            "请配置 openai_compatible 或 local_sentence_transformer"
+        )
 
     def _normalize_collection_name(self, collection_name: str) -> str:
         """规范化集合名，确保可持久化且命名安全。"""
@@ -142,6 +173,8 @@ class VectorStore:
         """
         if not documents:
             return 0
+        if self.embeddings is None:
+            raise RuntimeError("知识库功能需要 EMBEDDING_* 配置，无法写入知识库")
 
         docs_to_add = []
         for doc in documents:
@@ -172,6 +205,8 @@ class VectorStore:
         相似度搜索
         """
         try:
+            if self.embeddings is None:
+                raise RuntimeError("知识库功能需要 EMBEDDING_* 配置，无法检索知识库")
             return self.vector_db.similarity_search(query, k=k)
         except Exception as e:
             logger.error(f"Error during similarity search: {e}")
