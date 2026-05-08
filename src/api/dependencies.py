@@ -44,7 +44,19 @@ def _get_config() -> Config:
 def _get_storage():
     """缓存会话存储实例，用于会话列表与行程数据持久化"""
     config = _get_config()
-    return get_conversation_storage(config)
+    logger.info(
+        "初始化会话存储: storage_type=%s env=%s",
+        getattr(config, "TRIP_CONTEXT_STORAGE_TYPE", ""),
+        getattr(config, "ENVIRONMENT", ""),
+    )
+    start_time = time.perf_counter()
+    storage = get_conversation_storage(config)
+    logger.info(
+        "会话存储初始化完成: storage_class=%s cost_ms=%.2f",
+        storage.__class__.__name__,
+        (time.perf_counter() - start_time) * 1000.0,
+    )
+    return storage
 
 
 def _get_llm_manager_for_user(user_id: int) -> LlmManager:

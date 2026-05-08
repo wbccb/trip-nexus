@@ -1,6 +1,7 @@
 import hashlib
 import json
 import datetime
+import time
 import redis
 import mysql.connector
 from typing import Optional, Dict, List
@@ -20,7 +21,15 @@ class ProdConversationStorage(BaseConversationStorage):
     """生产用存储：Redis + MySQL"""
 
     def __init__(self, config: Config):
+        init_start = time.perf_counter()
+        logger.info(
+            "ProdConversationStorage 初始化开始: redis_url_set=%s mysql_host=%s mysql_db=%s",
+            bool(config.REDIS_URL),
+            config.MYSQL_HOST,
+            config.MYSQL_DATABASE,
+        )
         # 1. Redis连接（短期缓存）
+        redis_start = time.perf_counter()
         if config.REDIS_URL:
             self.redis = redis.from_url(
                 config.REDIS_URL,
@@ -38,7 +47,13 @@ class ProdConversationStorage(BaseConversationStorage):
                 socket_timeout=5,
                 socket_connect_timeout=5
             )
+        logger.info(
+            "ProdConversationStorage Redis 初始化完成: mode=%s cost_ms=%.2f",
+            "url" if config.REDIS_URL else "host_port",
+            (time.perf_counter() - redis_start) * 1000.0,
+        )
         # 2. MySQL连接配置
+        mysql_cfg_start = time.perf_counter()
         self.mysql_config = {
             'host': config.MYSQL_HOST,
             'port': config.MYSQL_PORT,
@@ -50,8 +65,19 @@ class ProdConversationStorage(BaseConversationStorage):
         if config.MYSQL_SSL_CA:
             self.mysql_config['ssl_ca'] = config.MYSQL_SSL_CA
             self.mysql_config['ssl_verify_cert'] = True
+        logger.info(
+            "ProdConversationStorage MySQL 配置完成: ssl_ca_set=%s cost_ms=%.2f",
+            bool(config.MYSQL_SSL_CA),
+            (time.perf_counter() - mysql_cfg_start) * 1000.0,
+        )
         # 3. 启动时主动确保生产业务表存在，避免首次请求才暴露“表不存在”错误。
+        table_start = time.perf_counter()
         self._ensure_mysql_tables()
+        logger.info(
+            "ProdConversationStorage 初始化完成: total_cost_ms=%.2f table_init_ms=%.2f",
+            (time.perf_counter() - init_start) * 1000.0,
+            (time.perf_counter() - table_start) * 1000.0,
+        )
 
     def _get_mysql_connection(self):
         """获取MySQL连接"""
@@ -60,6 +86,7 @@ class ProdConversationStorage(BaseConversationStorage):
     def _ensure_mysql_tables(self):
         """初始化生产环境业务表，保证会话/聊天/实体/摘要/行程数据可直接落库。"""
         try:
+            logger.info("ProdConversationStorage 开始初始化 MySQL 业务表")
             conn = self._get_mysql_connection()
             cursor = conn.cursor()
             # 业务表结构统一从独立 SQL 文件读取，后续改表时只需要维护一份脚本。
