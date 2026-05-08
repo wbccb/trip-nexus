@@ -5,7 +5,7 @@ from langchain_core.documents import Document
 from chromadb import EphemeralClient, PersistentClient
 from chromadb.config import Settings
 from src.config import Config
-from google import genai
+import google.genai as genai
 from google.genai import types
 from langchain_openai import OpenAIEmbeddings
 import logging
