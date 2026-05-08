@@ -1,5 +1,6 @@
 import logging
 import os
+from importlib import import_module
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -17,8 +18,33 @@ from src.auth.middleware import init_auth_tables
 print("[app import] auth middleware imported", flush=True)
 
 print("[app import] start importing route modules", flush=True)
-from src.api.routes import auth, admin, health, session, chat, flow, trip, knowledge, map
+_ROUTE_MODULE_NAMES = [
+    "auth",
+    "admin",
+    "health",
+    "session",
+    "chat",
+    "flow",
+    "trip",
+    "knowledge",
+    "map",
+]
+_ROUTE_MODULES = {}
+for _module_name in _ROUTE_MODULE_NAMES:
+    print(f"[app import] importing route module: {_module_name}", flush=True)
+    _ROUTE_MODULES[_module_name] = import_module(f"src.api.routes.{_module_name}")
+    print(f"[app import] route module imported: {_module_name}", flush=True)
 print("[app import] route modules imported", flush=True)
+
+auth = _ROUTE_MODULES["auth"]
+admin = _ROUTE_MODULES["admin"]
+health = _ROUTE_MODULES["health"]
+session = _ROUTE_MODULES["session"]
+chat = _ROUTE_MODULES["chat"]
+flow = _ROUTE_MODULES["flow"]
+trip = _ROUTE_MODULES["trip"]
+knowledge = _ROUTE_MODULES["knowledge"]
+map = _ROUTE_MODULES["map"]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
