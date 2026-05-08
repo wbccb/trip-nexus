@@ -5,15 +5,26 @@ from langchain_core.documents import Document
 from chromadb import EphemeralClient, PersistentClient
 from chromadb.config import Settings
 from src.config import Config
-import google.genai as genai
-from google.genai import types
 from langchain_openai import OpenAIEmbeddings
 import logging
 import os
 import re
 import time
+import importlib
 
 logger = logging.getLogger(__name__)
+
+
+def _load_gemini_module():
+    """延迟导入 Gemini SDK，避免应用启动阶段被依赖问题直接卡死。"""
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+        return genai, types
+    except Exception:
+        genai = importlib.import_module("google.genai")
+        types = importlib.import_module("google.genai.types")
+        return genai, types
 
 
 class GeminiEmbeddings:
@@ -21,9 +32,11 @@ class GeminiEmbeddings:
 
     def __init__(self, api_key: str | None = None, model_name: str = "gemini-embedding-001") -> None:
         self.model_name = model_name
+        genai, _ = _load_gemini_module()
         self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        _, types = _load_gemini_module()
         contents = [str(text or "") for text in texts]
         result = self.client.models.embed_content(
             model=self.model_name,
@@ -34,6 +47,7 @@ class GeminiEmbeddings:
         return [list(getattr(item, "values", []) or []) for item in embeddings]
 
     def embed_query(self, text: str) -> List[float]:
+        _, types = _load_gemini_module()
         result = self.client.models.embed_content(
             model=self.model_name,
             contents=str(text or ""),
