@@ -16,10 +16,6 @@ print("[app import] start importing auth middleware", flush=True)
 from src.auth.middleware import init_auth_tables
 print("[app import] auth middleware imported", flush=True)
 
-print("[app import] start importing dependencies", flush=True)
-from src.api import dependencies as _dependencies_probe  # noqa: F401
-print("[app import] dependencies imported", flush=True)
-
 print("[app import] start importing route modules", flush=True)
 from src.api.routes import auth, admin, health, session, chat, flow, trip, knowledge, map
 print("[app import] route modules imported", flush=True)

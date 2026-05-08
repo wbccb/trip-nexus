@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import contextvars
 import json
 import logging
 import time
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from fastapi import HTTPException, Request
 
@@ -14,16 +16,18 @@ from src.auth.middleware import (
     get_auth_db_connection,
     init_auth_tables,
 )
-from src.frontend.context.conversation_manager import ConversationManager
 from src.frontend.context.storage import get_conversation_storage
-from src.llm.llm_manager import LlmManager
-from src.map.map_renderer import TripMap
-from src.rag.rag_main import AIRetrievalPipeline
-from src.rag.store.vector_store import VectorStore
 from src.models.user import PublicUserProfile
 from src.api.schemas.auth import AuthResponse
 from src.frontend.context.entity import Message
 from src.utils.sql_loader import load_named_sql, render_named_sql
+
+if TYPE_CHECKING:
+    from src.frontend.context.conversation_manager import ConversationManager
+    from src.llm.llm_manager import LlmManager
+    from src.map.map_renderer import TripMap
+    from src.rag.rag_main import AIRetrievalPipeline
+    from src.rag.store.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 _AUTH_QUERIES_SQL = "auth/queries.sql"
@@ -61,6 +65,8 @@ def _get_storage():
 
 def _get_llm_manager_for_user(user_id: int) -> LlmManager:
     """按用户级别隔离以支持独立配置。为支持配置即时生效，移除 lru_cache"""
+    from src.llm.llm_manager import LlmManager
+
     config = _get_config()
     is_prod = config.ENVIRONMENT.lower() == "production"
 
@@ -114,6 +120,8 @@ def _get_llm_manager() -> LlmManager:
 
 
 def _get_conversation_manager() -> ConversationManager:
+    from src.frontend.context.conversation_manager import ConversationManager
+
     storage = _get_storage()
     llm_manager = _get_llm_manager()
     return ConversationManager(storage, llm_manager)
@@ -121,16 +129,22 @@ def _get_conversation_manager() -> ConversationManager:
 
 def _get_rag_pipeline() -> AIRetrievalPipeline:
     """每次获取最新的 LLM 实例用于 RAG"""
+    from src.rag.rag_main import AIRetrievalPipeline
+
     llm_manager = _get_llm_manager()
     return AIRetrievalPipeline(llm_manager.get_analysis_llm())
 
 
 @lru_cache(maxsize=1)
 def _get_map_renderer() -> TripMap:
+    from src.map.map_renderer import TripMap
+
     return TripMap()
 
 
 def _get_knowledge_store() -> VectorStore:
+    from src.rag.store.vector_store import VectorStore
+
     return VectorStore()
 
 
