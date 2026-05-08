@@ -5,14 +5,21 @@ from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+print("[auth route import] start auth.middleware", flush=True)
 from src.auth.middleware import (
     AuthenticatedUser,
     get_auth_db_connection,
     get_current_user,
     init_auth_tables,
 )
+print("[auth route import] auth.middleware imported", flush=True)
+
+print("[auth route import] start auth.oauth/password", flush=True)
 from src.auth.oauth import get_supported_oauth_providers
 from src.auth.password import hash_password, verify_password
+print("[auth route import] auth.oauth/password imported", flush=True)
+
+print("[auth route import] start auth schemas", flush=True)
 from src.api.schemas.auth import (
     AuthRegisterRequest,
     AuthLoginRequest,
@@ -26,7 +33,13 @@ from src.api.schemas.auth import (
     UserPasswordUpdateRequest,
     UserLlmConfig,
 )
+print("[auth route import] auth schemas imported", flush=True)
+
+print("[auth route import] start models.user", flush=True)
 from src.models.user import PublicUserProfile
+print("[auth route import] models.user imported", flush=True)
+
+print("[auth route import] start api.dependencies", flush=True)
 from src.api.dependencies import (
     _get_config,
     _get_user_by_email,
@@ -38,7 +51,11 @@ from src.api.dependencies import (
     _reset_observability_context,
     _record_audit_log,
 )
+print("[auth route import] api.dependencies imported", flush=True)
+
+print("[auth route import] start sql_loader", flush=True)
 from src.utils.sql_loader import load_named_sql
+print("[auth route import] sql_loader imported", flush=True)
 
 _AUTH_QUERIES_SQL = "auth/queries.sql"
 
