@@ -57,6 +57,7 @@ class Config:
     EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "")
     EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
     EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
     SENTENCE_BERT_MODEL = os.getenv("SENTENCE_BERT_MODEL", "all-MiniLM-L6-v2")
     MINILM_MODEL = os.getenv("MINILM_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 

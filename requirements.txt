@@ -33,6 +33,7 @@ geographiclib==2.0
 geopy==2.4.1
 google-auth==2.42.1
 googleapis-common-protos==1.71.0
+google-genai>=1.0.0
 greenlet==3.2.4
 grpcio==1.76.0
 h11==0.16.0

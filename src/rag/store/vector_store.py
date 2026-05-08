@@ -1,11 +1,12 @@
 from typing import List, Dict, Any
 from langchain_chroma import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from chromadb import EphemeralClient, PersistentClient
 from chromadb.config import Settings
 from src.config import Config
+from google import genai
+from google.genai import types
 from langchain_openai import OpenAIEmbeddings
 import logging
 import os
@@ -13,6 +14,36 @@ import re
 import time
 
 logger = logging.getLogger(__name__)
+
+
+class GeminiEmbeddings:
+    """Gemini embedding 适配器，兼容 LangChain Embeddings 接口。"""
+
+    def __init__(self, api_key: str | None = None, model_name: str = "gemini-embedding-001") -> None:
+        self.model_name = model_name
+        self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        contents = [str(text or "") for text in texts]
+        result = self.client.models.embed_content(
+            model=self.model_name,
+            contents=contents,
+            config=types.EmbedContentConfig(output_dimensionality=768),
+        )
+        embeddings = getattr(result, "embeddings", None) or []
+        return [list(getattr(item, "values", []) or []) for item in embeddings]
+
+    def embed_query(self, text: str) -> List[float]:
+        result = self.client.models.embed_content(
+            model=self.model_name,
+            contents=str(text or ""),
+            config=types.EmbedContentConfig(output_dimensionality=768),
+        )
+        embeddings = getattr(result, "embeddings", None) or []
+        if not embeddings:
+            return []
+        return list(getattr(embeddings[0], "values", []) or [])
+
 
 class VectorStore:
     def __init__(self, collection_name: str = "web_search_cache"):
@@ -48,25 +79,23 @@ class VectorStore:
                 raise RuntimeError(
                     f"知识库向量模型初始化失败，请检查 EMBEDDING_* 配置是否可用：{exc}"
                 ) from exc
-        if provider in {"local_sentence_transformer", "sentence_transformer", "local"}:
-            model_name = str(self.config.EMBEDDING_MODEL_NAME or "").strip()
-            if not model_name:
-                raise RuntimeError("知识库功能需要配置 EMBEDDING_MODEL_NAME 才能加载本地向量模型")
-            cache_folder = os.getenv("SENTENCE_TRANSFORMERS_HOME") or os.getenv("HF_HOME") or None
+        if provider in {"gemini", "google_gemini"}:
+            model_name = str(self.config.EMBEDDING_MODEL_NAME or "gemini-embedding-001").strip()
+            api_key = str(self.config.GEMINI_API_KEY or "").strip()
+            if not api_key:
+                raise RuntimeError("知识库功能需要配置 GEMINI_API_KEY 才能使用 Gemini embedding")
             try:
-                return HuggingFaceEmbeddings(
+                return GeminiEmbeddings(
+                    api_key=api_key,
                     model_name=model_name,
-                    model_kwargs={"device": "cpu"},
-                    encode_kwargs={"normalize_embeddings": True},
-                    cache_folder=cache_folder,
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    f"本地 embedding 模型初始化失败，请检查模型名/网络/缓存配置：{exc}"
+                    f"Gemini embedding 初始化失败，请检查 GEMINI_API_KEY / EMBEDDING_MODEL_NAME：{exc}"
                 ) from exc
         raise RuntimeError(
             f"不支持的 EMBEDDING_PROVIDER={self.config.EMBEDDING_PROVIDER}，"
-            "请配置 openai_compatible 或 local_sentence_transformer"
+            "请配置 openai_compatible 或 gemini"
         )
 
     def _normalize_collection_name(self, collection_name: str) -> str:
