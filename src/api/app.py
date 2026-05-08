@@ -5,15 +5,24 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.auth.middleware import init_auth_tables
-from src.api.routes import auth, admin, health, session, chat, flow, trip, knowledge, map
-
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+print("[app import] start importing auth middleware", flush=True)
+from src.auth.middleware import init_auth_tables
+print("[app import] auth middleware imported", flush=True)
+
+print("[app import] start importing dependencies", flush=True)
+from src.api import dependencies as _dependencies_probe  # noqa: F401
+print("[app import] dependencies imported", flush=True)
+
+print("[app import] start importing route modules", flush=True)
+from src.api.routes import auth, admin, health, session, chat, flow, trip, knowledge, map
+print("[app import] route modules imported", flush=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
