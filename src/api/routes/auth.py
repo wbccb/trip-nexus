@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime, timedelta
 from uuid import uuid4
 from typing import Dict
@@ -56,10 +57,12 @@ print("[auth route import] api.dependencies imported", flush=True)
 print("[auth route import] start sql_loader", flush=True)
 from src.utils.sql_loader import load_named_sql
 print("[auth route import] sql_loader imported", flush=True)
+from src.observability import ErrorCodes, log_event, normalize_exception
 
 _AUTH_QUERIES_SQL = "auth/queries.sql"
 
 router = APIRouter(prefix="/api", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 
 def _build_auth_error_detail(error_code: str, message: str) -> Dict[str, str]:
@@ -321,6 +324,20 @@ def update_user_llm_config(
     
     # 自动测试 LLM 配置的连通性
     try:
+        log_event(
+            logger,
+            logging.INFO,
+            "开始验证用户 LLM 配置",
+            {
+                "user_id": current_user.user_id,
+                "analysis_provider": test_config.get("analysis_provider"),
+                "analysis_base_url": test_config.get("analysis_base_url"),
+                "analysis_model_name": test_config.get("analysis_model_name"),
+                "generation_provider": test_config.get("generation_provider"),
+                "generation_base_url": test_config.get("generation_base_url"),
+                "generation_model_name": test_config.get("generation_model_name"),
+            },
+        )
         temp_llm_manager = LlmManager(
             model_name=test_config["generation_model_name"],
             ollama_base_url=test_config["generation_base_url"],
@@ -336,10 +353,40 @@ def update_user_llm_config(
         analysis_response = analysis_llm.invoke([HumanMessage(content="Hello! Please reply with just 'OK'.")])
         if not analysis_response or not getattr(analysis_response, "content", ""):
             raise HTTPException(status_code=400, detail="模型连接测试失败，未返回有效内容")
+        log_event(
+            logger,
+            logging.INFO,
+            "用户 LLM 配置验证通过",
+            {
+                "user_id": current_user.user_id,
+                "analysis_model_name": test_config.get("analysis_model_name"),
+                "generation_model_name": test_config.get("generation_model_name"),
+                "analysis_response_preview": str(getattr(analysis_response, "content", "") or "")[:120],
+            },
+        )
             
     except HTTPException:
         raise
     except Exception as e:
+        log_event(
+            logger,
+            logging.ERROR,
+            "用户 LLM 配置验证失败",
+            {
+                "user_id": current_user.user_id,
+                "analysis_provider": test_config.get("analysis_provider"),
+                "analysis_base_url": test_config.get("analysis_base_url"),
+                "analysis_model_name": test_config.get("analysis_model_name"),
+                "generation_provider": test_config.get("generation_provider"),
+                "generation_base_url": test_config.get("generation_base_url"),
+                "generation_model_name": test_config.get("generation_model_name"),
+                "error": normalize_exception(
+                    e,
+                    code=ErrorCodes.LLM_FAILED,
+                    source="auth.update_user_llm_config",
+                ),
+            },
+        )
         raise HTTPException(status_code=400, detail=f"模型连接失败: {str(e)}")
 
     # 测试通过，落库保存

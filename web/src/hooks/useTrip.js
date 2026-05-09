@@ -276,6 +276,7 @@ export function useTrip({
         } = streamOptions || {};
         // 初始化累计文本
         let accumulatedText = "";
+        let accumulatedReasoningText = "";
         // 暂存会话 ID
         let streamSessionId = null;
         // 暂存行程结果
@@ -283,6 +284,7 @@ export function useTrip({
         await streamMainFlow(payload, (event) => {
           const eventType = event?.event || "";
           const deltaText = event?.content_delta || "";
+          const reasoningDelta = event?.reasoning_delta || "";
           const step = event?.step || "";
           
           if (eventType === "start" && onStreamStart) {
@@ -293,7 +295,12 @@ export function useTrip({
           // Include eventType === "start" to catch the first "intent" step
           if (eventType === "start" || eventType === "delta" || step) {
             if (step === "generate" && eventType === "delta") {
-              accumulatedText += deltaText;
+              if (deltaText) {
+                accumulatedText += deltaText;
+              }
+              if (reasoningDelta) {
+                accumulatedReasoningText += reasoningDelta;
+              }
             }
             if (step === "warning") {
               const warningReport = event?.payload?.conflict_report || createEmptyConflictReport();
@@ -304,7 +311,7 @@ export function useTrip({
             console.log("[useTrip] Passing event to onStreamDelta:", { eventType, step, currentAccumulatedText: accumulatedText, payload: event?.payload });
             if (onStreamDelta) {
               // We need to wait for a microtask so state updates don't overlap improperly
-              setTimeout(() => onStreamDelta(accumulatedText, event), 0);
+              setTimeout(() => onStreamDelta(accumulatedText, event, accumulatedReasoningText), 0);
             }
           }
           

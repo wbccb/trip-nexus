@@ -1,6 +1,7 @@
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 import re
 import logging
+import time
 from src.observability import log_event, summarize_value
 
 logger = logging.getLogger(__name__)
@@ -97,7 +98,7 @@ class LlmStreamingAdapter:
 
     def build_stream_events_from_stream(
         self,
-        stream: Iterable[str],
+        stream: Iterable[Any],
         message_id: str,
     ) -> Iterable[Dict[str, Any]]:
         """
@@ -121,12 +122,21 @@ class LlmStreamingAdapter:
         for delta in stream:
             if not delta:
                 continue
+            if isinstance(delta, dict):
+                content_delta = str(delta.get("content_delta") or "")
+                reasoning_delta = str(delta.get("reasoning_delta") or "")
+                if not content_delta and not reasoning_delta:
+                    continue
+            else:
+                content_delta = str(delta or "")
+                reasoning_delta = ""
             sequence += 1
             yield {
                 "event": "delta",
                 "sequence": sequence,
                 "message_id": message_id,
-                "content_delta": delta,
+                "content_delta": content_delta,
+                "reasoning_delta": reasoning_delta,
                 "is_final": False,
             }
         sequence += 1
@@ -138,7 +148,7 @@ class LlmStreamingAdapter:
             "is_final": True,
         }
 
-    def extract_stream_delta(self, chunk: Any) -> str:
+    def extract_stream_delta(self, chunk: Any) -> Tuple[str, str]:
         """
         从不同模型返回的 chunk 结构中提取增量文本。
 
@@ -146,25 +156,52 @@ class LlmStreamingAdapter:
         - 纯字符串；
         - 带 content 属性的对象；
         - 带 content 字段的字典。
+        - 带 reasoning_content 的 OpenAI 兼容增量对象/字典。
 
         参数说明：
         - chunk: 模型 stream() 返回的单个增量块。
 
         返回：
-        - 可直接拼接的文本片段，无法提取时返回空字符串。
+        - (增量类型, 增量文本)。
+        - 增量类型取值: content / reasoning / unknown。
         """
         if chunk is None:
-            return ""
+            return "unknown", ""
         if isinstance(chunk, str):
-            return chunk
+            return "content", chunk
+        if hasattr(chunk, "additional_kwargs"):
+            additional_kwargs = getattr(chunk, "additional_kwargs", {}) or {}
+            reasoning_text = additional_kwargs.get("reasoning_content")
+            if isinstance(reasoning_text, str) and reasoning_text:
+                return "reasoning", reasoning_text
         if hasattr(chunk, "content"):
-            return getattr(chunk, "content") or ""
+            content_text = getattr(chunk, "content") or ""
+            if isinstance(content_text, str) and content_text:
+                return "content", content_text
+        if hasattr(chunk, "content_blocks"):
+            try:
+                for block in getattr(chunk, "content_blocks") or []:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = str(block.get("type") or "").strip().lower()
+                    if block_type in {"reasoning", "reasoning_content", "thinking"}:
+                        reasoning_text = block.get("thinking") or block.get("text") or ""
+                        if isinstance(reasoning_text, str) and reasoning_text:
+                            return "reasoning", reasoning_text
+            except Exception:
+                pass
         if isinstance(chunk, dict):
+            reasoning_text = chunk.get("reasoning_content")
+            if isinstance(reasoning_text, str) and reasoning_text:
+                return "reasoning", reasoning_text
             content = chunk.get("content")
-            return content if isinstance(content, str) else ""
-        return str(chunk)
+            if isinstance(content, str) and content:
+                return "content", content
+        # 对于 finish chunk 等不包含正文/思考文本的对象，这里直接忽略；
+        # 否则会把 AIMessageChunk 的调试字符串误拼进最终 JSON，导致解析失败。
+        return "unknown", ""
 
-    def stream_llm_text(self, llm: Any, prompt: str) -> Iterable[str]:
+    def stream_llm_text(self, llm: Any, prompt: str) -> Iterable[Dict[str, str]]:
         """
         调用模型的流式接口并输出增量文本。
 
@@ -184,6 +221,9 @@ class LlmStreamingAdapter:
             in_think = False
             carry = ""
             cleaned_parts: List[str] = []
+            stream_started_at = time.perf_counter()
+            first_reasoning_logged = False
+            first_content_logged = False
 
             def _process_buffer(buffer_text: str) -> tuple[str, str, bool]:
                 nonlocal in_think
@@ -209,18 +249,60 @@ class LlmStreamingAdapter:
                 return output, "", in_think
 
             for chunk in llm.stream(prompt):
-                delta = self.extract_stream_delta(chunk)
+                delta_kind, delta = self.extract_stream_delta(chunk)
                 if not delta:
                     continue
+                elapsed_ms = int((time.perf_counter() - stream_started_at) * 1000)
+                if delta_kind == "reasoning" and not first_reasoning_logged:
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "检测到首个 reasoning chunk",
+                        {
+                            "耗时毫秒": elapsed_ms,
+                            "片段长度": len(delta),
+                            "预览": _format_log_text(delta, head=80, tail=60),
+                        },
+                    )
+                    first_reasoning_logged = True
+                    yield {
+                        "content_delta": "",
+                        "reasoning_delta": delta,
+                    }
+                    continue
+                if delta_kind == "reasoning":
+                    yield {
+                        "content_delta": "",
+                        "reasoning_delta": delta,
+                    }
+                    continue
+                if delta_kind == "content" and not first_content_logged:
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "检测到首个 content chunk",
+                        {
+                            "耗时毫秒": elapsed_ms,
+                            "片段长度": len(delta),
+                            "预览": _format_log_text(delta, head=80, tail=60),
+                        },
+                    )
+                    first_content_logged = True
                 buffer_text = carry + delta
                 output_text, carry, in_think = _process_buffer(buffer_text)
                 if output_text:
                     cleaned_parts.append(output_text)
-                    yield output_text
+                    yield {
+                        "content_delta": output_text,
+                        "reasoning_delta": "",
+                    }
 
             if not in_think and carry:
                 cleaned_parts.append(carry)
-                yield carry
+                yield {
+                    "content_delta": carry,
+                    "reasoning_delta": "",
+                }
             cleaned_text = "".join(cleaned_parts)
             _log_llm_output("stream_response", cleaned_text)
             return
@@ -233,4 +315,7 @@ class LlmStreamingAdapter:
         cleaned_text = _strip_think_content(response_text)
         _log_llm_output("invoke_response", cleaned_text)
         if cleaned_text:
-            yield str(cleaned_text)
+            yield {
+                "content_delta": str(cleaned_text),
+                "reasoning_delta": "",
+            }

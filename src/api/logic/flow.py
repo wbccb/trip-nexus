@@ -36,7 +36,7 @@ from src.api.logic.knowledge import (
     _build_knowledge_context_payload,
     _build_source_evidence_from_docs,
 )
-from src.observability import log_event, summarize_value
+from src.observability import ErrorCodes, log_event, normalize_exception, summarize_value
 from src.utils.sql_loader import load_named_sql, render_named_sql
 
 if TYPE_CHECKING:
@@ -1472,11 +1472,13 @@ async def _run_flow_stream(
                     if raw_event == "end":
                         continue
                     delta_text = event.get("content_delta") or ""
+                    reasoning_delta = event.get("reasoning_delta") or ""
                     if raw_event == "delta":
-                        response_chunks.append(delta_text)
-                        stream_chunk_count += 1
-                        stream_char_count += len(delta_text)
-                        if not first_stream_chunk_logged:
+                        if delta_text:
+                            response_chunks.append(delta_text)
+                            stream_chunk_count += 1
+                            stream_char_count += len(delta_text)
+                        if (delta_text or reasoning_delta) and not first_stream_chunk_logged:
                             _log_flow_step(
                                 message_id,
                                 session_id,
@@ -1484,6 +1486,7 @@ async def _run_flow_stream(
                                 "进行中",
                                 {
                                     "状态": "已收到首个流式分片",
+                                    "分片类型": "content" if delta_text else "reasoning",
                                     "累计分片数": stream_chunk_count,
                                     "累计字符数": stream_char_count,
                                 },
@@ -1498,6 +1501,7 @@ async def _run_flow_stream(
                                 "进行中",
                                 {
                                     "状态": "持续接收模型输出",
+                                    "最近分片类型": "content" if delta_text else ("reasoning" if reasoning_delta else "unknown"),
                                     "累计分片数": stream_chunk_count,
                                     "累计字符数": stream_char_count,
                                 },
@@ -1515,6 +1519,7 @@ async def _run_flow_stream(
                             "status": "running",
                             "mode": flow_mode,
                             "content_delta": delta_text,
+                            "reasoning_delta": reasoning_delta,
                             "is_final": False,
                             "payload": {},
                         },
@@ -1834,6 +1839,20 @@ async def _run_flow_stream(
         )
     except Exception as exc:
         logger.exception("主流程异常 message_id=%s session_id=%s error=%s", message_id, session_id, str(exc))
+        log_event(
+            logger,
+            logging.ERROR,
+            "主流程异常详情",
+            {
+                "message_id": message_id,
+                "session_id": session_id,
+                "error": normalize_exception(
+                    exc,
+                    code=ErrorCodes.LLM_FAILED,
+                    source="flow._run_flow_stream",
+                ),
+            },
+        )
         last_sequence += 1
         await _append_flow_event(
             message_id,

@@ -270,10 +270,22 @@ PACE_MAP = {
     "family_friendly": "亲子友好（避免过早出发，优先儿童友好景点，安排更平缓的节奏与午间休息）",
 }
 
-OPENAI_CHAT_TEMPLATE_KWARGS = {
-    "chat_template_kwargs": {
-        "enable_thinking": False,
+DEEPSEEK_DISABLE_THINKING_EXTRA_BODY = {
+    "thinking": {
+        "type": "disabled",
     }
+}
+
+# DeepSeek 等 OpenAI 兼容实现对 function.name 的格式更严格，
+# 不接受带 "." 的工具名；Function Calling 路径使用合法别名，
+# 执行前再映射回内部工具注册名。
+FUNCTION_CALL_TOOL_NAME_MAP = {
+    "weather.get_daily": "weather_get_daily",
+    "geo.geocode": "geo_geocode",
+    "poi.search": "poi_search",
+}
+FUNCTION_CALL_TOOL_ALIAS_MAP = {
+    alias: name for name, alias in FUNCTION_CALL_TOOL_NAME_MAP.items()
 }
 
 
@@ -408,6 +420,8 @@ class LlmManager:
         base_url = self._normalize_openai_base_url(cfg.get("base_url"))
         temperature = cfg.get("temperature") or 0.7
         api_key = cfg.get("api_key") or ""
+        hostname = (urlparse(base_url).hostname or "").lower()
+        is_deepseek_api = "deepseek.com" in hostname
         if self._is_local_ollama_base_url(base_url):
             ollama_root_url = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
             log_event(
@@ -426,8 +440,10 @@ class LlmManager:
                 "api_key": api_key,
                 "base_url": base_url,
                 "temperature": temperature,
-                "extra_body": OPENAI_CHAT_TEMPLATE_KWARGS,
             }
+            if is_deepseek_api:
+                # DeepSeek 官方文档要求通过 thinking.type=disabled 关闭思考模式。
+                init_kwargs["extra_body"] = DEEPSEEK_DISABLE_THINKING_EXTRA_BODY
         except ImportError:
             try:
                 from langchain_community.chat_models import ChatOpenAI
@@ -455,7 +471,13 @@ class LlmManager:
             logger,
             logging.INFO,
             "初始化 OpenAI 兼容模型",
-            {"模型": model_name, "地址": base_url, "实现": client_variant},
+            {
+                "模型": model_name,
+                "地址": base_url,
+                "实现": client_variant,
+                "禁用Thinking": is_deepseek_api,
+                "extra_body": init_kwargs.get("extra_body") if is_deepseek_api else {},
+            },
         )
         return ChatOpenAI(**init_kwargs)
 
@@ -543,12 +565,12 @@ class LlmManager:
         except Exception:
             return []
 
-        @lc_tool("weather.get_daily")
+        @lc_tool(FUNCTION_CALL_TOOL_NAME_MAP["weather.get_daily"])
         def weather_get_daily(city: str, date: Optional[str] = None, days: int = 7) -> Dict[str, Any]:
             """FunctionCall 天气工具：输入城市与日期，返回每日天气结构化结果。"""
             return get_daily_weather(city, date, days)
 
-        @lc_tool("geo.geocode")
+        @lc_tool(FUNCTION_CALL_TOOL_NAME_MAP["geo.geocode"])
         def geo_geocode(address: str, city: Optional[str] = None, attraction: Optional[str] = None) -> Dict[str, Any]:
             """FunctionCall 地理编码工具：输入地址与城市，返回经纬度与标准化地址。"""
             return geocode_address(
@@ -558,7 +580,7 @@ class LlmManager:
                 attraction=attraction,
             )
 
-        @lc_tool("poi.search")
+        @lc_tool(FUNCTION_CALL_TOOL_NAME_MAP["poi.search"])
         def poi_search(query: str, city: Optional[str] = None, top_k: int = 5, defer_answer: bool = False) -> Dict[str, Any]:
             """FunctionCall POI 工具：输入关键词与城市，返回搜索结果列表。"""
             return search_poi(
@@ -597,7 +619,16 @@ class LlmManager:
 {query}
 """
         # 将工具绑定到云端模型，让模型自行产出 tool_calls
-        bound_llm = self.analysis_llm.bind_tools(tools)
+        log_event(
+            logger,
+            logging.INFO,
+            "FunctionCall 工具别名映射",
+            {
+                "模型": str((self._analysis_config or {}).get("model_name") or ""),
+                "发送工具名": [getattr(tool, "name", "") for tool in tools],
+                "内部映射": FUNCTION_CALL_TOOL_ALIAS_MAP,
+            },
+        )
         started_at = log_llm_start(
             logger,
             stage="工具选择",
@@ -605,7 +636,33 @@ class LlmManager:
             prompt=prompt,
             extra={"上下文条数": len(normalized_context)},
         )
-        response = bound_llm.invoke(prompt)
+        try:
+            bound_llm = self.analysis_llm.bind_tools(tools)
+            response = bound_llm.invoke(prompt)
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "FunctionCall 调用失败，回退到工具路由",
+                {
+                    "模型": str((self._analysis_config or {}).get("model_name") or ""),
+                    "BaseURL": str((self._analysis_config or {}).get("base_url") or ""),
+                    "发送工具名": [getattr(tool, "name", "") for tool in tools],
+                    "错误类型": exc.__class__.__name__,
+                    "错误信息": str(exc),
+                    "错误详情": normalize_exception(
+                        exc,
+                        code=ErrorCodes.LLM_FAILED,
+                        source="llm_manager._call_tool_by_function_call",
+                    ),
+                },
+            )
+            return {
+                "needs_tool": False,
+                "decision": {"needs_tool": False, "tool_name": "", "params": {}, "source": "function_call"},
+                "result": None,
+                "fallback": True,
+            }
         response_text = response.content if hasattr(response, "content") else response
         cleaned_response_text = _strip_think_content(response_text)
         self._notify_usage(
@@ -640,7 +697,8 @@ class LlmManager:
 
         # 当前先取第一个工具调用，避免多工具时的执行顺序问题
         first_call = tool_calls[0]
-        tool_name = self._normalize_tool_name(first_call.get("name") if isinstance(first_call, dict) else "")
+        function_tool_name = first_call.get("name") if isinstance(first_call, dict) else ""
+        tool_name = self._normalize_tool_name(function_tool_name)
         params = first_call.get("args") if isinstance(first_call, dict) else {}
         if not isinstance(params, dict):
             params = {}
@@ -657,7 +715,16 @@ class LlmManager:
                 "fallback": False,
             }
 
-        log_event(logger, logging.INFO, "工具选择完成\n----------------------", {"工具名": tool_name, "参数": params})
+        log_event(
+            logger,
+            logging.INFO,
+            "工具选择完成\n----------------------",
+            {
+                "FunctionCall工具名": function_tool_name,
+                "内部工具名": tool_name,
+                "参数": params,
+            },
+        )
 
 
         # 执行工具并返回标准化结果
@@ -774,12 +841,17 @@ class LlmManager:
             },
         )
 
-        def _stream_wrapper() -> Iterable[str]:
+        def _stream_wrapper() -> Iterable[Dict[str, str]]:
             nonlocal output_chars
             output_parts: List[str] = []
             for delta in self._streaming_adapter.stream_llm_text(llm, prompt):
-                output_chars += len(str(delta))
-                output_parts.append(str(delta or ""))
+                if isinstance(delta, dict):
+                    content_delta = str(delta.get("content_delta") or "")
+                else:
+                    content_delta = str(delta or "")
+                output_chars += len(content_delta)
+                if content_delta:
+                    output_parts.append(content_delta)
                 yield delta
             elapsed_ms = int((datetime.now() - start_ts).total_seconds() * 1000)
             full_output_text = "".join(output_parts)
@@ -1046,6 +1118,7 @@ class LlmManager:
             normalized = str(tool_name or "").strip()
         if not normalized:
             return ""
+        normalized = FUNCTION_CALL_TOOL_ALIAS_MAP.get(normalized, normalized)
         valid_names = {str(item.get("name") or "") for item in self.list_tools() if isinstance(item, dict)}
         return normalized if normalized in valid_names else ""
 

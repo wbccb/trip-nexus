@@ -392,7 +392,7 @@ export default function App() {
             console.log("[App.jsx] onStreamStart triggered");
             updateMessage("正在处理...")
           },
-          onStreamDelta: (nextText, event) => {
+          onStreamDelta: (nextText, event, reasoningText) => {
             console.log("[App.jsx] onStreamDelta called with step:", event?.step, "currentIntent:", currentIntent);
           if (event?.step === "intent" && event?.payload?.intent) {
             currentIntent = event.payload.intent;
@@ -417,9 +417,9 @@ export default function App() {
           finalize: "行程已生成，请查看详情",
         };
 
-        if (event?.step === "generate" && currentIntent === "general_conversation") {
+        if (event?.step === "generate" && (currentIntent === "general_conversation" || currentIntent === "generate_trip")) {
             streamingText = nextText || ""
-            updateMessage(streamingText || "正在思考...")
+            updateMessage(streamingText || (reasoningText ? "模型正在思考..." : "正在思考..."))
           } else {
             // If the step is mapping to modification intents, handle it specifically
             if (event?.step === "generate" && currentIntent && ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"].includes(currentIntent)) {
@@ -533,7 +533,7 @@ export default function App() {
         updateChatMessageById(assistantMessageId, "行程生成中...")
       },
       // 流增量回调处理
-      onStreamDelta: (nextText, event) => {
+      onStreamDelta: (nextText, event, reasoningText) => {
         if (event?.step === "intent" && event?.payload?.intent) {
           currentIntent = event.payload.intent;
           setFlowRuntimeStatus((prev) => ({
@@ -557,9 +557,9 @@ export default function App() {
           finalize: "行程已生成，请查看右侧详情",
         };
 
-        if (event?.step === "generate" && currentIntent === "general_conversation") {
+        if (event?.step === "generate" && (currentIntent === "general_conversation" || currentIntent === "generate_trip")) {
           streamingText = nextText || ""
-          updateChatMessageById(assistantMessageId, streamingText || "...")
+          updateChatMessageById(assistantMessageId, streamingText || (reasoningText ? "模型正在思考..." : "..."))
         } else {
           // If the step is mapping to modification intents, handle it specifically
           if (event?.step === "generate" && currentIntent && ["modify_trip", "add_attraction", "delete_attraction", "reorder_trip"].includes(currentIntent)) {
