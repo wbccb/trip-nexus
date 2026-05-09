@@ -65,9 +65,25 @@ class AIRetrievalPipeline:
         self.searcher = MultiSourceSearcher(llm)
         self.quality_filter = QualityFilter()
         self.crawler = ContentCrawler()
-        # 使用 ephemeral_collection 或者每次清除
-        self.vector_store = VectorStore(collection_name="current_search_context")
+        # 向量库延迟初始化，避免非 RAG 路径在低内存实例上提前加载 embedding/chroma。
+        self.vector_store: Optional[VectorStore] = None
         self._token_encoder = tiktoken.get_encoding("cl100k_base")
+
+    def _get_vector_store(self) -> VectorStore:
+        if self.vector_store is None:
+            started_at = time.perf_counter()
+            self.vector_store = VectorStore(collection_name="current_search_context")
+            log_event(
+                logger,
+                logging.INFO,
+                "RAG 向量存储初始化完成",
+                {
+                    "collection_name": getattr(self.vector_store, "collection_name", ""),
+                    "client_mode": getattr(self.vector_store, "client_mode", ""),
+                    "cost_ms": round((time.perf_counter() - started_at) * 1000.0, 2),
+                },
+            )
+        return self.vector_store
 
     def _normalize_text(self, text: str) -> str:
         """
@@ -390,7 +406,7 @@ class AIRetrievalPipeline:
         _log_rag_step("RAG Step 0 检索开始", {"查询": query})
         
         # 清除旧的向量存储上下文
-        self.vector_store.clear()
+        self._get_vector_store().clear()
 
         # 1. 意图识别 (如果外部未传入，则进行识别)
         if not intent_info:
@@ -471,10 +487,10 @@ class AIRetrievalPipeline:
                         "engine": meta.get("engine"),
                     }
                 })
-            self.vector_store.add_documents(documents)
+            self._get_vector_store().add_documents(documents)
             
             # 将联网检索到的正文存入向量库后，检索相关片段作为 Body Evidence 候选（抓取正文的高相关段落）
-            relevant_docs = self.vector_store.similarity_search(query, k=self.config.EVIDENCE_BODY_CANDIDATE_K)
+            relevant_docs = self._get_vector_store().similarity_search(query, k=self.config.EVIDENCE_BODY_CANDIDATE_K)
             _log_rag_step("RAG Step 6 向量检索完成", {"候选片段数": len(relevant_docs)})
             
             # 依据 Top N 与 token长度预算 => 两个都得满足 => 构建 Body Evidence

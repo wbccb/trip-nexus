@@ -12,6 +12,8 @@ import re
 import time
 import importlib
 
+import psutil
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,6 +64,15 @@ class GeminiEmbeddings:
 class VectorStore:
     def __init__(self, collection_name: str = "web_search_cache"):
         self.config = Config()
+        logger.info(
+            "VectorStore init start: provider=%s model=%s collection=%s persist_directory=%s pid=%s rss_mb=%.2f",
+            str(self.config.EMBEDDING_PROVIDER or ""),
+            str(self.config.EMBEDDING_MODEL_NAME or ""),
+            str(collection_name or ""),
+            os.path.abspath(self.config.CHROMA_DB_PATH),
+            os.getpid(),
+            self._get_process_rss_mb(),
+        )
         self.embeddings = self._build_embeddings()
         self.persist_directory = os.path.abspath(self.config.CHROMA_DB_PATH)
         self.collection_name = self._normalize_collection_name(collection_name)
@@ -74,6 +85,21 @@ class VectorStore:
             separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?", " ", ""]
         )
         self._init_db()
+        logger.info(
+            "VectorStore init done: provider=%s model=%s collection=%s client_mode=%s pid=%s rss_mb=%.2f",
+            str(self.config.EMBEDDING_PROVIDER or ""),
+            str(self.config.EMBEDDING_MODEL_NAME or ""),
+            self.collection_name,
+            self.client_mode,
+            os.getpid(),
+            self._get_process_rss_mb(),
+        )
+
+    def _get_process_rss_mb(self) -> float:
+        try:
+            return round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 2)
+        except Exception:
+            return 0.0
 
     def _build_embeddings(self):
         provider = str(self.config.EMBEDDING_PROVIDER or "").strip().lower()

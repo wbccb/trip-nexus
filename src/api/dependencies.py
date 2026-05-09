@@ -142,10 +142,19 @@ def _get_map_renderer() -> TripMap:
     return TripMap()
 
 
+@lru_cache(maxsize=1)
 def _get_knowledge_store() -> VectorStore:
     from src.rag.store.vector_store import VectorStore
-
-    return VectorStore()
+    logger.info("初始化知识库向量存储")
+    start_time = time.perf_counter()
+    store = VectorStore()
+    logger.info(
+        "知识库向量存储初始化完成: client_mode=%s collection=%s cost_ms=%.2f",
+        getattr(store, "client_mode", ""),
+        getattr(store, "collection_name", ""),
+        (time.perf_counter() - start_time) * 1000.0,
+    )
+    return store
 
 
 def _normalize_knowledge_base_id(raw_id: str) -> str:

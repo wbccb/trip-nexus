@@ -60,6 +60,10 @@ class Config:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
     SENTENCE_BERT_MODEL = os.getenv("SENTENCE_BERT_MODEL", "all-MiniLM-L6-v2")
     MINILM_MODEL = os.getenv("MINILM_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    ENABLE_CROSS_ENCODER_RERANKER = os.getenv(
+        "ENABLE_CROSS_ENCODER_RERANKER",
+        "false" if ENVIRONMENT == "production" else "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     # LLM 基础配置（兼容旧版简单 OpenAI 场景）
     LLM_MODEL = os.getenv("LLM_MODEL", "gpt-3.5-turbo")
