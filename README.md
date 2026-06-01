@@ -1,95 +1,238 @@
-# TripNexus ✈️
+# TripNexus
 
-TripNexus 是一个基于大语言模型（LLM）与多智能体（Agent）架构构建的智能旅行规划系统。本项目通过结合流式交互、FunctionCall 工具调用、LangGraph 状态编排以及 RAG 检索增强技术，为用户提供从意图识别、路线规划、私有知识库参考到地图可视化的端到端 AI 智能管家体验。
+[English](README.en.md) | 简体中文
 
-## 🌟 核心能力
+TripNexus 是一个面向旅行规划场景的 AI 应用，结合大语言模型、Function Calling、RAG 检索增强、LangGraph Agent 编排和地图可视化，提供从旅行灵感收集、意图识别、结构化行程生成、局部重排到路线展示的端到端体验。
 
-* **智能行程规划与编辑**：支持结构化行程的生成，以及基于自然语言的增、删、改、重新排布。
-* **原生工具调用 (FunctionCall)**：统一协议调用天气查询、地理编码、POI（兴趣点）搜索等本地/外部 API。
-* **高阶 RAG 检索增强**：结合多源搜索引擎与本地知识库，引入“证据预算 (Evidence Budget)”机制，精准防范上下文溢出。
-* **Agent 状态编排**：基于 LangGraph 实现 `Planner -> Scheduler -> Executor -> Reflector` 的计划与执行循环，支持断点续传（Checkpoint）与人工介入（HITL）。
-* **极致流式交互**：采用 SSE (Server-Sent Events) 协议，支持大模型文本与前端 UI 状态树的增量渲染与断线重连。
+## 目录
 
----
+- [核心能力](#核心能力)
+- [技术栈](#技术栈)
+- [系统架构](#系统架构)
+- [快速开始](#快速开始)
+- [环境变量](#环境变量)
+- [常用 API](#常用-api)
+- [项目结构](#项目结构)
+- [开发脚本](#开发脚本)
+- [相关文档](#相关文档)
+- [许可证](#许可证)
 
-## 🏗️ 系统架构
+## 核心能力
 
-项目采用前后端分离架构设计，主链路为 **React 前端 + Python API 后端**。
+- **AI 行程生成与编辑**：根据目的地、天数、预算、节奏、偏好和特殊约束生成结构化行程，并支持自然语言修改、单日重排和局部重排。
+- **旅行灵感收纳箱**：支持上传 PDF、Markdown、TXT，导入社交 URL，进行 URL 预处理、风险分级、失败降级和原位重试。
+- **RAG 检索增强**：支持私有知识库和公网多源搜索，使用 Evidence Budget 控制摘要与正文证据，降低上下文溢出风险。
+- **Function Calling 工具调用**：统一调用天气、地理编码、POI 等工具，并支持工具缓存、超时、熔断和错误规范化。
+- **Agent 编排与流式交互**：基于 LangGraph 管理计划与执行状态，通过 SSE 增量输出主流程事件，支持状态查询、暂停、恢复和重试。
+- **地图可视化**：前端展示行程 POI、路线和地图图层，支持高德街道、高德卫星与 CartoDB 图层。
+- **多租户模型配置**：支持用户级 LLM 配置隔离，保存前进行连通性验证，并在配置变更后刷新用户模型实例。
 
-* **前端 (Frontend)**：`/web`，基于 React + Vite 构建。负责 UI 交互、地图渲染（高德/CartoDB）、流式事件解析与状态可视化（如 Agent 节点状态、知识库管理等）。
-* **后端 (Backend)**：`/src`，基于 Python 构建。API 入口为 `src/api/app.py`，负责 LLM 路由、上下文管理、RAG 检索与 Agent 执行逻辑。
-* **存储层 (Storage)**：Redis（2小时短期记忆/缓存） + MySQL（会话与行程持久化） + Chroma（向量知识库）。
+## 技术栈
 
----
+| 层级 | 技术 |
+| --- | --- |
+| 前端 | React 19、Vite、Ant Design、MapLibre、Deck.gl、React Map GL |
+| 后端 | Python 3.12、FastAPI、Pydantic、Uvicorn |
+| LLM / Agent | LangChain、LangGraph、OpenAI 兼容接口、Ollama 兼容接口 |
+| RAG / 知识库 | Chroma、Sentence Transformers、SearXNG、BeautifulSoup、Unstructured |
+| 存储 | SQLite 测试存储、Redis 短期缓存、MySQL 生产存储 |
+| 地图 | Folium、高德地图瓦片、CartoDB |
+| 可观测性 | 结构化日志、流程指标、错误码、超时与熔断 |
 
-## 🚀 主要运行流程
+## 系统架构
 
-1.  **用户输入**：前端 UI 收集用户聊天消息或指令。
-2.  **意图识别**：LLM 对输入进行意图分类与核心参数抽取。
-3.  **记忆融合**：系统检索历史对话，维护短期/长期记忆，优化 Token 预算。
-4.  **检索增强**：触发 RAG 链路，检索私有知识库或进行外网多源搜索获取辅助信息。
-5.  **工具与生成**：模型通过 FunctionCall 调用天气/POI等工具，生成或修改结构化行程。
-6.  **前端渲染**：通过 SSE 将生成过程流式推送到前端，同步渲染聊天气泡与地图路线。
-7.  **数据持久化**：会话状态、行程数据落库保存。
+```text
+React + Vite Web
+  |-- Chat / Trip / Knowledge / Map UI
+  |-- SSE consumer and local state rendering
+  v
+FastAPI Backend
+  |-- routes: auth, flow, trip, knowledge, map
+  |-- logic: main flow, trip normalization, knowledge orchestration
+  |-- llm: prompt building, model routing, function calling, streaming adapter
+  |-- rag: intent recognition, search, crawl, validation, vector retrieval
+  |-- agent: LangGraph plan-and-execute loop
+  |-- observability: metrics, limits, cache, errors
+  v
+Storage and External Services
+  |-- SQLite / Redis / MySQL
+  |-- Chroma vector store
+  |-- OpenAI-compatible or Ollama-compatible models
+  |-- SearXNG and web sources
+```
 
----
+主业务入口是 `/api/flow/stream`。前端提交用户消息、行程约束和可选知识库参数后，后端依次完成意图识别、上下文整理、RAG 检索、工具调用、行程生成、冲突检测和最终结果透传。
 
-## 🧩 核心模块解析
+## 快速开始
 
-### 1. LLM 管理与 FunctionCall (`src/llm/`)
-负责管理 Ollama 与 OpenAI 兼容模型，处理结构化提示词与清洗 JSON 输出。
+### 1. 克隆项目
 
-* **动态路由与工具调用**：云端模型优先走原生 `bind_tools` (FunctionCall)，本地模型安全降级为大模型意图路由（`decide_tool_call`）。模型仅负责“选择工具并生成参数”，实际由后端本地代码执行后注入上下文。
-* **流式输出适配 (`LlmStreamingAdapter`)**：将模型原生 `stream` 输出封装为标准化的 `start/delta/end` 事件序列，失败时自动降级为 `invoke`，保障链路高可用。
+```bash
+git clone <your-repository-url>
+cd TripNexus
+```
 
-### 2. Agent 计划与执行循环 (`src/agent/`)
-摒弃了简单的线性链，采用基于 LangGraph 的可控状态机编排。
+### 2. 准备 Python 环境
 
-* **执行拓扑**：Planner（规划） -> Scheduler（调度） -> Executor（执行） -> Reflector（反思）。
-* **控制机制**：支持通过 Checkpoint 按 `thread_id` 恢复状态；在工具执行失败等场景支持 Human-in-the-loop（人工介入），前端可选择跳过（skip）、覆盖（override）或重试（retry）。
+```bash
+python3.12 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-### 3. RAG 检索链路 (`src/rag/`)
-构建了端到端的 `AIRetrievalPipeline`，无需搜索时直接绕过，提升响应速度。
+### 3. 准备前端依赖
 
-* **多源聚合**：SearXNG 聚合搜索 + DuckDuckGo 备选，结合 ThreadPool 并发抓取网页正文。
-* **证据预算 (Evidence Budget)**：对摘要 (Summary) 和正文 (Body) 进行 Top K 截断与字符预算控制，动态回填分数与元数据。
-* **私有知识库**：支持 PDF/Markdown/TXT 文件的高维向量化入库（Chroma），支持与行程生成请求联动。
+```bash
+cd web
+pnpm install
+cd ..
+```
 
-### 4. 对话上下文与存储 (`src/frontend/context/`)
-* **分级记忆**：核心实体提取（最高优先级） -> 最近3轮对话 -> 长期摘要 -> 早期对话。
-* **存储实现**：提供 `prod_storage` (Redis+MySQL) 与 `test_storage` (内存+SQLite) 两套实现，保证测试与生产环境接口一致。
+### 4. 配置环境变量
 
-### 5. 可观测性与稳定性保障 (`src/observability/`)
-* 针对多源搜索与抓取链路加入并发限制、全局超时与熔断机制。
-* 实现全链路日志与关键步骤打点（耗时、Token消耗、错误码），并具备统一的错误规范用于前端 UI 可视化提示。
+后端会根据 `ENVIRONMENT` 加载 `.env.development` 或 `.env.production`，系统环境变量优先级更高。本地开发时请编辑 `.env.development`，或在启动命令前导出同名环境变量。
 
----
+至少需要确认以下后端配置：
 
-## 🔌 协议与状态流转
+```dotenv
+ENVIRONMENT=development
+JWT_SECRET_KEY=replace-with-a-local-secret
 
-* **SSE 传输协议**：前后端通过 Server-Sent Events 连接。后端推送包含 `id/event/data` 的标准帧，其中 `data` 承载自定义 JSON 状态树（包含 sequence、nodes、payload 等）。
-* **断线续传**：基于 `last_sequence` 与数据库事件表，前端在重连时携带最后序号，后端按序恢复下发，确保状态不乱序。
-* **单向数据流**：前端**完全事件驱动**，不进行本地推断。例如 `replan` 动作由后端下发事件清空前端队列，将节点状态重置为 `planned`，等待新计划填充。
+ANALYSIS_PROVIDER=openai_compatible
+ANALYSIS_BASE_URL=http://localhost:11434/v1
+ANALYSIS_MODEL_NAME=your-analysis-model
+ANALYSIS_API_KEY=your-api-key
 
----
+GENERATION_PROVIDER=openai_compatible
+GENERATION_BASE_URL=http://localhost:11434/v1
+GENERATION_MODEL_NAME=your-generation-model
+GENERATION_API_KEY=your-api-key
 
-## 📂 目录导航参考
+EMBEDDING_PROVIDER=openai_compatible
+EMBEDDING_BASE_URL=http://localhost:11434/v1
+EMBEDDING_MODEL_NAME=your-embedding-model
+EMBEDDING_API_KEY=your-api-key
 
-* 前端布局与交互：[`web/README.md`](web/README.md)
-* 后端 API 入口：[`src/api/app.py`](src/api/app.py)
-* 大模型核心逻辑：[`src/llm/llm_manager.py`](src/llm/llm_manager.py)
-* RAG 检索主流程：[`src/rag/rag_main.py`](src/rag/rag_main.py)
-* Agent 编排逻辑：[`src/agent/agent_loop.py`](src/agent/agent_loop.py)
+SEARXNG_URL=http://localhost:8080
+TRIP_CONTEXT_STORAGE_TYPE=test
+AUTH_DB_BACKEND=sqlite
+```
 
----
+前端默认连接 `http://127.0.0.1:8000`。如需修改前端 API 地址，可创建 `web/.env.local`：
 
+```bash
+cd web
+printf 'VITE_API_BASE=http://127.0.0.1:8000\n' > .env.local
+```
 
-## 项目运行
-```shell
-# 后端
-PYTHONPATH=. uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --reload
+### 5. 启动后端
 
-# 前端
+```bash
+source venv/bin/activate
+PYTHONPATH=. uvicorn src.api.app:app --host 127.0.0.1 --port 8000 --reload
+```
+
+### 6. 启动前端
+
+```bash
 cd web
 pnpm run dev
 ```
+
+打开 Vite 输出的本地地址，通常是 `http://localhost:5173`。
+
+## 环境变量
+
+| 变量 | 说明 |
+| --- | --- |
+| `ENVIRONMENT` | 运行环境，常用值为 `development` 或 `production` |
+| `JWT_SECRET_KEY` | JWT 签名密钥 |
+| `SUPER_ADMIN_EMAIL` / `SUPER_ADMIN_PASSWORD` | 初始化超级管理员账号 |
+| `ANALYSIS_*` | 意图识别与参数抽取模型配置 |
+| `GENERATION_*` | 行程生成与修改模型配置 |
+| `EMBEDDING_*` | 向量化模型配置 |
+| `SEARXNG_URL` | SearXNG 聚合搜索服务地址 |
+| `CHROMA_DB_PATH` | Chroma 向量库目录 |
+| `TRIP_CONTEXT_STORAGE_TYPE` | 行程上下文存储类型，`test` 或 `prod` |
+| `AUTH_DB_BACKEND` | 鉴权数据库后端，`sqlite` 或 `mysql` |
+| `REDIS_*` | Redis 短期缓存配置 |
+| `MYSQL_*` | MySQL 生产存储配置 |
+| `CORS_ORIGINS` | 允许访问后端的前端源 |
+
+## 常用 API
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `POST` | `/api/flow/stream` | 主流程 SSE 入口，生成或修改行程 |
+| `GET` | `/api/flow/status` | 查询主流程状态 |
+| `POST` | `/api/flow/control` | 暂停、恢复或重试主流程 |
+| `GET` | `/api/flow/metrics` | 查询流程指标明细 |
+| `GET` | `/api/flow/metrics/summary` | 查询流程指标汇总 |
+| `GET` | `/api/knowledge/bases` | 获取知识库列表 |
+| `POST` | `/api/knowledge/bases` | 创建知识库 |
+| `POST` | `/api/knowledge/bases/{knowledge_base_id}/upload` | 上传文件到知识库 |
+| `POST` | `/api/knowledge/bases/{knowledge_base_id}/ingest/url` | 导入 URL 来源 |
+| `POST` | `/api/knowledge/preprocess/url` | URL 预处理与解析预判 |
+| `GET` | `/api/knowledge/bases/{knowledge_base_id}/sources` | 查询知识来源列表 |
+| `PATCH` | `/api/knowledge/bases/{knowledge_base_id}/sources/{source_id}` | 修改来源正文并重建分块 |
+| `DELETE` | `/api/knowledge/bases/{knowledge_base_id}/sources/{source_id}` | 删除知识来源 |
+
+## 项目结构
+
+```text
+TripNexus/
+├── src/
+│   ├── api/              # FastAPI 入口、路由、请求模型与业务编排
+│   ├── auth/             # 用户、JWT、管理员初始化与数据库访问
+│   ├── llm/              # LLM 管理、提示词、工具调用、流式适配
+│   ├── rag/              # 搜索、抓取、质量门禁、向量检索
+│   ├── agent/            # LangGraph Agent 状态编排
+│   ├── map/              # 地图 HTML 渲染
+│   ├── frontend/context/ # 对话上下文与存储抽象
+│   ├── models/           # 领域模型
+│   └── observability/    # 指标、缓存、并发限制、错误规范
+├── web/
+│   ├── src/api/          # 前端 API 封装与 SSE 消费
+│   ├── src/components/   # React 页面组件
+│   ├── src/hooks/        # 会话、行程、知识库、自定义鉴权状态
+│   └── src/utils/        # 行程数据归一化与调试工具
+├── scripts/              # 回放、报告与辅助脚本
+├── sql/                  # 数据库初始化脚本
+├── searxng/              # SearXNG 相关配置说明
+├── requirements.txt      # Python 依赖
+└── pyproject.toml        # Python 项目元数据
+```
+
+## 开发脚本
+
+后端：
+
+```bash
+source venv/bin/activate
+PYTHONPATH=. uvicorn src.api.app:app --host 127.0.0.1 --port 8000 --reload
+```
+
+前端：
+
+```bash
+cd web
+pnpm run dev
+pnpm run build
+pnpm run preview
+```
+
+## 相关文档
+
+- [前端说明](web/README.md)
+- [SearXNG 说明](searxng/README.md)
+- [SQL 说明](sql/README.md)
+- [后端入口](src/api/app.py)
+- [主流程路由](src/api/routes/flow.py)
+- [知识库路由](src/api/routes/knowledge.py)
+- [行程逻辑](src/api/logic/trip.py)
+- [LLM 管理](src/llm/llm_manager.py)
+- [RAG 主流程](src/rag/rag_main.py)
+
+## 许可证
+
+本项目使用 [MIT License](LICENSE)。
